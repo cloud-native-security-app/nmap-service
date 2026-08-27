@@ -1,0 +1,152 @@
+{
+  "project": "nmap-service",
+  "description": "Microservicio ms-nmap: recibe una solicitud de escaneo (IP, usuario de red, credenciales/permisos) vía el Broker, se conecta por SSH al objetivo, ejecuta nmap para detectar puertos/servicios/versiones/vulnerabilidades, persiste el resultado en MongoDB (db-nmap) y publica el resultado hacia el Broker para que ms-analisis genere el informe final.",
+  "rules": {
+    "one_feature_at_a_time": true,
+    "require_tests_to_close": true,
+    "valid_status": ["pending", "in_progress", "done", "blocked"]
+  },
+  "features": [
+    {
+      "id": 1,
+      "name": "scaffolding",
+      "title": "Scaffolding del crate Rust",
+      "description": "Inicializar el crate Rust con tokio, tracing y la estructura de módulos base (lib + main delgado).",
+      "acceptance": [
+        "Existe Cargo.toml (edition 2021 o superior) con dependencias: tokio (rt-multi-thread, macros), tracing, tracing-subscriber, serde, serde_json",
+        "El crate expone src/lib.rs con los módulos (config, domain, ssh, scanner, parser, repository, messaging) declarados pub, para que los tests de integración en tests/ puedan importarlos (tests/ compila como crate externo y no puede ver módulos de un binario puro)",
+        "src/main.rs es un envoltorio delgado: inicializa el runtime tokio y tracing_subscriber, y llama a una función pública de la lib (p. ej. lib::run()) para el resto de la lógica",
+        "src/lib.rs (o el módulo raíz) activa #![deny(missing_docs)] para forzar rustdoc en todo ítem público futuro",
+        "Cargo.toml incluye testcontainers como dev-dependency",
+        "cargo build compila sin warnings"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 2,
+      "name": "config",
+      "title": "Configuración del servicio",
+      "description": "Carga y valida la configuración del servicio desde variables de entorno (Mongo, broker, timeouts SSH).",
+      "acceptance": [
+        "src/config.rs carga configuración desde variables de entorno (URI de Mongo, endpoint/credenciales del broker, timeouts de SSH) y devuelve un error explícito si falta una variable requerida, sin panics",
+        "Ningún valor de configuración queda hardcodeado en el código",
+        "Test cubre: config válida se carga correctamente; falta una variable requerida produce un error tipado"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 3,
+      "name": "domain_model",
+      "title": "Modelo de dominio del escaneo",
+      "description": "Tipos que representan una solicitud de escaneo y su resultado (hosts, puertos, servicios, versiones, vulnerabilidades).",
+      "acceptance": [
+        "src/domain.rs define ScanRequest { ip, network_user, ssh_credentials_ref, has_sudo: bool, requested_by, correlation_id, ... }",
+        "ssh_credentials_ref usa un tipo que redacta su contenido en Debug/Display (p. ej. secrecy::SecretString) para que no pueda filtrarse por accidente vía tracing::debug!/error! ni en un panic message",
+        "has_sudo indica si el usuario de red tiene sudo disponible en el objetivo, según lo informado por quien creó la solicitud (Gateway/ms-usuarios); nmap_execution lo usa para decidir si intenta -O",
+        "src/domain.rs define ScanResult { host, ports: Vec<PortFinding>, vulnerabilities: Vec<VulnFinding>, scanned_at }",
+        "PortFinding incluye puerto, protocolo, estado, servicio, versión",
+        "VulnFinding incluye identificador (CVE si aplica), severidad, descripción, script NSE de origen",
+        "Todos los tipos derivan Serialize/Deserialize (serde) para persistir y publicar",
+        "Test unitario cubre (de)serialización round-trip de ScanResult"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 4,
+      "name": "ssh_client",
+      "title": "Cliente SSH hacia el objetivo",
+      "description": "Módulo que se conecta por SSH a la IP objetivo con el usuario de red/credenciales dados y ejecuta comandos remotos, capturando stdout/stderr, verificando la identidad del host (TOFU).",
+      "acceptance": [
+        "src/ssh.rs expone connect(host, user, credentials) -> Result<SshSession, SshError> (async)",
+        "SshSession expone run_command(cmd: &str) -> Result<CommandOutput, SshError> con stdout, stderr y exit code",
+        "src/ssh.rs define un trait HostKeyStore { known_fingerprint(&self, host) -> Option<Fingerprint>; remember(&mut self, host, Fingerprint) }, con una implementación en memoria para tests/desarrollo",
+        "connect() implementa Trust On First Use: si no hay fingerprint conocido para el host, lo guarda vía HostKeyStore y continúa; si hay uno guardado que no coincide con el de la conexión actual, devuelve SshError::HostKeyMismatch y rechaza la conexión",
+        "Errores de autenticación, timeout, host inalcanzable y host key mismatch son variantes distintas de SshError, no un error genérico",
+        "Las credenciales nunca se escriben en logs (tracing) ni en mensajes de error (ver docs/security-scope.md)",
+        "Tests de integración levantan un contenedor Docker con sshd vía testcontainers (no un host real), marcados #[ignore = \"requiere Docker\"], y verifican: conexión exitosa, fallo de auth, comando remoto devuelve el stdout esperado, primera conexión guarda el fingerprint, segunda conexión con el mismo host lo acepta, host key distinta (simulando MITM) se rechaza con HostKeyMismatch"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 5,
+      "name": "nmap_execution",
+      "title": "Ejecución remota de nmap",
+      "description": "Orquesta la ejecución de nmap sobre la sesión SSH ya establecida, con las flags de detección de servicios/versión/vulnerabilidades, respetando los privilegios disponibles, y devuelve el XML crudo.",
+      "acceptance": [
+        "src/scanner.rs expone run_scan(session: &SshSession, target_ip, has_sudo: bool) -> Result<String, ScanError> que ejecuta nmap con flags de detección (-sV --script vuln -oX -, configurables) y devuelve el XML capturado por stdout",
+        "Si has_sudo es true, se antepone sudo -n (no interactivo, falla rápido si pide password) y se añade -O para detección de SO; si es false, se omite -O y no se usa sudo",
+        "La intensidad/timing del escaneo (-T) es configurable con un valor por defecto conservador, según docs/security-scope.md",
+        "Si nmap no está instalado en el objetivo, se devuelve ScanError::ToolNotAvailable distinguible de otros fallos",
+        "Si se solicitó sudo pero la ejecución falla por privilegios insuficientes (p. ej. sudo -n pide password), se devuelve ScanError::InsufficientPrivileges distinguible de otros fallos",
+        "Tests de integración usan el contenedor sshd de testcontainers (marcados #[ignore = \"requiere Docker\"]) con un stub que simula la salida de nmap (no requiere nmap real instalado en CI), cubriendo el caso con y sin sudo"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 6,
+      "name": "xml_parser",
+      "title": "Parseo de resultados nmap",
+      "description": "Convierte el XML producido por nmap en los tipos de dominio (ScanResult).",
+      "acceptance": [
+        "src/parser.rs expone parse(xml: &str) -> Result<ScanResult, ParseError>",
+        "Cubre hosts up/down, múltiples puertos con distintos estados (open/closed/filtered), servicio+versión cuando nmap los detecta, y hallazgos de --script vuln",
+        "XML malformado o de una versión de nmap inesperada produce ParseError, nunca panics",
+        "Tests unitarios usan al menos 3 fixtures de XML real en tests/fixtures/: host con puertos abiertos, host sin puertos abiertos, XML con hallazgos de vulnerabilidades"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 7,
+      "name": "mongo_persistence",
+      "title": "Persistencia y consulta en MongoDB (db-nmap)",
+      "description": "Guarda y permite consultar cada ScanResult en MongoDB, y respalda el almacén de host keys SSH (TOFU) usado por ssh_client para que persista entre reinicios y réplicas del servicio.",
+      "acceptance": [
+        "src/repository.rs expone save(result: &ScanResult) -> Result<ScanId, RepoError> usando el driver oficial mongodb (async)",
+        "src/repository.rs expone find_by_id(id: ScanId) -> Result<Option<ScanResult>, RepoError> y find_by_correlation_id(correlation_id) -> Result<Option<ScanResult>, RepoError>; un id inexistente devuelve Ok(None), no un error",
+        "Cada documento incluye timestamp y el correlation_id del ScanRequest original",
+        "Implementa HostKeyStore (definido en ssh_client) respaldado por una colección de MongoDB",
+        "Fallos de conexión a Mongo son un RepoError distinguible, no un panic",
+        "Tests de integración corren contra el contenedor MongoDB oficial levantado vía testcontainers, marcados #[ignore = \"requiere Docker\"]: guardar y recuperar por id, guardar y recuperar por correlation_id, id inexistente devuelve None, guardar y recuperar un fingerprint conocido, nunca contra una base de producción"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 8,
+      "name": "broker_consumer",
+      "title": "Consumo de solicitudes de escaneo desde el Broker",
+      "description": "Se suscribe/consume mensajes del Broker con la solicitud de escaneo (IP, usuario de red, permisos) y los convierte en un ScanRequest.",
+      "acceptance": [
+        "src/messaging/consumer.rs define un trait ScanRequestSource desacoplado de la tecnología concreta de broker (aún por confirmar), con al menos una implementación/stub para desarrollo y tests",
+        "Mensajes malformados o sin los campos requeridos se rechazan con un error explícito y no tumban el proceso",
+        "Cada solicitud recibida se loggea con su correlation_id, sin credenciales en texto plano",
+        "Tests unitarios cubren: mensaje válido se convierte en ScanRequest, mensaje inválido se rechaza"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 9,
+      "name": "broker_publisher",
+      "title": "Publicación de resultados hacia el Broker",
+      "description": "Publica el ScanResult (o una referencia al documento persistido) de vuelta al Broker para que ms-analisis lo consuma.",
+      "acceptance": [
+        "src/messaging/publisher.rs define un trait ScanResultSink desacoplado de la tecnología concreta de broker, con al menos una implementación/stub para desarrollo y tests",
+        "Se publica tanto el caso de éxito (resultado) como el caso de fallo (motivo del error)",
+        "Test unitario verifica que un ScanResult se serializa correctamente al formato de mensaje esperado"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 10,
+      "name": "scan_pipeline_wiring",
+      "title": "Orquestación end-to-end del pipeline",
+      "description": "Conecta consumer -> ssh -> nmap -> parser -> persistence -> publisher en src/lib.rs (función run()), invocada desde src/main.rs, con manejo de errores en cada etapa.",
+      "acceptance": [
+        "Un mensaje de escaneo válido recorre todo el pipeline y termina publicando un resultado, verificado con un test de integración end-to-end usando los stubs/servidores de prueba de las features anteriores",
+        "El HostKeyStore usado en producción es la implementación respaldada por Mongo (feature mongo_persistence), no la de memoria usada en los tests aislados de ssh_client",
+        "Un fallo en cualquier etapa (SSH, nmap, parseo, Mongo) se traduce en un mensaje de error publicado hacia el Broker, no en un crash del proceso",
+        "El proceso maneja múltiples solicitudes concurrentes sin bloquear el runtime (async/await correcto, sin llamadas bloqueantes fuera de spawn_blocking)"
+      ],
+      "status": "pending"
+    }
+  ]
+}
