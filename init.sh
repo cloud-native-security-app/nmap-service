@@ -18,6 +18,12 @@ fail()  { printf "${RED}[FAIL]${NC}  %s\n" "$1"; }
 
 EXIT_CODE=0
 
+# La toolchain de Rust suele instalarse vía rustup en ~/.cargo/bin, que no
+# siempre está en el PATH de shells no interactivos. Lo añadimos si hace falta.
+if ! command -v cargo >/dev/null 2>&1 && [ -d "$HOME/.cargo/bin" ]; then
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 echo "── 1. Verificando entorno ─────────────────────────────"
 
 if ! command -v cargo >/dev/null 2>&1; then
