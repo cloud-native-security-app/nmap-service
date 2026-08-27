@@ -80,7 +80,7 @@
         "Si se solicitó sudo pero la ejecución falla por privilegios insuficientes (p. ej. sudo -n pide password), se devuelve ScanError::InsufficientPrivileges distinguible de otros fallos",
         "Tests de integración usan el contenedor sshd de testcontainers (marcados #[ignore = \"requiere Docker\"]) con un stub que simula la salida de nmap (no requiere nmap real instalado en CI), cubriendo el caso con y sin sudo"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 6,
@@ -160,6 +160,23 @@
         "lib::run() recibe las implementaciones de estos puertos como parámetros (inyección de dependencias) en vez de llamar directo a los módulos concretos; la elección de la implementación real vive en el composition root (src/main.rs o un módulo de wiring dedicado)",
         "Todos los tests existentes (unitarios y de integración, incluidos los marcados #[ignore = \"requiere Docker\"]) siguen pasando sin cambios de comportamiento -este refactor solo cambia cómo se inyectan las dependencias, no la lógica-",
         "docs/architecture.md se actualiza para reflejar el patrón hexagonal completo (puertos y adaptadores) en vez del parcial actual"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 12,
+      "name": "containerization",
+      "title": "Imagen Docker de producción de ms-nmap",
+      "description": "Dockerfile multi-stage que compila el binario ms-nmap y produce una imagen final mínima para desplegar el servicio. Se implementa después de scan_pipeline_wiring (feature 10), cuando lib::run() ya orquesta el pipeline real. La imagen NO incluye el binario nmap: nmap se ejecuta en el objetivo vía SSH, no en el contenedor de ms-nmap (ver docs/architecture.md). testcontainers (tests) es independiente: levanta contenedores desechables de sshd/MongoDB para las pruebas y no empaqueta el servicio.",
+      "acceptance": [
+        "Existe Dockerfile multi-stage en la raíz: stage builder con la toolchain Rust que hace cargo build --release, stage final mínimo (distroless/cc o debian-slim) con solo el binario ms-nmap y certificados CA",
+        "La imagen final no contiene toolchain de compilación, código fuente, ni el binario nmap",
+        "El contenedor corre como usuario no-root",
+        "El binario lee toda su configuración de variables de entorno (ya cubierto por config, feature 2); se documentan en README o docs/ las env vars requeridas para docker run",
+        "Existe .dockerignore que excluye al menos target/, .git/, .claude/, progress/, docs/",
+        "Las imágenes base están fijadas por tag concreto (no latest), idealmente por digest",
+        "docker build completa sin error y docker run con las env vars requeridas arranca el proceso sin panic (verificación manual documentada)",
+        "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no)"
       ],
       "status": "pending"
     }

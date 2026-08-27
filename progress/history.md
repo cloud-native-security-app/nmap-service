@@ -215,3 +215,78 @@
 - `progress/explore_ssh_crate.md` y `progress/explore_testcontainers_sshd.md`
   (investigación previa del leader) quedan como referencia.
 - Commit pendiente (lo gestiona el leader).
+
+---
+
+## 2026-08-27 — Feature 5: nmap_execution
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó sin cambios, ver `progress/review_nmap_execution.md`)
+
+### Qué se hizo
+
+- `src/scanner.rs` deja de ser stub e implementa la ejecución remota de `nmap`
+  sobre una `SshSession` ya establecida, devolviendo el XML crudo de `stdout`.
+- `Cargo.toml` **sin cambios**: no hicieron falta dependencias nuevas.
+- API pública (rustdoc en todo ítem):
+  - `async fn run_scan(session: &SshSession, target_ip: IpAddr, has_sudo: bool)
+    -> Result<String, ScanError>` — delega en `run_scan_with(.., &ScanOptions::default())`.
+  - `async fn run_scan_with(session, target_ip, has_sudo, &ScanOptions)` — variante
+    configurable (patrón `run_scan` + `run_scan_with`, el más idiomático).
+  - `struct ScanOptions { detection_flags: Vec<String>, timing: Timing }` + `Default`
+    (`-sV --script vuln` + `-oX -` + `-T2`).
+  - `enum Timing { Paranoid..Insane }` (`-T0`..`-T5`).
+  - `enum ScanError` (`thiserror`, variantes distintas, sin genérico):
+    `ToolNotAvailable`, `InsufficientPrivileges`, `Ssh(#[from] SshError)`,
+    `NmapFailed { exit_code: i32, stderr: String }`.
+  - Privadas testeadas directamente: `build_command` (construcción pura del
+    comando) e `interpret` (clasificación pura `CommandOutput` → `Result`).
+- Alcance de seguridad (`docs/security-scope.md`):
+  - Defaults de escaneo autorizados explícitamente aquí (a diferencia de los
+    timeouts de config, feature 2). Documentado en rustdoc.
+  - Timing por defecto `-T2` (`Timing::Polite`), elegido sobre `-T3` por
+    "usa menos ancho de banda y recursos del objetivo" — alineado con
+    §"Límite de las capacidades de escaneo" (evitar `-T4`/`-T5`).
+  - Sólo detección: default nunca incluye scripts `exploit`/`intrusive`.
+  - `has_sudo == true` → prefijo `sudo -n ` + `-O`; `false` → ni `sudo` ni `-O`.
+  - `target_ip: IpAddr` interpolada vía `to_string()` (sólo dígitos/`.`/`:`).
+  - Sin `unwrap`/`expect`/`panic!` fuera de tests. Mensajes de error sin
+    credenciales (el `#[error]` de `InsufficientPrivileges` se redactó para no
+    incluir la palabra "contraseña").
+- Clasificación de errores (`interpret`, orden): `ToolNotAvailable` (exit 127 /
+  stderr `command not found` / `nmap: not found`) → `InsufficientPrivileges`
+  (sólo si `has_sudo`, exit≠0, stderr tipo `password/terminal is required`) →
+  `exit 0` → `Ok(stdout)` → resto `NmapFailed` con stderr truncado a ~2000 B
+  respetando límites UTF-8. `exit_code == -1` (centinela de `CommandOutput`)
+  cae en `NmapFailed`.
+
+### Verificación
+
+- 14 tests unitarios en `#[cfg(test)] mod tests` de `src/scanner.rs` (sin Docker):
+  construcción de comando con/sin sudo, flags/timing/IP siempre presentes,
+  `-T2` conservador, opciones personalizadas reflejadas, y mapeo de
+  `CommandOutput` → cada variante de `ScanError` (incl. sudo-like ignorado sin
+  `has_sudo`, éxito, exit genérico truncado, señal, Display sin credenciales).
+- 4 tests de integración en `tests/scanner.rs` (`#[tokio::test]` +
+  `#[ignore = "requiere Docker"]`) contra
+  `lscr.io/linuxserver/openssh-server:version-9.9_p2-r0`, patrón de `tests/ssh.rs`.
+  Stub de `nmap` copiado con `with_copy_to` (bytes) + `chmod 0755` vía
+  `container.exec` (`CmdWaitFor::exit_code(0)`); el stub verifica `-oX -` y, si
+  ve `-O`, exige `id -u == 0`. Casos: sin sudo → XML; con sudo → XML y uid 0;
+  sin stub → `ToolNotAvailable`; stub de `sudo` que deniega → `InsufficientPrivileges`.
+- `./init.sh` → EXIT 0: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo test` (36 passed: config 8 + domain 7 + ssh 7 + scanner 14),
+  `cargo test -- --ignored` (scanner 4 + ssh 5, con Docker real),
+  `cargo doc --no-deps` limpio.
+
+### Notas / seguimiento
+
+- Aprobado en ronda 1 sin cambios requeridos.
+- Ajuste de test (no toca lógica del servicio): `SUDO_ACCESS=true` en la imagen
+  sólo da `sudo` sin contraseña si el usuario no tiene contraseña (y aquí la
+  necesitamos para el auth SSH). El helper `start_target(passwordless_sudo=true)`
+  reescribe la regla vía `exec` como root
+  (`sed -i '/^scanuser ALL=/d' /etc/sudoers` + append `NOPASSWD`), porque el
+  init de la imagen añade la regla con contraseña *después* del `@includedir`.
+- Detalle: `progress/impl_nmap_execution.md`, `progress/review_nmap_execution.md`.
+- Commit pendiente (lo gestiona el leader).
