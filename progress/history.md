@@ -144,3 +144,74 @@
   al arrancar la sesión. Los gestiona el leader.
 - Detalle: `progress/impl_domain_model.md`, `progress/review_domain_model.md`.
 - Commit pendiente (lo gestiona el leader).
+
+---
+
+## 2026-08-27 — Feature 4: ssh_client
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó sin cambios, ver `progress/review_ssh_client.md`)
+
+### Qué se hizo
+
+- `src/ssh.rs` deja de ser stub e implementa el cliente SSH hacia el objetivo con
+  verificación de host key por TOFU.
+- Dep nueva: `russh = { version = "0.63", default-features = false, features = ["ring"] }`
+  (backend `ring`, no `aws-lc-rs`, para evitar toolchain C/cmake). No se añadió
+  `ssh-key` como dep directa (se usa el reexport `russh::keys::ssh_key`).
+  `tokio` gana las features `time` y `net`.
+- API pública (rustdoc en todo ítem; `#![deny(missing_docs)]`):
+  - `Fingerprint` — newtype sobre `[u8; 32]` (SHA-256 crudo), `Clone/PartialEq/Eq/
+    Debug/Serialize/Deserialize`; `from_host_public_key(&PublicKey)`,
+    `from_sha256_bytes([u8;32])`, `openssh_format()`/`Display` → `SHA256:<base64>`.
+  - `trait HostKeyStore: Send` (`known_fingerprint`/`remember`) +
+    `InMemoryHostKeyStore` (`HashMap`, `Default`/`new`).
+  - `CommandOutput { stdout: String, stderr: String, exit_code: i32 }` (`-1` si el
+    canal se cierra sin `exit-status`).
+  - `SshTimeouts { connect, command }` (Durations explícitos, sin defaults en el módulo).
+  - `SshError` (`thiserror`): variantes distintas `AuthFailed`, `Timeout`,
+    `Unreachable(String)`, `HostKeyMismatch { host }`, catch-all tipado
+    `Protocol(String)`/`Io(String)`. Mensajes sin credenciales ni material de clave.
+  - `connect(host, port, user, credentials, store, timeouts) -> Result<SshSession, SshError>`
+    (async) y `SshSession::run_command(&self, cmd)`.
+- TOFU: `Verifier` (interno, sin `Debug`, sin credencial) implementa
+  `russh::client::Handler::check_server_key` (param `&PublicKeyOrCertificate`,
+  verificado contra russh 0.63.1). Delega en `verify_fingerprint(store, host, fp)`:
+  desconocido → `remember` + acepta; igual → acepta; distinto → marca
+  `Arc<AtomicBool>` compartido y devuelve `Ok(false)`. `connect` traduce el error
+  resultante a `HostKeyMismatch { host }`. Nunca `Ok(true)` incondicional.
+- Auth solo por password vía `credentials.expose()` en el punto exacto de
+  `authenticate_password`. Auth por clave pública queda como extensión futura
+  (fuera de acceptance).
+
+### Desviación de firma (documentada, como `ip` en feature 3)
+
+- Acceptance: `connect(host, user, credentials)`. Real:
+  `connect(host, port, user, credentials, store, timeouts)`.
+- `port`: el objetivo no siempre escucha en 22. `store`: obligatorio para TOFU;
+  se usa `std::sync::Mutex` (no `tokio`) para que el supertrait `: Send` baste
+  para `Verifier: Handler + Send + 'static`. `timeouts`: `Duration` explícitos
+  de `config`, sin hardcodear (regla de feature 2).
+
+### Verificación
+
+- 8 tests unitarios en `src/ssh.rs` (sin Docker): store remember/None, `Fingerprint`
+  round-trip serde y formato OpenSSH, `SshError` Display sin términos de credencial,
+  y 3 sobre `verify_fingerprint` (la fn real que usa `check_server_key`):
+  unknown→remember+accept, match→accept, mismatch→reject sin sobrescribir.
+- 5 tests de integración en `tests/ssh.rs` (`#[tokio::test]` + `#[ignore = "requiere Docker"]`)
+  contra `lscr.io/linuxserver/openssh-server:version-9.9_p2-r0`: conexión OK +
+  `echo`; stderr + exit≠0; password mala → `AuthFailed`; 1ª conexión guarda
+  fingerprint y 2ª al mismo host lo acepta; host key sembrada distinta → `HostKeyMismatch`
+  (Enfoque A).
+- `./init.sh` → EXIT 0: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
+  (incluye `tests/`), `cargo test` (22 passed), `cargo test -- --ignored` (5 passed
+  con Docker real), `cargo doc --no-deps`.
+
+### Notas / seguimiento
+
+- Aprobado en ronda 1 sin cambios requeridos.
+- Detalle: `progress/impl_ssh_client.md`, `progress/review_ssh_client.md`.
+- `progress/explore_ssh_crate.md` y `progress/explore_testcontainers_sshd.md`
+  (investigación previa del leader) quedan como referencia.
+- Commit pendiente (lo gestiona el leader).

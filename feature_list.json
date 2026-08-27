@@ -65,7 +65,7 @@
         "Las credenciales nunca se escriben en logs (tracing) ni en mensajes de error (ver docs/security-scope.md)",
         "Tests de integración levantan un contenedor Docker con sshd vía testcontainers (no un host real), marcados #[ignore = \"requiere Docker\"], y verifican: conexión exitosa, fallo de auth, comando remoto devuelve el stdout esperado, primera conexión guarda el fingerprint, segunda conexión con el mismo host lo acepta, host key distinta (simulando MITM) se rechaza con HostKeyMismatch"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 5,
