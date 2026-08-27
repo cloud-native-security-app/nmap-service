@@ -49,7 +49,7 @@
         "Todos los tipos derivan Serialize/Deserialize (serde) para persistir y publicar",
         "Test unitario cubre (de)serialización round-trip de ScanResult"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 4,
@@ -145,6 +145,21 @@
         "El HostKeyStore usado en producción es la implementación respaldada por Mongo (feature mongo_persistence), no la de memoria usada en los tests aislados de ssh_client",
         "Un fallo en cualquier etapa (SSH, nmap, parseo, Mongo) se traduce en un mensaje de error publicado hacia el Broker, no en un crash del proceso",
         "El proceso maneja múltiples solicitudes concurrentes sin bloquear el runtime (async/await correcto, sin llamadas bloqueantes fuera de spawn_blocking)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 11,
+      "name": "hexagonal_ports",
+      "title": "Completar arquitectura hexagonal (puertos para ssh, scanner, repository)",
+      "description": "Extraer traits (puertos) para ssh, scanner y repository -hoy son funciones concretas-, completando el patrón hexagonal ya iniciado en messaging (ScanRequestSource/ScanResultSink) y ssh::HostKeyStore. Se hace después de que el pipeline end-to-end (feature scan_pipeline_wiring) esté probado y funcionando, para tener tests reales como red de seguridad antes de reordenar dependencias.",
+      "acceptance": [
+        "src/ssh.rs define un trait (p. ej. RemoteExecutor) con connect/run_command, implementado por el tipo concreto existente (SshSession o equivalente)",
+        "src/scanner.rs define un trait (p. ej. NmapScanner) con run_scan, implementado por la lógica concreta existente",
+        "src/repository.rs define un trait (p. ej. ScanResultRepository) con save/find_by_id/find_by_correlation_id, implementado por el tipo Mongo concreto existente",
+        "lib::run() recibe las implementaciones de estos puertos como parámetros (inyección de dependencias) en vez de llamar directo a los módulos concretos; la elección de la implementación real vive en el composition root (src/main.rs o un módulo de wiring dedicado)",
+        "Todos los tests existentes (unitarios y de integración, incluidos los marcados #[ignore = \"requiere Docker\"]) siguen pasando sin cambios de comportamiento -este refactor solo cambia cómo se inyectan las dependencias, no la lógica-",
+        "docs/architecture.md se actualiza para reflejar el patrón hexagonal completo (puertos y adaptadores) en vez del parcial actual"
       ],
       "status": "pending"
     }

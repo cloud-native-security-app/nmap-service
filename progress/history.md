@@ -87,3 +87,60 @@
   las env vars de timeout.
 - Detalle: `progress/impl_config.md`, `progress/review_config.md`.
 - Commit pendiente (lo gestiona el leader).
+
+---
+
+## 2026-08-27 — Feature 3: domain_model
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó en ronda 2, ver `progress/review_domain_model.md`)
+
+### Qué se hizo
+
+- `src/domain.rs` deja de ser stub e implementa los tipos puros del dominio (sin IO).
+- `ScanRequest { correlation_id: CorrelationId, ip: IpAddr, network_user: String,
+  ssh_credentials_ref: SshCredentialsRef, has_sudo: bool, requested_by: String }`.
+  El campo IP se llama `ip` (nombre Rust + clave serde), como fija el acceptance
+  y esperan el mensaje del Broker (feature 8) y el documento Mongo (feature 7).
+- `SshCredentialsRef`: newtype sobre `secrecy::SecretString` con `Debug`/`Display`
+  redactados (`[REDACTED]`) e impls serde manuales: `Serialize` emite `[REDACTED]`,
+  `Deserialize` lee el valor real (`String::deserialize` + `SecretString::from`).
+  El round-trip de `ScanRequest` es intencionadamente lossy en la credencial;
+  la credencial nunca se re-serializa hacia Mongo/Broker (docs/security-scope.md).
+- `ScanResult { host: IpAddr, ports: Vec<PortFinding>, vulnerabilities:
+  Vec<VulnFinding>, scanned_at: OffsetDateTime }` — exactamente los 4 campos del
+  acceptance; `scanned_at` serializado como RFC 3339.
+- `PortFinding { port: u16, protocol, state, service: Option<String>,
+  version: Option<String> }`; `VulnFinding { id: Option<String>, severity,
+  description: String, nse_script: String }`.
+- Enums con encoding string estable: `Protocol` (Tcp/Udp), `PortState` (6 estados
+  de nmap), `Severity` (Unknown..Critical). Newtype `CorrelationId` (transparent).
+- Deps nuevas: `time = { version = "0.3", features = ["serde-well-known"] }` (dep
+  directa nueva, justificada por `scanned_at` RFC 3339; elegida sobre `chrono`
+  por menor superficie) y `time`/`macros` como dev-dependency (`datetime!` en
+  tests). `secrecy` sin cambios respecto a feature 2 (`"0.10"`, sin features).
+
+### Verificación
+
+- 7 tests unitarios en `#[cfg(test)] mod tests` de `src/domain.rs`: round-trip
+  JSON completo de `ScanResult` (3 puertos en distintos estados/protocolos + 1
+  vuln con CVE, `assert_eq!` del valor completo); `scanned_at` sale como RFC 3339;
+  `Debug` y JSON de `ScanRequest` no filtran la credencial; `Display`/`Debug` de
+  `SshCredentialsRef` redactados y valor recuperable vía `expose()`;
+  deserialización de credencial real desde mensaje del Broker; encoding estable
+  de los enums.
+- `./init.sh` → EXIT 0: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo test` (15 passed: 8 config + 7 domain), `cargo doc --no-deps`
+  todo limpio.
+
+### Notas / seguimiento
+
+- Ronda 1 recibió CHANGES_REQUESTED: campo IP nombrado `target_ip` en vez de
+  `ip` (contrato del acceptance); feature `serde` de `secrecy` añadida sin uso;
+  justificación incorrecta de `time` en el informe ("dep transitiva previa").
+  Ronda 2 corrigió los tres puntos.
+- Los cambios en `docs/architecture.md` (§"Hexagonal parcial") y `feature_list.json`
+  (feature id:11 `hexagonal_ports`) no los hizo el implementer; ya estaban staged
+  al arrancar la sesión. Los gestiona el leader.
+- Detalle: `progress/impl_domain_model.md`, `progress/review_domain_model.md`.
+- Commit pendiente (lo gestiona el leader).

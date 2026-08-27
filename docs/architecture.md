@@ -48,6 +48,17 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
   (consumer de Broker); no expone health/readiness ni ninguna otra ruta HTTP
   en esta ronda de features. Es una decisión explícita, no un olvido — se
   puede agregar como feature independiente más adelante sin tocar el resto.
+- **Hexagonal parcial, a propósito.** `messaging` (`ScanRequestSource`/
+  `ScanResultSink`) y `ssh::HostKeyStore` ya son puertos (traits) porque
+  había una razón concreta para tener más de una implementación (broker aún
+  sin decidir; TOFU necesita una implementación en memoria para tests y otra
+  respaldada por Mongo). `ssh`, `scanner` y `repository` siguen siendo
+  funciones concretas, no traits — no se abstraen especulativamente sin una
+  razón hoy. Completar el patrón hexagonal para esos tres módulos e
+  inyectar sus implementaciones en `lib::run()` queda registrado como
+  feature `hexagonal_ports`, a hacerse **después** de `scan_pipeline_wiring`,
+  usando los tests end-to-end ya existentes como red de seguridad del
+  refactor.
 
 ## Capas
 
