@@ -1,11 +1,13 @@
 //! Persistencia y consulta del [`ScanResult`] en MongoDB (`db-nmap`) y respaldo
 //! persistente del almacén de host keys SSH (TOFU) que define `ssh`.
 //!
-//! [`MongoRepository`] es un **struct concreto**, no un trait: `docs/architecture.md`
-//! reserva la extracción de un puerto `ScanResultRepository` para la feature
-//! `hexagonal_ports`. [`MongoHostKeyStore`] implementa el trait `ssh::HostKeyStore`
-//! (que sí es un puerto) contra una colección de MongoDB, de modo que el trust
-//! store sobreviva reinicios y se comparta entre réplicas del servicio.
+//! [`MongoRepository`] es el adaptador de producción del puerto
+//! [`ScanResultRepository`] (feature `hexagonal_ports`): implementa el trait
+//! delegando en sus propios métodos inherentes, que se conservan porque los
+//! tests de integración los usan directamente. [`MongoHostKeyStore`] implementa
+//! el trait `ssh::HostKeyStore` (otro puerto) contra una colección de MongoDB,
+//! de modo que el trust store sobreviva reinicios y se comparta entre réplicas
+//! del servicio.
 //!
 //! ## Desviaciones respecto al `acceptance` de la feature (documentadas)
 //!
@@ -256,6 +258,68 @@ impl MongoRepository {
             .sort(doc! { "timestamp": -1 })
             .await?;
         Ok(found.map(|stored| stored.result))
+    }
+}
+
+/// Puerto (hexagonal) para persistir y consultar [`ScanResult`].
+///
+/// Abstrae [`MongoRepository`] tras un trait dyn-compatible
+/// (`Arc<dyn ScanResultRepository>`) para poder inyectar el adaptador real o un
+/// doble en tests. Las firmas coinciden con los métodos inherentes de
+/// [`MongoRepository`].
+#[async_trait::async_trait]
+pub trait ScanResultRepository: Send + Sync {
+    /// Persiste `result` junto con `correlation_id` y una marca temporal, y
+    /// devuelve el [`ScanId`] asignado.
+    ///
+    /// # Errores
+    ///
+    /// Ver [`RepoError`] (conexión, serialización, backend).
+    async fn save(
+        &self,
+        result: &ScanResult,
+        correlation_id: &CorrelationId,
+    ) -> Result<ScanId, RepoError>;
+
+    /// Recupera el [`ScanResult`] con identificador `id`; `Ok(None)` si no
+    /// existe.
+    ///
+    /// # Errores
+    ///
+    /// Ver [`RepoError`].
+    async fn find_by_id(&self, id: &ScanId) -> Result<Option<ScanResult>, RepoError>;
+
+    /// Recupera el [`ScanResult`] asociado a `correlation_id` (el más reciente si
+    /// hubiera varios); `Ok(None)` si no hay coincidencias.
+    ///
+    /// # Errores
+    ///
+    /// Ver [`RepoError`].
+    async fn find_by_correlation_id(
+        &self,
+        correlation_id: &CorrelationId,
+    ) -> Result<Option<ScanResult>, RepoError>;
+}
+
+#[async_trait::async_trait]
+impl ScanResultRepository for MongoRepository {
+    async fn save(
+        &self,
+        result: &ScanResult,
+        correlation_id: &CorrelationId,
+    ) -> Result<ScanId, RepoError> {
+        MongoRepository::save(self, result, correlation_id).await
+    }
+
+    async fn find_by_id(&self, id: &ScanId) -> Result<Option<ScanResult>, RepoError> {
+        MongoRepository::find_by_id(self, id).await
+    }
+
+    async fn find_by_correlation_id(
+        &self,
+        correlation_id: &CorrelationId,
+    ) -> Result<Option<ScanResult>, RepoError> {
+        MongoRepository::find_by_correlation_id(self, correlation_id).await
     }
 }
 

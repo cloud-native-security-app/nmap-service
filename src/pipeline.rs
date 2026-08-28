@@ -26,50 +26,80 @@ use crate::domain::{ScanRequest, ScanResult};
 use crate::messaging::consumer::{ConsumeError, ScanRequestSource};
 use crate::messaging::publisher::{ScanOutcome, ScanResultSink};
 use crate::parser;
-use crate::repository::MongoRepository;
-use crate::scanner::{self, ScanOptions};
-use crate::ssh::{self, HostKeyStore, SshTimeouts};
+use crate::repository::ScanResultRepository;
+use crate::scanner::{NmapScanner, ScanOptions};
+use crate::ssh::{HostKeyStore, RemoteExecutor, SshTimeouts};
+
+/// Adaptadores de los puertos hexagonales que necesita el pipeline, ya
+/// construidos (inyección de dependencias).
+///
+/// La elección de la implementación concreta de cada puerto vive en el
+/// composition root ([`crate::wiring`] + `src/main.rs`), nunca en esta capa.
+/// Todos los campos son `Arc<dyn _>`: baratos de clonar y compartir entre las
+/// tareas concurrentes que despacha [`ScanPipeline::run`].
+#[derive(Clone)]
+pub struct ServicePorts {
+    /// Puerto SSH: establece la sesión con el objetivo (adaptador real
+    /// [`crate::ssh::RusshExecutor`]).
+    pub executor: Arc<dyn RemoteExecutor>,
+    /// Puerto de escaneo: ejecuta `nmap` sobre la sesión (adaptador real
+    /// [`crate::scanner::NmapCliScanner`]).
+    pub scanner: Arc<dyn NmapScanner>,
+    /// Puerto de persistencia del [`ScanResult`] (adaptador real
+    /// [`crate::repository::MongoRepository`]).
+    pub repository: Arc<dyn ScanResultRepository>,
+    /// Almacén de host keys TOFU. En producción es el respaldado por Mongo
+    /// ([`crate::repository::MongoHostKeyStore`]), para que sobreviva reinicios
+    /// y se comparta entre réplicas.
+    pub host_key_store: Arc<dyn HostKeyStore>,
+    /// Destino de los desenlaces de escaneo hacia el Broker.
+    pub sink: Arc<dyn ScanResultSink>,
+}
+
+/// Parámetros de despliegue del pipeline que no son puertos ni viajan en el
+/// [`ScanRequest`]: provienen de [`crate::config::Config`].
+#[derive(Clone)]
+pub struct PipelineConfig {
+    /// Puerto SSH del objetivo (todos los objetivos de un entorno escuchan en el
+    /// mismo puerto; ver [`crate::config::Config::ssh_port`]).
+    pub ssh_port: u16,
+    /// Tiempos máximos de conexión y de comando SSH.
+    pub ssh_timeouts: SshTimeouts,
+    /// Opciones con las que se construye la línea de comandos de `nmap`.
+    pub scan_options: ScanOptions,
+}
 
 /// Dependencias ya construidas del pipeline de escaneo.
 ///
-/// Es barato de clonar: `MongoRepository` comparte el pool de conexiones de su
-/// `Client` interno y el resto de campos son `Arc` / `Copy` / colecciones
-/// pequeñas. [`run`](Self::run) clona una copia por cada solicitud que despacha
-/// a una tarea concurrente.
+/// Es barato de clonar: cada puerto es un `Arc` y el resto de campos son `Copy`
+/// o colecciones pequeñas. [`run`](Self::run) clona una copia por cada solicitud
+/// que despacha a una tarea concurrente.
 #[derive(Clone)]
 pub struct ScanPipeline {
-    repo: MongoRepository,
+    executor: Arc<dyn RemoteExecutor>,
+    scanner: Arc<dyn NmapScanner>,
+    repository: Arc<dyn ScanResultRepository>,
     host_key_store: Arc<dyn HostKeyStore>,
     sink: Arc<dyn ScanResultSink>,
-    ssh_port: u16,
-    ssh_timeouts: SshTimeouts,
-    scan_options: ScanOptions,
+    config: PipelineConfig,
 }
 
 impl ScanPipeline {
-    /// Construye el pipeline con sus dependencias ya inicializadas.
+    /// Construye el pipeline a partir de los [`ServicePorts`] inyectados y la
+    /// [`PipelineConfig`] del despliegue.
     ///
-    /// `ssh_port` es el puerto SSH del objetivo: el [`ScanRequest`] no lo
-    /// transporta, proviene de la configuración del despliegue (ver
-    /// [`crate::config::Config::ssh_port`]). `host_key_store` debe ser la
-    /// implementación persistente respaldada por Mongo
-    /// ([`crate::repository::MongoHostKeyStore`]) en producción, para que la
-    /// verificación TOFU sobreviva reinicios y se comparta entre réplicas.
-    pub fn new(
-        repo: MongoRepository,
-        host_key_store: Arc<dyn HostKeyStore>,
-        sink: Arc<dyn ScanResultSink>,
-        ssh_port: u16,
-        ssh_timeouts: SshTimeouts,
-        scan_options: ScanOptions,
-    ) -> Self {
+    /// El `host_key_store` de `ports` debe ser la implementación persistente
+    /// respaldada por Mongo ([`crate::repository::MongoHostKeyStore`]) en
+    /// producción, para que la verificación TOFU sobreviva reinicios y se
+    /// comparta entre réplicas.
+    pub fn new(ports: ServicePorts, config: PipelineConfig) -> Self {
         Self {
-            repo,
-            host_key_store,
-            sink,
-            ssh_port,
-            ssh_timeouts,
-            scan_options,
+            executor: ports.executor,
+            scanner: ports.scanner,
+            repository: ports.repository,
+            host_key_store: ports.host_key_store,
+            sink: ports.sink,
+            config,
         }
     }
 
@@ -119,25 +149,33 @@ impl ScanPipeline {
     /// [`ScanResult`] o, ante el primer `Err`, el `reason` legible ya
     /// formateado (`err.to_string()` de la etapa, sin credenciales).
     async fn run_stages(&self, request: &ScanRequest) -> Result<ScanResult, String> {
-        let session = ssh::connect(
-            &request.ip.to_string(),
-            self.ssh_port,
-            &request.network_user,
-            &request.ssh_credentials_ref,
-            &self.host_key_store,
-            self.ssh_timeouts,
-        )
-        .await
-        .map_err(|err| err.to_string())?;
+        let session = self
+            .executor
+            .connect(
+                &request.ip.to_string(),
+                self.config.ssh_port,
+                &request.network_user,
+                &request.ssh_credentials_ref,
+                &self.host_key_store,
+                self.config.ssh_timeouts,
+            )
+            .await
+            .map_err(|err| err.to_string())?;
 
-        let xml =
-            scanner::run_scan_with(&session, request.ip, request.has_sudo, &self.scan_options)
-                .await
-                .map_err(|err| err.to_string())?;
+        let xml = self
+            .scanner
+            .run_scan(
+                session.as_ref(),
+                request.ip,
+                request.has_sudo,
+                &self.config.scan_options,
+            )
+            .await
+            .map_err(|err| err.to_string())?;
 
         let result = parser::parse(&xml).map_err(|err| err.to_string())?;
 
-        self.repo
+        self.repository
             .save(&result, &request.correlation_id)
             .await
             .map_err(|err| err.to_string())?;
@@ -204,15 +242,20 @@ async fn next_valid_request(source: &dyn ScanRequestSource) -> Option<ScanReques
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
     use std::sync::Mutex;
+    use std::time::Duration;
+
+    use secrecy::SecretString;
 
     use super::*;
-    use crate::domain::CorrelationId;
+    use crate::domain::{CorrelationId, SshCredentialsRef};
     use crate::messaging::consumer::{InMemoryScanRequestSource, IncomingScanRequest};
+    use crate::messaging::publisher::InMemoryScanResultSink;
     use crate::parser::ParseError;
-    use crate::repository::RepoError;
+    use crate::repository::{RepoError, ScanId};
     use crate::scanner::ScanError;
-    use crate::ssh::SshError;
+    use crate::ssh::{InMemoryHostKeyStore, RemoteSession, SshError};
 
     const SECRET: &str = "hunter2-super-secret-token";
 
@@ -307,6 +350,118 @@ mod tests {
                 }
                 other => panic!("se esperaba Failed, se obtuvo {other:?}"),
             }
+        }
+    }
+
+    /// Adaptador falso de [`RemoteExecutor`] que siempre falla la conexión.
+    struct FailingExecutor;
+
+    #[async_trait::async_trait]
+    impl RemoteExecutor for FailingExecutor {
+        async fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            _user: &str,
+            _credentials: &SshCredentialsRef,
+            _store: &Arc<dyn HostKeyStore>,
+            _timeouts: SshTimeouts,
+        ) -> Result<Box<dyn RemoteSession>, SshError> {
+            Err(SshError::AuthFailed)
+        }
+    }
+
+    /// Puertos que no deben invocarse cuando una etapa previa falla.
+    struct UnusedScanner;
+
+    #[async_trait::async_trait]
+    impl NmapScanner for UnusedScanner {
+        async fn run_scan(
+            &self,
+            _session: &dyn RemoteSession,
+            _target_ip: IpAddr,
+            _has_sudo: bool,
+            _options: &ScanOptions,
+        ) -> Result<String, ScanError> {
+            unreachable!("scanner no debe llamarse si la etapa SSH falló")
+        }
+    }
+
+    struct UnusedRepository;
+
+    #[async_trait::async_trait]
+    impl ScanResultRepository for UnusedRepository {
+        async fn save(
+            &self,
+            _result: &ScanResult,
+            _correlation_id: &CorrelationId,
+        ) -> Result<ScanId, RepoError> {
+            unreachable!("repository no debe llamarse si la etapa SSH falló")
+        }
+
+        async fn find_by_id(&self, _id: &ScanId) -> Result<Option<ScanResult>, RepoError> {
+            unreachable!()
+        }
+
+        async fn find_by_correlation_id(
+            &self,
+            _correlation_id: &CorrelationId,
+        ) -> Result<Option<ScanResult>, RepoError> {
+            unreachable!()
+        }
+    }
+
+    fn test_request(correlation_id: &str) -> ScanRequest {
+        ScanRequest {
+            correlation_id: CorrelationId::from(correlation_id),
+            ip: "198.51.100.7".parse().expect("IP de prueba válida"),
+            network_user: "netops".to_owned(),
+            ssh_credentials_ref: SshCredentialsRef::new(SecretString::from(SECRET.to_owned())),
+            has_sudo: false,
+            requested_by: "analyst@example.test".to_owned(),
+        }
+    }
+
+    fn test_config() -> PipelineConfig {
+        PipelineConfig {
+            ssh_port: 22,
+            ssh_timeouts: SshTimeouts {
+                connect: Duration::from_secs(1),
+                command: Duration::from_secs(1),
+            },
+            scan_options: ScanOptions::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_stage_failure_is_published_as_failed_outcome_without_docker() {
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let ports = ServicePorts {
+            executor: Arc::new(FailingExecutor),
+            scanner: Arc::new(UnusedScanner),
+            repository: Arc::new(UnusedRepository),
+            host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+            sink: sink.clone(),
+        };
+        let pipeline = ScanPipeline::new(ports, test_config());
+
+        pipeline.process_one(test_request("corr-ssh-fail")).await;
+
+        let published = sink.published();
+        assert_eq!(published.len(), 1, "debe publicarse un único desenlace");
+        match &published[0] {
+            ScanOutcome::Failed {
+                correlation_id,
+                reason,
+            } => {
+                assert_eq!(correlation_id.as_str(), "corr-ssh-fail");
+                assert_eq!(reason, &SshError::AuthFailed.to_string());
+                assert!(
+                    !reason.contains(SECRET),
+                    "el reason no debe filtrar la credencial: {reason}"
+                );
+            }
+            other => panic!("se esperaba Failed, se obtuvo {other:?}"),
         }
     }
 }

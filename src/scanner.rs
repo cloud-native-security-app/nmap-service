@@ -1,4 +1,4 @@
-//! Orquesta la ejecución remota de `nmap` sobre una [`SshSession`] ya
+//! Orquesta la ejecución remota de `nmap` sobre una [`RemoteSession`] ya
 //! establecida y devuelve el XML crudo que `nmap` escribe en `stdout`.
 //!
 //! El comando se construye a partir de [`ScanOptions`]. Los valores por defecto
@@ -16,7 +16,7 @@
 
 use std::net::IpAddr;
 
-use crate::ssh::{CommandOutput, SshError, SshSession};
+use crate::ssh::{CommandOutput, RemoteSession, SshError};
 
 /// `stderr` de `nmap` incluido en [`ScanError::NmapFailed`] se trunca a este
 /// número de bytes para no arrastrar salidas gigantes a los logs/mensajes.
@@ -123,12 +123,15 @@ pub enum ScanError {
 ///
 /// Equivale a [`run_scan_with`] con `&ScanOptions::default()`.
 ///
+/// `session` es cualquier [`RemoteSession`]: la [`crate::ssh::SshSession`] real
+/// coerciona a `&dyn RemoteSession` en el sitio de llamada.
+///
 /// # Errores
 ///
 /// Ver [`ScanError`]: `nmap` ausente, `sudo -n` sin privilegios, fallo de
 /// transporte SSH, o `nmap` terminando con error.
 pub async fn run_scan(
-    session: &SshSession,
+    session: &dyn RemoteSession,
     target_ip: IpAddr,
     has_sudo: bool,
 ) -> Result<String, ScanError> {
@@ -139,7 +142,7 @@ pub async fn run_scan(
 ///
 /// Construye la línea de comandos (`sudo -n` y `-O` sólo si `has_sudo`; siempre
 /// `-oX -` y `target_ip` al final), la ejecuta vía
-/// [`SshSession::run_command`] e interpreta la salida.
+/// [`RemoteSession::run_command`] e interpreta la salida.
 ///
 /// `target_ip` es un [`IpAddr`], por lo que su representación textual sólo
 /// contiene dígitos, puntos y `:`; no se interpola ninguna cadena arbitraria en
@@ -149,7 +152,7 @@ pub async fn run_scan(
 ///
 /// Ver [`ScanError`].
 pub async fn run_scan_with(
-    session: &SshSession,
+    session: &dyn RemoteSession,
     target_ip: IpAddr,
     has_sudo: bool,
     options: &ScanOptions,
@@ -158,6 +161,47 @@ pub async fn run_scan_with(
     tracing::debug!(%command, "ejecutando nmap en el host objetivo");
     let output = session.run_command(&command).await?;
     interpret(output, has_sudo)
+}
+
+/// Puerto (hexagonal) para la etapa de escaneo del pipeline.
+///
+/// Abstrae la ejecución de `nmap` tras un trait dyn-compatible
+/// (`Arc<dyn NmapScanner>`) para poder inyectar el adaptador real
+/// ([`NmapCliScanner`]) o un doble en tests. La sesión sobre la que se ejecuta
+/// llega como [`RemoteSession`], no como un tipo concreto.
+#[async_trait::async_trait]
+pub trait NmapScanner: Send + Sync {
+    /// Ejecuta `nmap` sobre `session` contra `target_ip` con `options` y
+    /// devuelve el XML crudo.
+    ///
+    /// # Errores
+    ///
+    /// Ver [`ScanError`].
+    async fn run_scan(
+        &self,
+        session: &dyn RemoteSession,
+        target_ip: IpAddr,
+        has_sudo: bool,
+        options: &ScanOptions,
+    ) -> Result<String, ScanError>;
+}
+
+/// Adaptador de producción de [`NmapScanner`]: delega en la función libre
+/// [`run_scan_with`] (invoca el binario `nmap` en el objetivo vía SSH).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NmapCliScanner;
+
+#[async_trait::async_trait]
+impl NmapScanner for NmapCliScanner {
+    async fn run_scan(
+        &self,
+        session: &dyn RemoteSession,
+        target_ip: IpAddr,
+        has_sudo: bool,
+        options: &ScanOptions,
+    ) -> Result<String, ScanError> {
+        run_scan_with(session, target_ip, has_sudo, options).await
+    }
 }
 
 /// Construye la línea de comandos de `nmap` a partir de las opciones.

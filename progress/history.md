@@ -661,3 +661,63 @@ repository -> publisher`. Estado final: **done** (reviewer aprobó en ronda 2).
 - Commit pendiente (lo gestiona el leader): `src/config.rs`, `src/pipeline.rs`,
   `src/lib.rs`, `src/messaging/publisher.rs`, `tests/scan_pipeline.rs`,
   `feature_list.json`, `progress/*.md`.
+
+## 2026-08-27 — feature 11 `hexagonal_ports` (implementer)
+
+Refactor sin cambio de comportamiento: extrae puertos (traits) para ssh,
+scanner y repository e inyecta sus adaptadores en `lib::run()` vía
+`ServicePorts`. Red de seguridad: 82 tests previos, todos verdes antes y
+después (83 tras añadir un test unitario sin Docker).
+
+### Cambios
+
+- `src/ssh.rs`: puertos `RemoteExecutor` (`connect -> Box<dyn RemoteSession>`) y
+  `RemoteSession` (`run_command`), dyn-compatibles vía `async-trait`.
+  `impl RemoteSession for SshSession`; adaptador `RusshExecutor` (unit struct)
+  que delega en la función libre `connect`. No se borró la función libre ni los
+  métodos inherentes (`tests/ssh.rs` los usa sin cambios).
+- `src/scanner.rs`: puerto `NmapScanner` + adaptador `NmapCliScanner`. Las
+  funciones libres `run_scan`/`run_scan_with` pasan a `&dyn RemoteSession`;
+  `tests/scanner.rs` sin cambios (coerción `&SshSession` -> `&dyn RemoteSession`).
+- `src/repository.rs`: puerto `ScanResultRepository`
+  (`save`/`find_by_id`/`find_by_correlation_id`); `impl` para `MongoRepository`
+  delegando en los métodos inherentes (conservados; `tests/repository.rs` los
+  usa directo). `HostKeyStore`/`MongoHostKeyStore` intactos (ya eran puerto).
+- `src/pipeline.rs`: `ScanPipeline` sobre `Arc<dyn ...>` de cada puerto +
+  `PipelineConfig`. `new(ports: ServicePorts, config: PipelineConfig)`. Structs
+  públicos `ServicePorts` y `PipelineConfig`. `run_stages` usa los puertos;
+  `process_one`/`run` sin cambio de lógica. Test nuevo sin Docker: fallo de
+  etapa SSH -> `ScanOutcome::Failed` sin fuga de credencial.
+- `src/wiring.rs` (nuevo, `pub mod wiring`): composition root
+  `service_ports_from_config(&Config) -> Result<ServicePorts, WiringError>`.
+  Construye `RusshExecutor`, `NmapCliScanner`, `MongoRepository`, el
+  `HostKeyStore` **de Mongo**, y `sink` = `InMemoryScanResultSink` (no hay
+  adaptador real de broker; documentado).
+- `src/lib.rs`: `run(ports, config, source: Option<Arc<dyn ScanRequestSource>>)`.
+  `source == None` (caso actual) -> loggea "adaptador de broker pendiente" y
+  retorna limpio, sin panic (comportamiento observable = feature 10).
+- `src/main.rs`: delgado — `Config::from_env` -> `wiring` -> `run(..., None)`.
+  Sin `anyhow`, sin dependencias nuevas.
+- `tests/scan_pipeline.rs`: único cambio, `build_pipeline` arma `ServicePorts` +
+  `PipelineConfig` con los adaptadores reales; lógica de los 3 e2e intacta.
+- `docs/architecture.md`: §"Hexagonal parcial" -> "Hexagonal completo" con tabla
+  puerto/adaptador y composition root; §Capas: añadidas `pipeline` y `wiring`.
+- `Cargo.toml`: sin cambios.
+
+### Revisión
+
+- Ronda 1: **APROBADO** sin cambios requeridos.
+- Detalle: `progress/impl_hexagonal_ports.md`, `progress/review_hexagonal_ports.md`.
+
+### Verificación
+
+- `./init.sh` verde y estable: 3 corridas tras implementación + 2 al cierre
+  (exit 0, 0 `[FAIL]`), incluye `cargo test -- --ignored` con contenedores
+  reales sshd + `mongo:7` (18 tests).
+- `cargo test`: 83 unitarios verdes. `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --check`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` limpios.
+- Sin `unwrap`/`expect`/`panic!` fuera de tests.
+- Commit pendiente (lo gestiona el leader): `src/ssh.rs`, `src/scanner.rs`,
+  `src/repository.rs`, `src/pipeline.rs`, `src/lib.rs`, `src/main.rs`,
+  `src/wiring.rs`, `tests/scan_pipeline.rs`, `docs/architecture.md`,
+  `feature_list.json`, `progress/*.md`.

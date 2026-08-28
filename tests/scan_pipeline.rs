@@ -21,12 +21,12 @@ use testcontainers::{
 
 use nmap_service::domain::{CorrelationId, PortState, ScanRequest, SshCredentialsRef};
 use nmap_service::messaging::consumer::InMemoryScanRequestSource;
-use nmap_service::messaging::publisher::{InMemoryScanResultSink, ScanOutcome};
+use nmap_service::messaging::publisher::{InMemoryScanResultSink, ScanOutcome, ScanResultSink};
 use nmap_service::parser;
-use nmap_service::pipeline::ScanPipeline;
-use nmap_service::repository::MongoRepository;
-use nmap_service::scanner::ScanOptions;
-use nmap_service::ssh::{self, HostKeyStore, SshTimeouts};
+use nmap_service::pipeline::{PipelineConfig, ScanPipeline, ServicePorts};
+use nmap_service::repository::{MongoRepository, ScanResultRepository};
+use nmap_service::scanner::{NmapCliScanner, NmapScanner, ScanOptions};
+use nmap_service::ssh::{self, HostKeyStore, RemoteExecutor, RusshExecutor, SshTimeouts};
 
 const SSHD_IMAGE: &str = "lscr.io/linuxserver/openssh-server";
 const SSHD_TAG: &str = "version-9.9_p2-r0";
@@ -153,14 +153,20 @@ fn build_pipeline(
     sink: &Arc<InMemoryScanResultSink>,
     ssh_port: u16,
 ) -> ScanPipeline {
-    let host_key_store: Arc<dyn HostKeyStore> = Arc::new(repo.host_key_store());
+    let ports = ServicePorts {
+        executor: Arc::new(RusshExecutor) as Arc<dyn RemoteExecutor>,
+        scanner: Arc::new(NmapCliScanner) as Arc<dyn NmapScanner>,
+        repository: Arc::new(repo.clone()) as Arc<dyn ScanResultRepository>,
+        host_key_store: Arc::new(repo.host_key_store()) as Arc<dyn HostKeyStore>,
+        sink: sink.clone() as Arc<dyn ScanResultSink>,
+    };
     ScanPipeline::new(
-        repo.clone(),
-        host_key_store,
-        sink.clone(),
-        ssh_port,
-        timeouts(),
-        ScanOptions::default(),
+        ports,
+        PipelineConfig {
+            ssh_port,
+            ssh_timeouts: timeouts(),
+            scan_options: ScanOptions::default(),
+        },
     )
 }
 

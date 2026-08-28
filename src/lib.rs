@@ -18,73 +18,40 @@ pub mod pipeline;
 pub mod repository;
 pub mod scanner;
 pub mod ssh;
+pub mod wiring;
 
-use crate::config::Config;
-use crate::messaging::publisher::{InMemoryScanResultSink, ScanResultSink};
+use crate::messaging::consumer::ScanRequestSource;
 use crate::pipeline::ScanPipeline;
-use crate::repository::MongoRepository;
-use crate::scanner::ScanOptions;
-use crate::ssh::{HostKeyStore, SshTimeouts};
 
-/// Arranca el servicio (composition root): carga la configuración, conecta con
-/// MongoDB y construye el [`ScanPipeline`] que orquesta
-/// `consumer -> ssh -> scanner -> parser -> repository -> publisher`.
+pub use crate::pipeline::{PipelineConfig, ServicePorts};
+
+/// Arranca el pipeline de escaneo con los puertos ya inyectados (composition
+/// root en [`wiring`] + `src/main.rs`).
 ///
-/// El almacén de host keys (TOFU) que se inyecta es el respaldado por Mongo
-/// ([`repository::MongoHostKeyStore`]), no el de memoria de los tests aislados de
-/// `ssh`.
+/// Construye el [`ScanPipeline`] a partir de `ports` y `config` y:
 ///
-/// # Estado del wiring del broker
+/// - si `source` es `Some`, consume solicitudes de esa
+///   [`ScanRequestSource`] llamando a [`ScanPipeline::run`] hasta que se cierre;
+/// - si es `None`, deja constancia con `tracing::warn!` y retorna. Hoy es el
+///   caso normal: la tecnología concreta de cola de mensajes aún no está
+///   decidida (ver `docs/architecture.md`), así que todavía no existe un
+///   adaptador real de `ScanRequestSource`. El `sink` de `ports` es igualmente
+///   el stub en memoria hasta que exista el adaptador de broker.
 ///
-/// La tecnología concreta de cola de mensajes aún no está decidida (ver
-/// `docs/architecture.md`), así que todavía no existe un adaptador real de
-/// [`ScanRequestSource`](messaging::consumer::ScanRequestSource) ni de
-/// [`ScanResultSink`] — sólo los stubs en
-/// memoria. Esta función valida la configuración, comprueba que MongoDB es
-/// accesible y deja el pipeline construido; cuando exista el adaptador de
-/// broker se le pasará su `source` a [`ScanPipeline::run`]. Conectar ese
-/// adaptador queda fuera del alcance de la feature `scan_pipeline_wiring`.
-///
-/// Nunca hace `panic`: un fallo de configuración o de conexión a MongoDB se
-/// registra con `tracing::error!` y la función retorna de forma limpia.
-pub async fn run() {
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(err) => {
-            tracing::error!(error = %err, "configuración inválida; ms-nmap no puede arrancar");
-            return;
-        }
-    };
+/// Nunca hace `panic`.
+pub async fn run(
+    ports: ServicePorts,
+    config: PipelineConfig,
+    source: Option<Arc<dyn ScanRequestSource>>,
+) {
+    let pipeline = ScanPipeline::new(ports, config);
 
-    let repo = match MongoRepository::connect(&config.mongo_uri, &config.mongo_db).await {
-        Ok(repo) => repo,
-        Err(err) => {
-            tracing::error!(
-                error = %err,
-                "no se pudo conectar con MongoDB; ms-nmap no puede arrancar"
-            );
-            return;
-        }
-    };
-
-    let host_key_store: Arc<dyn HostKeyStore> = Arc::new(repo.host_key_store());
-    let sink: Arc<dyn ScanResultSink> = Arc::new(InMemoryScanResultSink::new());
-
-    let _pipeline = ScanPipeline::new(
-        repo,
-        host_key_store,
-        sink,
-        config.ssh_port,
-        SshTimeouts {
-            connect: config.ssh_connect_timeout,
-            command: config.ssh_command_timeout,
-        },
-        ScanOptions::default(),
-    );
-
-    tracing::warn!(
-        "ms-nmap arrancó: configuración validada y MongoDB accesible. El adaptador de \
-         broker (ScanRequestSource real) aún no existe; el pipeline no consumirá \
-         solicitudes hasta que se implemente (fuera del alcance de scan_pipeline_wiring)."
-    );
+    match source {
+        Some(source) => pipeline.run(source).await,
+        None => tracing::warn!(
+            "ms-nmap arrancó: configuración validada y MongoDB accesible. El adaptador de \
+             broker (ScanRequestSource real) aún no existe; el pipeline no consumirá \
+             solicitudes hasta que se implemente."
+        ),
+    }
 }

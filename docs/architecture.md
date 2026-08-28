@@ -48,17 +48,31 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
   (consumer de Broker); no expone health/readiness ni ninguna otra ruta HTTP
   en esta ronda de features. Es una decisión explícita, no un olvido — se
   puede agregar como feature independiente más adelante sin tocar el resto.
-- **Hexagonal parcial, a propósito.** `messaging` (`ScanRequestSource`/
-  `ScanResultSink`) y `ssh::HostKeyStore` ya son puertos (traits) porque
-  había una razón concreta para tener más de una implementación (broker aún
-  sin decidir; TOFU necesita una implementación en memoria para tests y otra
-  respaldada por Mongo). `ssh`, `scanner` y `repository` siguen siendo
-  funciones concretas, no traits — no se abstraen especulativamente sin una
-  razón hoy. Completar el patrón hexagonal para esos tres módulos e
-  inyectar sus implementaciones en `lib::run()` queda registrado como
-  feature `hexagonal_ports`, a hacerse **después** de `scan_pipeline_wiring`,
-  usando los tests end-to-end ya existentes como red de seguridad del
-  refactor.
+- **Hexagonal completo (puertos y adaptadores).** Cada capa que cruza un
+  límite de IO se expone como un **puerto** (trait dyn-compatible) con su
+  **adaptador** de producción, y todos se inyectan en `lib::run()` agrupados en
+  el struct `pipeline::ServicePorts`:
+
+  | Puerto (trait)                     | Módulo        | Adaptador de producción         |
+  |------------------------------------|---------------|---------------------------------|
+  | `messaging::ScanRequestSource`     | `messaging`   | *(pendiente: broker sin decidir)* |
+  | `messaging::ScanResultSink`        | `messaging`   | *(pendiente; hoy `InMemoryScanResultSink`)* |
+  | `ssh::HostKeyStore`                | `ssh`         | `repository::MongoHostKeyStore`  |
+  | `ssh::RemoteExecutor` (`connect`)  | `ssh`         | `ssh::RusshExecutor`             |
+  | `ssh::RemoteSession` (`run_command`) | `ssh`       | `ssh::SshSession`               |
+  | `scanner::NmapScanner`             | `scanner`     | `scanner::NmapCliScanner`        |
+  | `repository::ScanResultRepository` | `repository`  | `repository::MongoRepository`   |
+
+  El **composition root** —el único sitio que nombra los adaptadores
+  concretos— vive en `src/wiring.rs` (`wiring::service_ports_from_config`) y
+  `src/main.rs`. `ssh`, `scanner` y `repository` conservan además sus funciones
+  y métodos inherentes: los adaptadores son una capa fina encima y los tests de
+  integración los siguen usando directamente. `ssh::RemoteExecutor` y
+  `ssh::RemoteSession` se separaron en dos traits (conectar vs. ejecutar) para
+  que el adaptador de sesión sea trivialmente `SshSession` y `scanner` dependa
+  sólo de `&dyn RemoteSession`. Este patrón se completó en la feature
+  `hexagonal_ports`, después de `scan_pipeline_wiring`, usando los tests
+  end-to-end existentes como red de seguridad del refactor.
 
 ## Capas
 
@@ -76,11 +90,19 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 7. **`messaging`** — `consumer` (recibe `ScanRequest` del Broker) y
    `publisher` (envía `ScanResult` o error al Broker), cada uno detrás de un
    trait para no acoplar el resto del servicio a la tecnología del broker.
-8. **`lib` (`src/lib.rs`)** — declara `pub mod` para cada capa anterior y
-   expone una función de arranque (p. ej. `pub async fn run(...)`) que conecta
-   `consumer -> ssh -> scanner -> parser -> repository -> publisher`.
-9. **`main` (`src/main.rs`)** — envoltorio delgado: inicializa runtime tokio,
-   tracing y config, y llama a `lib::run(...)`. Sin lógica de negocio propia.
+8. **`pipeline` (`src/pipeline.rs`)** — orquesta
+   `consumer -> ssh -> scanner -> parser -> repository -> publisher` en
+   `ScanPipeline`, construido a partir de los puertos inyectados
+   (`ServicePorts` + `PipelineConfig`). Un fallo de etapa se publica como
+   desenlace de error, nunca `panic`.
+9. **`wiring` (`src/wiring.rs`)** — composition root: construye los adaptadores
+   reales de cada puerto desde la `Config` y los agrupa en `ServicePorts`.
+10. **`lib` (`src/lib.rs`)** — declara `pub mod` para cada capa anterior y
+    expone `pub async fn run(ports, config, source)` que arma el `ScanPipeline`
+    y lo pone a consumir.
+11. **`main` (`src/main.rs`)** — envoltorio delgado: inicializa runtime tokio,
+    tracing y config, llama a `wiring::service_ports_from_config` y a
+    `lib::run(...)`. Sin lógica de negocio propia.
 
 No introducir capas adicionales hasta que haya una razón concreta
 documentada en `feature_list.json`.

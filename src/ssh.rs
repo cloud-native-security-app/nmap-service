@@ -460,6 +460,81 @@ impl SshSession {
     }
 }
 
+/// Puerto (hexagonal) para establecer una sesión SSH con el objetivo.
+///
+/// Abstrae la función libre [`connect`] tras un trait dyn-compatible
+/// (`Arc<dyn RemoteExecutor>`) para poder inyectar el adaptador real
+/// ([`RusshExecutor`]) en el pipeline y sustituirlo por un doble en tests sin
+/// levantar un `sshd`. La verificación TOFU y el manejo de credenciales siguen
+/// viviendo en el adaptador concreto (ver `docs/security-scope.md`).
+#[async_trait::async_trait]
+pub trait RemoteExecutor: Send + Sync {
+    /// Se conecta por SSH a `host:port`, verifica la identidad del host (TOFU
+    /// contra `store`) y autentica a `user` con `credentials`.
+    ///
+    /// # Errores
+    ///
+    /// Las mismas variantes de [`SshError`] que documenta [`connect`]
+    /// (timeout, host inalcanzable, host key mismatch, fallo del trust store,
+    /// autenticación rechazada, protocolo/E/S).
+    async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        user: &str,
+        credentials: &SshCredentialsRef,
+        store: &Arc<dyn HostKeyStore>,
+        timeouts: SshTimeouts,
+    ) -> Result<Box<dyn RemoteSession>, SshError>;
+}
+
+/// Puerto (hexagonal) para ejecutar comandos sobre una sesión SSH ya
+/// establecida.
+///
+/// Es lo que [`RemoteExecutor::connect`] devuelve y lo que `scanner` consume
+/// para lanzar `nmap`. El adaptador real es [`SshSession`].
+#[async_trait::async_trait]
+pub trait RemoteSession: Send + Sync {
+    /// Ejecuta `cmd` en el host remoto y devuelve su `stdout`, `stderr` y código
+    /// de salida.
+    ///
+    /// # Errores
+    ///
+    /// - [`SshError::Timeout`] si el comando excede el timeout configurado.
+    /// - [`SshError::Io`] / [`SshError::Protocol`] ante fallos de canal o
+    ///   transporte.
+    async fn run_command(&self, cmd: &str) -> Result<CommandOutput, SshError>;
+}
+
+#[async_trait::async_trait]
+impl RemoteSession for SshSession {
+    async fn run_command(&self, cmd: &str) -> Result<CommandOutput, SshError> {
+        SshSession::run_command(self, cmd).await
+    }
+}
+
+/// Adaptador de producción de [`RemoteExecutor`]: delega en la función libre
+/// [`connect`] (cliente `russh`) y entrega la [`SshSession`] resultante como
+/// `Box<dyn RemoteSession>`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RusshExecutor;
+
+#[async_trait::async_trait]
+impl RemoteExecutor for RusshExecutor {
+    async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        user: &str,
+        credentials: &SshCredentialsRef,
+        store: &Arc<dyn HostKeyStore>,
+        timeouts: SshTimeouts,
+    ) -> Result<Box<dyn RemoteSession>, SshError> {
+        let session = connect(host, port, user, credentials, store, timeouts).await?;
+        Ok(Box::new(session))
+    }
+}
+
 /// Se conecta por SSH a `host:port`, verifica la identidad del host (TOFU contra
 /// `store`) y autentica a `user` con `credentials` (contraseña).
 ///

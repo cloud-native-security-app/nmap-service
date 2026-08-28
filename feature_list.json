@@ -161,7 +161,7 @@
         "Todos los tests existentes (unitarios y de integración, incluidos los marcados #[ignore = \"requiere Docker\"]) siguen pasando sin cambios de comportamiento -este refactor solo cambia cómo se inyectan las dependencias, no la lógica-",
         "docs/architecture.md se actualiza para reflejar el patrón hexagonal completo (puertos y adaptadores) en vez del parcial actual"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 12,
