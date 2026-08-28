@@ -461,3 +461,44 @@ destruidos al terminar. Archivos: `open_ports_service_version.xml`,
   Investigación previa: `progress/explore_mongo.md`.
 - Commit pendiente (lo gestiona el leader): incluir `tests/repository.rs` y los
   `progress/*.md` nuevos.
+
+---
+
+## 2026-08-27 — Feature 8: broker_consumer
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó sin cambios, ver
+  `progress/review_broker_consumer.md`; 65 unit + 15 Docker verdes, sin regresión)
+
+### Qué se hizo
+
+- `src/messaging/consumer.rs` reescrito (era stub `//!`):
+  - `trait ScanRequestSource` (async vía `async-trait`, `Send + Sync`,
+    dyn-compatible): `next_request(&self) -> Result<Option<IncomingScanRequest>, ConsumeError>`.
+    Modelo pull; `Ok(None)` = stream cerrado; `Err` no fatal para mensaje
+    ilegible, `Transport` para fallo del broker.
+  - `IncomingScanRequest`: wrapper `#[non_exhaustive]` sobre `ScanRequest`
+    (campo `pub request`), punto de extensión para un token de ack/nack cuando
+    se decida la tecnología de broker. Hoy no hay ack.
+  - `parse_scan_request(&[u8]) -> Result<ScanRequest, ConsumeError>` en dos
+    etapas (`from_slice` a `Value` -> `MalformedPayload`; `from_value` a
+    `ScanRequest` -> `InvalidSchema`). Sin `panic`/`unwrap`.
+  - `ConsumeError` (`thiserror`): `MalformedPayload` / `InvalidSchema` /
+    `Transport`. El payload crudo nunca entra al error; `redact_credential`
+    borra el valor de `ssh_credentials_ref` de la descripción de `serde` por si
+    llegó con un tipo inesperado (ver `docs/security-scope.md`).
+  - `log_request_received(&ScanRequest)`: `tracing::info!` con `correlation_id`
+    y campos no sensibles, nunca la credencial. `pub` para reuso por adaptadores
+    reales; el stub la llama al entregar.
+  - `InMemoryScanRequestSource` (stub): cola FIFO tras `Mutex`; `from_requests`
+    y `from_raw_messages`. Un mensaje inválido se entrega como `Err` y no
+    interrumpe los siguientes (parseo = responsabilidad de la fuente).
+- 9 tests unitarios nuevos en el módulo (mensaje válido -> campos; JSON roto;
+  basura no-UTF8; campo ausente; credencial no filtrada en el error x2; orden
+  FIFO + `None`; error-luego-continúa; logging sin credencial).
+- Sin dependencias nuevas en `Cargo.toml`.
+- `./init.sh` verde (fmt + clippy `-D warnings` + unit + Docker `--ignored` +
+  doc), exit 0. Sin regresión en features 1-7.
+- Detalle: `progress/impl_broker_consumer.md`, `progress/review_broker_consumer.md`.
+- Commit pendiente (lo gestiona el leader): incluir `src/messaging/consumer.rs`
+  y los `progress/*.md` nuevos.

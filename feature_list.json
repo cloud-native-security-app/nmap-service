@@ -121,7 +121,7 @@
         "Cada solicitud recibida se loggea con su correlation_id, sin credenciales en texto plano",
         "Tests unitarios cubren: mensaje válido se convierte en ScanRequest, mensaje inválido se rechaza"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 9,
