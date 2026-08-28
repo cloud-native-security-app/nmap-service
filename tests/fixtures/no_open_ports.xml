@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.98 scan initiated Thu Aug 27 23:31:46 2026 as: /usr/bin/nmap -Pn -p 21,23,25,110,143 -oX - tgt-ssh -->
+<nmaprun scanner="nmap" args="/usr/bin/nmap -Pn -p 21,23,25,110,143 -oX - tgt-ssh" start="1787873506" startstr="Thu Aug 27 23:31:46 2026" version="7.98" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="5" services="21,23,25,110,143"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<hosthint><status state="up" reason="arp-response" reason_ttl="0"/>
+<address addr="172.18.0.2" addrtype="ipv4"/>
+<address addr="D2:A1:3C:1F:3C:92" addrtype="mac"/>
+<hostnames>
+<hostname name="tgt-ssh" type="user"/>
+</hostnames>
+</hosthint>
+<host starttime="1787873506" endtime="1787873506"><status state="up" reason="arp-response" reason_ttl="0"/>
+<address addr="172.18.0.2" addrtype="ipv4"/>
+<address addr="D2:A1:3C:1F:3C:92" addrtype="mac"/>
+<hostnames>
+<hostname name="tgt-ssh" type="user"/>
+<hostname name="tgt-ssh.nmaplab" type="PTR"/>
+</hostnames>
+<ports><port protocol="tcp" portid="21"><state state="closed" reason="reset" reason_ttl="64"/><service name="ftp" method="table" conf="3"/></port>
+<port protocol="tcp" portid="23"><state state="closed" reason="reset" reason_ttl="64"/><service name="telnet" method="table" conf="3"/></port>
+<port protocol="tcp" portid="25"><state state="closed" reason="reset" reason_ttl="64"/><service name="smtp" method="table" conf="3"/></port>
+<port protocol="tcp" portid="110"><state state="closed" reason="reset" reason_ttl="64"/><service name="pop3" method="table" conf="3"/></port>
+<port protocol="tcp" portid="143"><state state="closed" reason="reset" reason_ttl="64"/><service name="imap" method="table" conf="3"/></port>
+</ports>
+<times srtt="48" rttvar="1225" to="100000"/>
+</host>
+<runstats><finished time="1787873506" timestr="Thu Aug 27 23:31:46 2026" summary="Nmap done at Thu Aug 27 23:31:46 2026; 1 IP address (1 host up) scanned in 0.65 seconds" elapsed="0.65" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

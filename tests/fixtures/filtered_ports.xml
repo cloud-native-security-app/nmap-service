@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.98 scan initiated Thu Aug 27 23:57:08 2026 as: /usr/bin/nmap -sS -sU -Pn -p T:22,80,U:53,161 -oX - 10.99.99.99 -->
+<nmaprun scanner="nmap" args="/usr/bin/nmap -sS -sU -Pn -p T:22,80,U:53,161 -oX - 10.99.99.99" start="1787875028" startstr="Thu Aug 27 23:57:08 2026" version="7.98" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="2" services="22,80"/>
+<scaninfo type="udp" protocol="udp" numservices="2" services="53,161"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1787875028" endtime="1787875034"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="10.99.99.99" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports><port protocol="tcp" portid="22"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="ssh" method="table" conf="3"/></port>
+<port protocol="tcp" portid="80"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="http" method="table" conf="3"/></port>
+<port protocol="udp" portid="53"><state state="open|filtered" reason="no-response" reason_ttl="0"/><service name="domain" method="table" conf="3"/></port>
+<port protocol="udp" portid="161"><state state="open|filtered" reason="no-response" reason_ttl="0"/><service name="snmp" method="table" conf="3"/></port>
+</ports>
+</host>
+<runstats><finished time="1787875034" timestr="Thu Aug 27 23:57:14 2026" summary="Nmap done at Thu Aug 27 23:57:14 2026; 1 IP address (1 host up) scanned in 6.72 seconds" elapsed="6.72" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

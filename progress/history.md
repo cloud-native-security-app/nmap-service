@@ -290,3 +290,68 @@
   init de la imagen añade la regla con contraseña *después* del `@includedir`.
 - Detalle: `progress/impl_nmap_execution.md`, `progress/review_nmap_execution.md`.
 - Commit pendiente (lo gestiona el leader).
+
+---
+
+## 2026-08-27 — Feature 6: xml_parser
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó en ronda 2, ver `progress/review_xml_parser.md`)
+
+### Qué se hizo
+
+- `src/parser.rs` deja de ser stub e implementa la conversión del XML de `nmap`
+  (`-oX`) en `ScanResult`. Función pura y síncrona, sin IO.
+- `Cargo.toml`: + `roxmltree = "0.21"` (XML DOM de solo lectura, Rust puro, sin
+  `unsafe`/FFI; elegido sobre `quick-xml` porque el informe de una IP es un árbol
+  pequeño que se navega mejor que con eventos). Se parsea con
+  `ParsingOptions { allow_dtd: true, .. }` porque `nmap` emite `<!DOCTYPE nmaprun>`.
+- API pública (rustdoc en todo ítem, incl. variantes/campos de enum):
+  - `fn parse(xml: &str) -> Result<ScanResult, ParseError>`.
+  - `enum ParseError` (`thiserror`): `MalformedXml(String)`,
+    `UnexpectedStructure { detail }`, `InvalidValue { field, value }`,
+    `MultipleHosts`. Nunca `panic!`.
+  - `const MAX_DESCRIPTION_LEN: usize = 800`.
+- Mapeo (documentado en el rustdoc del módulo): `host` de `<address
+  addrtype="ipv4|ipv6">`; `scanned_at` de `<runstats><finished time>` (epoch s)
+  con fallback a `<nmaprun start>`; los 6 `PortState` crudos de nmap; `version` =
+  `product` + `version` + `(extrainfo)`; `vulnerabilities` de los `<script>` bajo
+  `<port>` y `<hostscript>` (estado NSE `VULNERABLE`/`LIKELY VULNERABLE` o CVEs
+  sin `NOT VULNERABLE`; un `VulnFinding` por CVE distinto; severidad de
+  `risk factor:`/`severity:`, del `cvss` más alto, o `VULNERABLE (Exploitable)`
+  → High; descripción recortada a 800 chars). Host down → `ScanResult` vacío;
+  sin `<host>` → `UnexpectedStructure`; varios `<host>` → `MultipleHosts`.
+- Sin `unwrap`/`expect`/`panic!` fuera de tests.
+
+### Fixtures — `tests/fixtures/` (7, XML real de Nmap 7.98)
+
+Generados con Docker (`instrumentisto/nmap`) contra contenedores propios en redes
+aisladas (`openssh-server`, `httpd:2.4.49`, `metasploitable2`, IPs sin asignar).
+Procedencia y comando exacto de cada uno en `tests/fixtures/README.md` (lo exige
+`docs/security-scope.md`). Ninguno editado a mano. Contenedores y redes
+destruidos al terminar. Archivos: `open_ports_service_version.xml`,
+`no_open_ports.xml`, `filtered_ports.xml`, `host_down.xml`, `no_host_element.xml`,
+`multiple_hosts.xml`, `vuln_findings.xml`.
+
+### Verificación
+
+- 11 tests unitarios en `#[cfg(test)] mod tests` de `src/parser.rs`: un test por
+  fixture verificando contenido concreto del `ScanResult` (IP, puertos exactos
+  con estado/servicio/versión, `scanned_at` como epoch, CVE + severidad + script
+  de cada vuln); `filtered`/`open|filtered` de punta a punta por `parse()`;
+  `parse_state` de todos los estados crudos; `MalformedXml` (cabecera real
+  truncada), `UnexpectedStructure` (XML sin `<nmaprun>` y `<nmaprun>` sin
+  `<host>`), `MultipleHosts`, `InvalidValue` (`portid` fuera de rango u16).
+- `./init.sh` → EXIT 0: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo test` (47 passed), `cargo test -- --ignored` (ssh 5 +
+  scanner 4, sin regresión), `cargo doc --no-deps` limpio.
+
+### Notas / seguimiento
+
+- Ronda 1 recibió CHANGES_REQUESTED: `filtered`/`open|filtered` solo se probaban
+  contra la fn privada `parse_state`, nunca por `parse()` hasta un `ScanResult`.
+  Ronda 2 añadió el fixture real `filtered_ports.xml` (TCP `filtered` + UDP
+  `open|filtered` en un mismo `<host>`) y el test
+  `parses_filtered_and_open_filtered_ports_end_to_end`.
+- Detalle: `progress/impl_xml_parser.md`, `progress/review_xml_parser.md`.
+- Commit pendiente (lo gestiona el leader).

@@ -93,7 +93,7 @@
         "XML malformado o de una versión de nmap inesperada produce ParseError, nunca panics",
         "Tests unitarios usan al menos 3 fixtures de XML real en tests/fixtures/: host con puertos abiertos, host sin puertos abiertos, XML con hallazgos de vulnerabilidades"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 7,
