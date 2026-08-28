@@ -721,3 +721,64 @@ después (83 tras añadir un test unitario sin Docker).
   `src/repository.rs`, `src/pipeline.rs`, `src/lib.rs`, `src/main.rs`,
   `src/wiring.rs`, `tests/scan_pipeline.rs`, `docs/architecture.md`,
   `feature_list.json`, `progress/*.md`.
+
+---
+
+## 2026-08-27 — Feature 12: containerization
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó sin cambios requeridos, ver
+  `progress/review_containerization.md`)
+
+### Qué se hizo
+
+- **`Dockerfile`** (raíz, nuevo) — multi-stage, sin tocar `src/` ni `Cargo.toml`:
+  - **Stage builder**: `rust:1.98-bookworm` pineado por digest
+    (`sha256:82150a52...39922`). Capa previa de cacheo de dependencias (copia
+    `Cargo.toml`/`Cargo.lock`, `src` dummy, `cargo build --release`, borra dummy);
+    luego `COPY src`, `touch` de entrypoints y
+    `cargo build --release --bin ms-nmap` + `strip`.
+  - **Stage runtime**: `gcr.io/distroless/cc-debian12:nonroot` pineado por digest
+    (`sha256:9dac0a79...182f`). Trae glibc + libgcc + `ca-certificates` + usuario
+    `nonroot` (uid 65532), sin shell ni gestor de paquetes. `COPY --from=builder`
+    del binario a `/usr/local/bin/ms-nmap`, `LABEL` OCI, `USER nonroot`,
+    `ENTRYPOINT ["/usr/local/bin/ms-nmap"]`.
+  - Sin `nmap` (corre en el objetivo vía SSH), sin `openssh-client` (`russh` es
+    Rust puro), sin toolchain ni código fuente en la imagen final.
+- **`.dockerignore`** (raíz, nuevo): excluye `target/`, `.git/`, `.gitignore`,
+  `.claude/`, `progress/`, `docs/`, `tests/`, `*.md`, `Dockerfile`,
+  `.dockerignore`. NO excluye `Cargo.toml`, `Cargo.lock`, `src/`.
+- **`README.md`**: nueva sección "Despliegue (Docker)" — build, `docker run` con
+  tabla de las 7 env vars requeridas (una descripción por variable), aclaración
+  de que la imagen no lleva `nmap` ni servidor/puerto HTTP.
+- **`docs/architecture.md`**: nueva sección "Despliegue" (imagen multi-stage, qué
+  incluye —binario + certs CA— y qué no —toolchain, fuente, `nmap`,
+  `openssh-client`—, usuario no-root, pin por tag+digest, `testcontainers`
+  independiente del empaquetado).
+
+### Verificación
+
+- `docker build -t ms-nmap:dev .`: OK. En frío 2m47s; rebuild cacheado 2.8s.
+  Imagen final: DISK USAGE 54.7 MB / CONTENT SIZE 14.2 MB (binario ~12 MB).
+- Imagen final sin toolchain/fuente/nmap: verificado con `docker create` +
+  `docker export | tar -tf -` (único match de `cargo|rustc|nmap|/app|target|.rs`
+  es `usr/local/bin/ms-nmap`; `bin/` y `usr/bin/` vacíos). `docker history`: solo
+  capas de la base distroless + LABEL + COPY del binario + USER + ENTRYPOINT.
+- Usuario no-root: `docker inspect` → `User=nonroot`; corre con `--user 65532:65532`.
+- `docker run` con las 7 env vars (Mongo inalcanzable): arranca, emite logs de
+  `tracing`, falla al conectar a Mongo y sale limpio (exit 0), sin panic.
+- `docker run` sin env vars: loggea `configuración inválida ... falta la variable
+  de entorno requerida: MS_NMAP_MONGO_URI`, sale limpio (exit 0), sin panic.
+- `./init.sh` → EXIT 0 (fmt + clippy `-D warnings` + `cargo test` + `cargo test
+  -- --ignored` con Docker real + `cargo doc`). La feature no toca `src/`.
+
+### Notas / seguimiento
+
+- Aprobado en ronda 1 sin cambios requeridos.
+- No se tocó `src/` ni `Cargo.toml`: el `main.rs` existente ya arranca y sale
+  limpio sin panic en contenedor.
+- Imagen de prueba `ms-nmap:dev` eliminada del daemon local al cerrar.
+- Detalle: `progress/impl_containerization.md`, `progress/review_containerization.md`.
+- Commit pendiente (lo gestiona el leader): `Dockerfile`, `.dockerignore`,
+  `README.md`, `docs/architecture.md`, `feature_list.json`, `progress/*.md`.
+- Con esta feature, las 12 del `feature_list.json` quedan en `done`.

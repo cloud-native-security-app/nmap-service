@@ -138,6 +138,26 @@ Broker  ──(ScanRequest)──▶  messaging::consumer
 - Las credenciales SSH nunca aparecen en logs, mensajes de error, ni en los
   documentos persistidos en texto plano (ver `docs/security-scope.md`).
 
+## Despliegue
+
+- El servicio se empaqueta con un `Dockerfile` multi-stage en la raíz (feature
+  `containerization`):
+  - **Stage builder** (`rust:1.98-bookworm`): compila `ms-nmap` en release, con
+    una capa previa que cachea la compilación de dependencias.
+  - **Stage runtime** (`gcr.io/distroless/cc-debian12:nonroot`): contiene
+    **solo** el binario `ms-nmap` y los certificados CA del sistema (TLS a
+    MongoDB y al Broker vía `rustls`). Corre como usuario no-root (`nonroot`,
+    uid 65532).
+- La imagen final **no incluye**: la toolchain de Rust, el código fuente, ni el
+  binario `nmap`. `nmap` se ejecuta en la máquina objetivo vía SSH (ver "SSH al
+  objetivo, no escaneo local"), no en el contenedor de `ms-nmap`. Tampoco lleva
+  `openssh-client`: `russh` es Rust puro.
+- Toda la configuración se inyecta por variables de entorno (ver `config` y
+  `README.md`). Las imágenes base se fijan por tag concreto y por digest
+  `@sha256:...` (nunca `latest`).
+- `testcontainers` (tests de integración) es independiente del empaquetado: sólo
+  levanta contenedores desechables de `sshd`/MongoDB para las pruebas.
+
 ## Qué NO hacer
 
 - No reimplementar la lógica de escaneo de `nmap` en Rust.

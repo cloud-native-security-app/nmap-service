@@ -19,3 +19,50 @@ integración con `testcontainers`.
 El repositorio se desarrolla guiado por agentes de IA sobre un arnés
 documental (`AGENTS.md`, `feature_list.json`, `docs/`, `CHECKPOINTS.md`).
 Antes de tocar código, lee `CLAUDE.md`.
+
+## Despliegue (Docker)
+
+El `Dockerfile` de la raíz produce una imagen multi-stage:
+
+- **builder**: `rust:1.98-bookworm`, compila el binario `ms-nmap` en release.
+- **runtime**: `gcr.io/distroless/cc-debian12:nonroot`, contiene **solo** el
+  binario y los certificados CA del sistema, y corre como usuario no-root
+  (`nonroot`, uid 65532).
+
+La imagen final **no incluye**: la toolchain de Rust, el código fuente, ni el
+binario `nmap`. `nmap` se ejecuta en la máquina objetivo vía SSH, no en este
+contenedor (ver `docs/architecture.md`). El servicio es un worker asíncrono
+puro: **no expone ningún servidor ni puerto HTTP**.
+
+### Construir
+
+```
+docker build -t ms-nmap .
+```
+
+### Ejecutar
+
+`ms-nmap` lee **toda** su configuración de variables de entorno; todas son
+obligatorias (si falta alguna, registra el error y termina sin arrancar):
+
+| Variable | Descripción |
+|----------|-------------|
+| `MS_NMAP_MONGO_URI` | URI de conexión a MongoDB (`db-nmap`), p. ej. `mongodb://host:27017` |
+| `MS_NMAP_MONGO_DB` | Nombre de la base de datos donde se persisten los resultados y el trust store SSH |
+| `MS_NMAP_SSH_PORT` | Puerto SSH del objetivo al que conectarse (p. ej. `22`) |
+| `MS_NMAP_BROKER_ENDPOINT` | Endpoint del Broker de mensajería del que se consumen solicitudes y al que se publican resultados |
+| `MS_NMAP_BROKER_CREDENTIAL` | Credencial/token de autenticación contra el Broker (secreto) |
+| `MS_NMAP_SSH_CONNECT_TIMEOUT_SECS` | Timeout en segundos para establecer la conexión SSH con el objetivo |
+| `MS_NMAP_SSH_COMMAND_TIMEOUT_SECS` | Timeout en segundos para la ejecución del comando `nmap` remoto |
+
+```
+docker run --rm \
+  -e MS_NMAP_MONGO_URI=mongodb://mongo:27017 \
+  -e MS_NMAP_MONGO_DB=db-nmap \
+  -e MS_NMAP_SSH_PORT=22 \
+  -e MS_NMAP_BROKER_ENDPOINT=nats://broker:4222 \
+  -e MS_NMAP_BROKER_CREDENTIAL=*** \
+  -e MS_NMAP_SSH_CONNECT_TIMEOUT_SECS=10 \
+  -e MS_NMAP_SSH_COMMAND_TIMEOUT_SECS=300 \
+  ms-nmap
+```
