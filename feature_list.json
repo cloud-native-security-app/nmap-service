@@ -108,7 +108,7 @@
         "Fallos de conexión a Mongo son un RepoError distinguible, no un panic",
         "Tests de integración corren contra el contenedor MongoDB oficial levantado vía testcontainers, marcados #[ignore = \"requiere Docker\"]: guardar y recuperar por id, guardar y recuperar por correlation_id, id inexistente devuelve None, guardar y recuperar un fingerprint conocido, nunca contra una base de producción"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 8,

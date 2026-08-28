@@ -355,3 +355,109 @@ destruidos al terminar. Archivos: `open_ports_service_version.xml`,
   `parses_filtered_and_open_filtered_ports_end_to_end`.
 - Detalle: `progress/impl_xml_parser.md`, `progress/review_xml_parser.md`.
 - Commit pendiente (lo gestiona el leader).
+
+---
+
+## 2026-08-27 — Feature 7: mongo_persistence
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó sin cambios, ver `progress/review_mongo_persistence.md`)
+
+### Qué se hizo
+
+- **A. `src/ssh.rs` — `HostKeyStore` pasa a async** (decisión del usuario, dentro
+  del alcance de esta feature):
+  - `#[async_trait::async_trait] pub trait HostKeyStore: Send + Sync` (se añade
+    `Sync`): `known_fingerprint(&self, host) -> Result<Option<Fingerprint>, HostKeyStoreError>`
+    y `remember(&self, host, Fingerprint) -> Result<(), HostKeyStoreError>` (`&self`,
+    ya no `&mut self`).
+  - Nuevo error propio `HostKeyStoreError` (`thiserror`): `Unavailable(String)`
+    (almacén de respaldo caído → la conexión SSH se aborta) y `Corrupt(String)`
+    (registro con formato inesperado). Variante `SshError::HostKeyStore(#[from]
+    HostKeyStoreError)`.
+  - Tipo compartido pasa de `Arc<Mutex<dyn HostKeyStore>>` a `Arc<dyn HostKeyStore>`
+    (sin `Mutex` externo). `Verifier`, `connect(store: &Arc<dyn HostKeyStore>)`,
+    `verify_fingerprint(store: &dyn HostKeyStore, ...)` ahora `async`. `Verifier`
+    comparte con `connect` un slot `Arc<Mutex<Option<HostKeyStoreError>>>` además
+    del `AtomicBool` de mismatch; `check_server_key` devuelve `Ok(false)` en
+    ambos casos (nunca acepta una clave sin verificar).
+  - `InMemoryHostKeyStore`: `entries: std::sync::Mutex<HashMap<..>>` (guard tomado
+    y soltado dentro de cada método, sin cruzar `.await`; sus `async fn` no hacen
+    `.await` real y nunca devuelven `Err`).
+  - Regresión features 4 y 5: `tests/ssh.rs` (5) y `tests/scanner.rs` (4) verdes
+    con Docker; 3 unit tests de `ssh.rs` convertidos a `#[tokio::test]` + 2 nuevos
+    (`HostKeyStoreError` en Display, hex round-trip vía `SshError`).
+
+- **B. `src/repository.rs` — `MongoRepository`** (struct concreto, NO trait; el
+  puerto `ScanResultRepository` es feature 11):
+  - `async fn connect(uri, db_name) -> Result<Self, RepoError>`: crea el `Client`,
+    hace `run_command({ping:1})` para fallar rápido, guarda las `Collection`. `Clone`.
+  - `async fn save(&self, result: &ScanResult, correlation_id: &CorrelationId)
+    -> Result<ScanId, RepoError>` — firma ampliada (documentada como desviación,
+    igual que `connect` en features 4/5): `ScanResult` no lleva `correlation_id`.
+  - `async fn find_by_id(&self, id: &ScanId)` y `find_by_correlation_id(&self,
+    correlation_id: &CorrelationId)` → `Result<Option<ScanResult>, RepoError>`;
+    id inexistente → `Ok(None)`. `find_by_correlation_id` usa `find_one().sort({timestamp:-1})`.
+  - Documento `StoredScan { _id: ObjectId, correlation_id, timestamp (RFC3339
+    string), result: <ScanResult anidado> }`.
+  - `ScanId`: newtype `#[serde(transparent)]` sobre el hex del `ObjectId`
+    (`new`/`as_str`/`Display`/`FromStr`/`From<ObjectId>`).
+  - `RepoError` (`thiserror`): `ConnectionFailed` (ServerSelection/Io/DnsResolve/
+    ConnectionPoolCleared), `Serialization` (BSON + `ScanId` inválido), `Backend`
+    (resto). `impl From<mongodb::error::Error>` con `match *err.kind`. Sin panics.
+  - `scanned_at` (y `timestamp`) se persisten como **string RFC3339** (vía el
+    `#[serde(with = "time::serde::rfc3339")]` que ya tiene `ScanResult`), no
+    `bson::DateTime`: consistente con el JSON al Broker, sin dep extra de `bson`.
+    Trade-off documentado en el rustdoc de módulo (no se hacen rangos temporales
+    sobre esos campos en este servicio).
+
+- **C. `src/repository.rs` — `MongoHostKeyStore`** implementa el `HostKeyStore`
+  async sobre `Collection<Document>` (colección `ssh_host_keys`), obtenido con
+  `MongoRepository::host_key_store()`. `remember` = `update_one(...).upsert(true)`
+  con `$set` del fingerprint y `$setOnInsert` de `first_seen` (idempotente).
+  Documento `{ "_id": "<host>", "fingerprint_sha256_hex": "<64 hex>",
+  "first_seen": "<rfc3339>" }` (hex, no el `[u8;32]` crudo; `fingerprint_from_hex`
+  valida longitud 64 y dígitos → `HostKeyStoreError::Corrupt`).
+
+- **D. `Cargo.toml`:** `+ mongodb = "3"` (driver oficial async exigido por
+  `docs/architecture.md`), `+ async-trait = "0.1"` movido a `[dependencies]`
+  (necesario para `Arc<dyn HostKeyStore>` con `async fn`; antes solo dev-transitiva
+  vía testcontainers). **`futures-util` NO añadido** (no se iteran cursores:
+  `find_one().sort()`) — desviación consciente de `progress/explore_mongo.md`.
+  `tokio` **sin** `"sync"` (toda la sincronización usa `std::sync::Mutex` sin
+  cruzar `.await`).
+
+### Verificación
+
+- 9 tests unitarios nuevos en `src/repository.rs`: `ScanId` round-trip
+  (string/serde/`From<ObjectId>`/rechazo no-hex); `RepoError::from` (E/S de red →
+  `ConnectionFailed`, BSON → `Serialization`) y Display sin términos de credencial;
+  `fingerprint_to_hex`/`from_hex` round-trip + rechazo de longitud/dígitos;
+  `connect_to_unreachable_mongo_is_connection_failed` (`#[tokio::test]` sin Docker,
+  `mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=500` → `ConnectionFailed`,
+  cubre el `ServerSelection` real que es `#[non_exhaustive]`).
+- `tests/repository.rs` nuevo — 6 tests `#[tokio::test]` + `#[ignore = "requiere
+  Docker"]`, contenedor `mongo:7`, base `db-nmap-test` (nunca producción):
+  save+find_by_id (asserts de contenido: puertos, CVE, severidad, `scanned_at`),
+  save+find_by_correlation_id (+ desconocido → `None`), id inexistente → `Ok(None)`,
+  forma del documento crudo (`correlation_id`/`timestamp`/`result.scanned_at` como
+  strings, timestamp en rango), `MongoHostKeyStore` remember/known + host
+  desconocido → `None` + persistencia entre instancias nuevas (`Client` nuevo) +
+  `remember` idempotente.
+- `./init.sh` → EXIT 0: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo test` (56 passed: config 8 + domain 7 + parser 11 + scanner 14
+  + ssh 7 + repository 9), `cargo test -- --ignored` (15 passed: repository 6 +
+  scanner 4 + ssh 5, con Docker real, sin regresión), `cargo doc --no-deps` limpio.
+- Sin `unwrap`/`expect`/`panic!` fuera de `#[cfg(test)]` (`now_rfc3339` usa
+  `unwrap_or_default()`, admisible).
+
+### Notas / seguimiento
+
+- Aprobado en ronda 1 sin cambios requeridos.
+- Archivos tocados: `src/ssh.rs`, `src/repository.rs` (era stub), `tests/repository.rs`
+  (nuevo), `tests/ssh.rs`, `tests/scanner.rs`, `Cargo.toml`/`Cargo.lock`,
+  `feature_list.json`.
+- Detalle: `progress/impl_mongo_persistence.md`, `progress/review_mongo_persistence.md`.
+  Investigación previa: `progress/explore_mongo.md`.
+- Commit pendiente (lo gestiona el leader): incluir `tests/repository.rs` y los
+  `progress/*.md` nuevos.

@@ -7,7 +7,7 @@
 //! `cargo test` los omite; `cargo test -- --ignored` los ejecuta.
 
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::SecretString;
@@ -150,7 +150,7 @@ async fn open_session(container: &ContainerAsync<GenericImage>) -> SshSession {
         .await
         .expect("puerto mapeado");
 
-    let store: Arc<Mutex<dyn HostKeyStore>> = Arc::new(Mutex::new(InMemoryHostKeyStore::new()));
+    let store: Arc<dyn HostKeyStore> = Arc::new(InMemoryHostKeyStore::new());
     let timeouts = SshTimeouts {
         connect: Duration::from_secs(20),
         command: Duration::from_secs(40),

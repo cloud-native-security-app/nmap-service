@@ -24,6 +24,8 @@ thiserror = "2"
 time = { version = "0.3", features = ["serde-well-known"] }
 russh = { version = "0.63", default-features = false, features = ["ring"] }
 roxmltree = "0.21"
+mongodb = "3"
+async-trait = "0.1"
 
 [dev-dependencies]
 testcontainers = "0.24"

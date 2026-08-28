@@ -4,7 +4,7 @@
 //! Todos requieren Docker y están marcados `#[ignore = "requiere Docker"]`:
 //! `cargo test` los omite; `cargo test -- --ignored` los ejecuta.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::SecretString;
@@ -36,8 +36,8 @@ fn creds(password: &str) -> SshCredentialsRef {
     SshCredentialsRef::new(SecretString::from(password.to_owned()))
 }
 
-fn empty_store() -> Arc<Mutex<dyn HostKeyStore>> {
-    Arc::new(Mutex::new(InMemoryHostKeyStore::new()))
+fn empty_store() -> Arc<dyn HostKeyStore> {
+    Arc::new(InMemoryHostKeyStore::new())
 }
 
 async fn start_sshd() -> ContainerAsync<GenericImage> {
@@ -145,7 +145,11 @@ async fn first_connection_stores_fingerprint_and_second_is_accepted() {
     let store = empty_store();
 
     assert!(
-        store.lock().unwrap().known_fingerprint(&host).is_none(),
+        store
+            .known_fingerprint(&host)
+            .await
+            .expect("consulta al almacén")
+            .is_none(),
         "el almacén parte vacío"
     );
 
@@ -153,7 +157,10 @@ async fn first_connection_stores_fingerprint_and_second_is_accepted() {
         .await
         .expect("primera conexión");
 
-    let remembered = store.lock().unwrap().known_fingerprint(&host);
+    let remembered = store
+        .known_fingerprint(&host)
+        .await
+        .expect("consulta al almacén");
     assert!(
         remembered.is_some(),
         "la primera conexión debe registrar el fingerprint del host"
@@ -164,7 +171,10 @@ async fn first_connection_stores_fingerprint_and_second_is_accepted() {
         .expect("segunda conexión al mismo host debe aceptarse");
 
     assert_eq!(
-        store.lock().unwrap().known_fingerprint(&host),
+        store
+            .known_fingerprint(&host)
+            .await
+            .expect("consulta al almacén"),
         remembered,
         "el fingerprint registrado no cambia entre conexiones"
     );
@@ -176,9 +186,12 @@ async fn changed_host_key_is_rejected_with_host_key_mismatch() {
     let container = start_sshd().await;
     let (host, port) = endpoint(&container).await;
 
-    let mut seeded = InMemoryHostKeyStore::new();
-    seeded.remember(&host, Fingerprint::from_sha256_bytes([0x42; 32]));
-    let store: Arc<Mutex<dyn HostKeyStore>> = Arc::new(Mutex::new(seeded));
+    let seeded = InMemoryHostKeyStore::new();
+    seeded
+        .remember(&host, Fingerprint::from_sha256_bytes([0x42; 32]))
+        .await
+        .expect("sembrar el almacén en memoria");
+    let store: Arc<dyn HostKeyStore> = Arc::new(seeded);
 
     let err = connect(&host, port, USER, &creds(PASS), &store, timeouts())
         .await

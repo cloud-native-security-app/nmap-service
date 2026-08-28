@@ -113,30 +113,70 @@ impl fmt::Display for Fingerprint {
     }
 }
 
+/// Error al consultar o actualizar un [`HostKeyStore`].
+///
+/// Las implementaciones respaldadas por IO (p. ej. la de MongoDB en
+/// `repository`) pueden fallar; la implementación en memoria nunca devuelve
+/// `Err`. Ningún mensaje incluye credenciales ni material de clave.
+#[derive(Debug, thiserror::Error)]
+pub enum HostKeyStoreError {
+    /// El almacén de respaldo no está disponible (p. ej. MongoDB caído o
+    /// inalcanzable). La conexión SSH se aborta en vez de continuar sin poder
+    /// verificar la identidad del host.
+    #[error("almacén de host keys no disponible: {0}")]
+    Unavailable(String),
+
+    /// Un registro del almacén tiene un formato inesperado o está corrupto
+    /// (p. ej. un fingerprint que no son 64 caracteres hexadecimales).
+    #[error("registro de host key inválido: {0}")]
+    Corrupt(String),
+}
+
 /// Almacén de fingerprints de host conocidos para la verificación TOFU.
 ///
 /// La primera conexión a un host guarda su fingerprint vía [`remember`];
 /// conexiones posteriores lo consultan vía [`known_fingerprint`] y rechazan la
 /// conexión si el fingerprint actual no coincide.
 ///
+/// El trait es `async` (vía `async-trait`) y dyn-compatible: se comparte
+/// como `Arc<dyn HostKeyStore>`. Ambos métodos toman `&self` y usan mutabilidad
+/// interior, de modo que no hace falta un `Mutex` externo. La implementación
+/// persistente (MongoDB) vive en `repository` para que el trust store sobreviva
+/// reinicios y se comparta entre réplicas del servicio.
+///
 /// [`remember`]: HostKeyStore::remember
 /// [`known_fingerprint`]: HostKeyStore::known_fingerprint
-pub trait HostKeyStore: Send {
+#[async_trait::async_trait]
+pub trait HostKeyStore: Send + Sync {
     /// Devuelve el fingerprint registrado para `host`, o `None` si el host es
     /// desconocido.
-    fn known_fingerprint(&self, host: &str) -> Option<Fingerprint>;
+    ///
+    /// # Errores
+    ///
+    /// [`HostKeyStoreError`] si el almacén de respaldo no está disponible o el
+    /// registro almacenado está corrupto.
+    async fn known_fingerprint(&self, host: &str)
+        -> Result<Option<Fingerprint>, HostKeyStoreError>;
 
     /// Registra (o sobrescribe) el fingerprint asociado a `host`.
-    fn remember(&mut self, host: &str, fingerprint: Fingerprint);
+    ///
+    /// # Errores
+    ///
+    /// [`HostKeyStoreError`] si el almacén de respaldo no está disponible.
+    async fn remember(&self, host: &str, fingerprint: Fingerprint)
+        -> Result<(), HostKeyStoreError>;
 }
 
 /// Implementación de [`HostKeyStore`] en memoria, para tests y desarrollo.
 ///
 /// No sobrevive a un reinicio del proceso; la implementación persistente vive en
-/// `repository` (feature `mongo_persistence`).
+/// `repository` (feature `mongo_persistence`). La sincronización es un
+/// [`std::sync::Mutex`] interno tomado y soltado dentro de cada método (sin
+/// cruzar ningún `.await`), por lo que sus operaciones son de hecho síncronas y
+/// nunca devuelven `Err`.
 #[derive(Debug, Default)]
 pub struct InMemoryHostKeyStore {
-    entries: HashMap<String, Fingerprint>,
+    entries: Mutex<HashMap<String, Fingerprint>>,
 }
 
 impl InMemoryHostKeyStore {
@@ -144,15 +184,31 @@ impl InMemoryHostKeyStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, Fingerprint>> {
+        match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 }
 
+#[async_trait::async_trait]
 impl HostKeyStore for InMemoryHostKeyStore {
-    fn known_fingerprint(&self, host: &str) -> Option<Fingerprint> {
-        self.entries.get(host).cloned()
+    async fn known_fingerprint(
+        &self,
+        host: &str,
+    ) -> Result<Option<Fingerprint>, HostKeyStoreError> {
+        Ok(self.entries().get(host).cloned())
     }
 
-    fn remember(&mut self, host: &str, fingerprint: Fingerprint) {
-        self.entries.insert(host.to_owned(), fingerprint);
+    async fn remember(
+        &self,
+        host: &str,
+        fingerprint: Fingerprint,
+    ) -> Result<(), HostKeyStoreError> {
+        self.entries().insert(host.to_owned(), fingerprint);
+        Ok(())
     }
 }
 
@@ -212,6 +268,12 @@ pub enum SshError {
         /// Host cuyo fingerprint no coincidió.
         host: String,
     },
+
+    /// No se pudo consultar o actualizar el almacén de host keys (TOFU). La
+    /// conexión se aborta: sin acceso al trust store no se puede verificar la
+    /// identidad del host.
+    #[error("no se pudo verificar la identidad del host: {0}")]
+    HostKeyStore(#[from] HostKeyStoreError),
 
     /// Fallo del protocolo SSH no cubierto por las demás variantes.
     #[error("error de protocolo SSH: {0}")]
@@ -274,14 +336,21 @@ fn classify_io(io: &std::io::Error, endpoint: Option<(&str, u16)>) -> SshError {
 
 /// Verificador de host key para el handshake de `russh`.
 ///
-/// No guarda credenciales. `mismatch` se comparte con [`connect`] mediante un
-/// [`AtomicBool`]: si `check_server_key` detecta un fingerprint distinto al
-/// registrado, lo marca y devuelve `Ok(false)` (rechazo), y [`connect`] traduce
-/// el error resultante a [`SshError::HostKeyMismatch`].
+/// No guarda credenciales. Comparte dos slots con [`connect`], que los lee tras
+/// el handshake para traducir el fallo a la variante de [`SshError`] correcta:
+///
+/// - `mismatch` ([`AtomicBool`]): `check_server_key` detectó un fingerprint
+///   distinto al registrado -> [`SshError::HostKeyMismatch`].
+/// - `store_error` ([`Mutex`]): `check_server_key` no pudo consultar/actualizar
+///   el [`HostKeyStore`] -> [`SshError::HostKeyStore`].
+///
+/// En ambos casos `check_server_key` devuelve `Ok(false)` (rechazo): nunca se
+/// acepta una clave sin verificarla.
 struct Verifier {
     host: String,
-    store: Arc<Mutex<dyn HostKeyStore>>,
+    store: Arc<dyn HostKeyStore>,
     mismatch: Arc<AtomicBool>,
+    store_error: Arc<Mutex<Option<HostKeyStoreError>>>,
 }
 
 impl client::Handler for Verifier {
@@ -297,35 +366,40 @@ impl client::Handler for Verifier {
         };
         let current = Fingerprint::from_host_public_key(key);
 
-        let trusted = verify_fingerprint(&self.store, &self.host, &current);
-        if !trusted {
-            self.mismatch.store(true, Ordering::SeqCst);
+        match verify_fingerprint(self.store.as_ref(), &self.host, &current).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.mismatch.store(true, Ordering::SeqCst);
+                Ok(false)
+            }
+            Err(err) => {
+                if let Ok(mut slot) = self.store_error.lock() {
+                    *slot = Some(err);
+                }
+                Ok(false)
+            }
         }
-        Ok(trusted)
     }
 }
 
 /// Decisión TOFU sobre el fingerprint `current` del host `host`:
 ///
-/// - host desconocido en `store` -> se registra y se acepta (`true`);
-/// - fingerprint registrado igual al actual -> se acepta (`true`);
-/// - fingerprint registrado distinto -> se rechaza (`false`) y **no** se
-///   sobrescribe el registrado.
-fn verify_fingerprint(
-    store: &Arc<Mutex<dyn HostKeyStore>>,
+/// - host desconocido en `store` -> se registra y se acepta (`Ok(true)`);
+/// - fingerprint registrado igual al actual -> se acepta (`Ok(true)`);
+/// - fingerprint registrado distinto -> se rechaza (`Ok(false)`) y **no** se
+///   sobrescribe el registrado;
+/// - fallo del almacén -> `Err(HostKeyStoreError)` (la conexión se abortará).
+async fn verify_fingerprint(
+    store: &dyn HostKeyStore,
     host: &str,
     current: &Fingerprint,
-) -> bool {
-    let mut store = match store.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    match store.known_fingerprint(host) {
+) -> Result<bool, HostKeyStoreError> {
+    match store.known_fingerprint(host).await? {
         None => {
-            store.remember(host, current.clone());
-            true
+            store.remember(host, current.clone()).await?;
+            Ok(true)
         }
-        Some(known) => &known == current,
+        Some(known) => Ok(&known == current),
     }
 }
 
@@ -399,6 +473,8 @@ impl SshSession {
 /// - [`SshError::Unreachable`] si el host no es alcanzable por la red.
 /// - [`SshError::HostKeyMismatch`] si el fingerprint del host difiere del
 ///   registrado en `store` (la conexión se rechaza).
+/// - [`SshError::HostKeyStore`] si no se puede consultar/actualizar `store`
+///   (p. ej. el almacén respaldado por MongoDB está caído).
 /// - [`SshError::AuthFailed`] si el servidor rechaza las credenciales.
 /// - [`SshError::Protocol`] / [`SshError::Io`] para el resto de fallos.
 pub async fn connect(
@@ -406,15 +482,17 @@ pub async fn connect(
     port: u16,
     user: &str,
     credentials: &SshCredentialsRef,
-    store: &Arc<Mutex<dyn HostKeyStore>>,
+    store: &Arc<dyn HostKeyStore>,
     timeouts: SshTimeouts,
 ) -> Result<SshSession, SshError> {
     let config = Arc::new(client::Config::default());
     let mismatch = Arc::new(AtomicBool::new(false));
+    let store_error: Arc<Mutex<Option<HostKeyStoreError>>> = Arc::new(Mutex::new(None));
     let verifier = Verifier {
         host: host.to_owned(),
         store: Arc::clone(store),
         mismatch: Arc::clone(&mismatch),
+        store_error: Arc::clone(&store_error),
     };
 
     let handshake = client::connect(config, (host, port), verifier);
@@ -422,6 +500,9 @@ pub async fn connect(
         Err(_) => return Err(SshError::Timeout),
         Ok(Ok(handle)) => handle,
         Ok(Err(err)) => {
+            if let Some(store_err) = store_error.lock().ok().and_then(|mut slot| slot.take()) {
+                return Err(SshError::HostKeyStore(store_err));
+            }
             if mismatch.load(Ordering::SeqCst) {
                 return Err(SshError::HostKeyMismatch {
                     host: host.to_owned(),
@@ -449,21 +530,24 @@ pub async fn connect(
 mod tests {
     use super::*;
 
-    fn store_handle(store: InMemoryHostKeyStore) -> Arc<Mutex<dyn HostKeyStore>> {
-        Arc::new(Mutex::new(store))
+    fn store_handle(store: InMemoryHostKeyStore) -> Arc<dyn HostKeyStore> {
+        Arc::new(store)
     }
 
-    #[test]
-    fn in_memory_store_remembers_and_returns_fingerprint() {
-        let mut store = InMemoryHostKeyStore::new();
+    #[tokio::test]
+    async fn in_memory_store_remembers_and_returns_fingerprint() {
+        let store = InMemoryHostKeyStore::new();
         let fp = Fingerprint::from_sha256_bytes([7u8; 32]);
 
-        assert_eq!(store.known_fingerprint("192.0.2.10"), None);
+        assert_eq!(store.known_fingerprint("192.0.2.10").await.unwrap(), None);
 
-        store.remember("192.0.2.10", fp.clone());
+        store.remember("192.0.2.10", fp.clone()).await.unwrap();
 
-        assert_eq!(store.known_fingerprint("192.0.2.10"), Some(fp));
-        assert_eq!(store.known_fingerprint("192.0.2.11"), None);
+        assert_eq!(
+            store.known_fingerprint("192.0.2.10").await.unwrap(),
+            Some(fp)
+        );
+        assert_eq!(store.known_fingerprint("192.0.2.11").await.unwrap(), None);
     }
 
     #[test]
@@ -503,6 +587,10 @@ mod tests {
             .to_string(),
             SshError::Protocol("kex failed".to_owned()).to_string(),
             SshError::Io("broken pipe".to_owned()).to_string(),
+            SshError::HostKeyStore(HostKeyStoreError::Unavailable("mongo caído".to_owned()))
+                .to_string(),
+            SshError::HostKeyStore(HostKeyStoreError::Corrupt("hex de 10 chars".to_owned()))
+                .to_string(),
         ]
         .join(" | ");
 
@@ -520,38 +608,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tofu_decision_unknown_host_is_remembered_and_accepted() {
+    #[tokio::test]
+    async fn tofu_decision_unknown_host_is_remembered_and_accepted() {
         let store = store_handle(InMemoryHostKeyStore::new());
         let fp = Fingerprint::from_sha256_bytes([1u8; 32]);
 
-        let accepted = verify_fingerprint(&store, "target", &fp);
+        let accepted = verify_fingerprint(store.as_ref(), "target", &fp)
+            .await
+            .expect("el almacén en memoria no falla");
 
         assert!(accepted);
-        assert_eq!(store.lock().unwrap().known_fingerprint("target"), Some(fp));
+        assert_eq!(store.known_fingerprint("target").await.unwrap(), Some(fp));
     }
 
-    #[test]
-    fn tofu_decision_matching_fingerprint_is_accepted() {
-        let mut seed = InMemoryHostKeyStore::new();
+    #[tokio::test]
+    async fn tofu_decision_matching_fingerprint_is_accepted() {
+        let seed = InMemoryHostKeyStore::new();
         let fp = Fingerprint::from_sha256_bytes([2u8; 32]);
-        seed.remember("target", fp.clone());
+        seed.remember("target", fp.clone()).await.unwrap();
         let store = store_handle(seed);
 
-        assert!(verify_fingerprint(&store, "target", &fp));
+        assert!(verify_fingerprint(store.as_ref(), "target", &fp)
+            .await
+            .expect("el almacén en memoria no falla"));
     }
 
-    #[test]
-    fn tofu_decision_changed_fingerprint_is_rejected() {
-        let mut seed = InMemoryHostKeyStore::new();
-        seed.remember("target", Fingerprint::from_sha256_bytes([3u8; 32]));
+    #[tokio::test]
+    async fn tofu_decision_changed_fingerprint_is_rejected() {
+        let seed = InMemoryHostKeyStore::new();
+        seed.remember("target", Fingerprint::from_sha256_bytes([3u8; 32]))
+            .await
+            .unwrap();
         let store = store_handle(seed);
 
         let current = Fingerprint::from_sha256_bytes([9u8; 32]);
-        assert!(!verify_fingerprint(&store, "target", &current));
+        assert!(!verify_fingerprint(store.as_ref(), "target", &current)
+            .await
+            .expect("el almacén en memoria no falla"));
         // el fingerprint registrado no se sobrescribe ante un mismatch
         assert_eq!(
-            store.lock().unwrap().known_fingerprint("target"),
+            store.known_fingerprint("target").await.unwrap(),
             Some(Fingerprint::from_sha256_bytes([3u8; 32]))
         );
     }
