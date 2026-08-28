@@ -133,7 +133,7 @@
         "Se publica tanto el caso de éxito (resultado) como el caso de fallo (motivo del error)",
         "Test unitario verifica que un ScanResult se serializa correctamente al formato de mensaje esperado"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 10,

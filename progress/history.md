@@ -502,3 +502,61 @@ destruidos al terminar. Archivos: `open_ports_service_version.xml`,
 - Detalle: `progress/impl_broker_consumer.md`, `progress/review_broker_consumer.md`.
 - Commit pendiente (lo gestiona el leader): incluir `src/messaging/consumer.rs`
   y los `progress/*.md` nuevos.
+
+---
+
+## 2026-08-27 — Feature 9: broker_publisher
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó; corrección de flakiness aplicada
+  después, ver `progress/review_broker_publisher.md` y
+  `progress/impl_broker_publisher.md`)
+
+### Qué se hizo
+
+- Reescrito `src/messaging/publisher.rs` (era stub `//!`), con simetría de estilo
+  respecto a `consumer.rs`:
+  - `trait ScanResultSink` (`#[async_trait]`, `Send + Sync`, dyn-compatible),
+    método único `publish(&self, &ScanOutcome) -> Result<(), PublishError>`.
+  - `ScanOutcome` (`Serialize`/`Deserialize`, `#[serde(tag = "status",
+    rename_all = "snake_case")]`): `Completed { correlation_id, result }` y
+    `Failed { correlation_id, reason }`. Ambas variantes llevan `correlation_id`
+    aparte porque `ScanResult` no lo transporta; `ms-analisis` lo necesita para
+    correlacionar éxito y fallo. Shape del mensaje documentado en el rustdoc
+    (timestamp del ejemplo como `+00:00`, salida real de `time::serde::rfc3339`).
+  - `PublishError` (`thiserror`): `Transport(String)` y `Serialization(String)`.
+  - `encode_outcome(&ScanOutcome) -> Result<Vec<u8>, PublishError>`: cuerpo JSON
+    canónico reutilizable por los adaptadores reales.
+  - `log_outcome_published(&ScanOutcome)` + función pura privada
+    `outcome_log_fields` (`correlation_id`, `status`, `counts`): sólo campos no
+    sensibles, estructuralmente incapaz de llevar el `reason` o el `ScanResult`.
+  - `InMemoryScanResultSink` stub: `Mutex<Vec<ScanOutcome>>`, `published()` para
+    inspección en tests; cada `publish` serializa, traza y guarda copia.
+- `src/messaging/mod.rs`: doc del módulo actualizada (ya no "stub del
+  scaffolding"; enlaza los dos traits).
+- Sin dependencias nuevas en `Cargo.toml`.
+- 10 tests unitarios nuevos (serialización de `Completed` con shape concreto y
+  puertos/vulns anidados, `Failed` con `correlation_id`+`reason`, round-trip,
+  `encode_outcome`, accesor de `correlation_id`, stub registra éxito y fallo en
+  orden, contrato de `reason`, campos de log para fallo/éxito, no-panic). Total
+  75 unit verdes.
+
+### Corrección post-review (flakiness)
+
+- El test de logging original instalaba un `tracing_subscriber` global
+  (`with_default` + `MakeWriter` en memoria), igual que el test análogo de
+  `consumer.rs`. Al correr en paralelo, la caché global de interés de `tracing`
+  tiene una carrera conocida -> el evento se descartaba de forma no determinista
+  y `./init.sh` quedaba en rojo intermitente.
+- Fix: se extrajo la construcción de campos de log a la función pura
+  `outcome_log_fields`; los tests la verifican directamente, sin `tracing` ni
+  subscriber global. Sin dependencia nueva (`serial_test` descartado).
+- Verificado: `./init.sh` 5/5 verde (exit 0), `cargo test --lib` 10/10 verde.
+
+### Verificación
+
+- `./init.sh` verde (fmt + clippy `-D warnings` + 75 unit + Docker `--ignored`
+  15 verdes + doc), exit 0, 5 ejecuciones seguidas. Sin regresión en features 1-8.
+- Detalle: `progress/impl_broker_publisher.md`, `progress/review_broker_publisher.md`.
+- Commit pendiente (lo gestiona el leader): incluir `src/messaging/publisher.rs`,
+  `src/messaging/mod.rs` y los `progress/*.md` nuevos.
