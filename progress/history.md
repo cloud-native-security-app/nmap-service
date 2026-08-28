@@ -560,3 +560,104 @@ destruidos al terminar. Archivos: `open_ports_service_version.xml`,
 - Detalle: `progress/impl_broker_publisher.md`, `progress/review_broker_publisher.md`.
 - Commit pendiente (lo gestiona el leader): incluir `src/messaging/publisher.rs`,
   `src/messaging/mod.rs` y los `progress/*.md` nuevos.
+
+---
+
+## 2026-08-27 — feature 10 `scan_pipeline_wiring` (implementer)
+
+Orquestación end-to-end del pipeline `consumer -> ssh -> scanner -> parser ->
+repository -> publisher`. Estado final: **done** (reviewer aprobó en ronda 2).
+
+### Cambios
+
+- **`src/config.rs`** (ampliación mínima del wiring): 2 env vars requeridas
+  nuevas, mismo patrón que feature 2 (sin default; ausente/vacía/inválida ->
+  `ConfigError`):
+  - `MS_NMAP_SSH_PORT` (`SSH_PORT_VAR`) -> `Config::ssh_port: u16`, validada con
+    `parse_port` (no numérico / fuera de `1..=65535` -> `InvalidValue`). El
+    `ScanRequest` no trae puerto SSH; es config del despliegue.
+  - `MS_NMAP_MONGO_DB` (`MONGO_DB_VAR`) -> `Config::mongo_db: String` para
+    `MongoRepository::connect(uri, db_name)`. Decisión: env var explícita, no
+    derivar del path del URI (consistencia con el resto de la config).
+  - 5 tests nuevos + asserts en el test de config válida.
+- **`src/pipeline.rs`** (nuevo, `pub mod pipeline;` en `lib.rs`):
+  - `ScanPipeline { repo: MongoRepository, host_key_store: Arc<dyn HostKeyStore>,
+    sink: Arc<dyn ScanResultSink>, ssh_port: u16, ssh_timeouts: SshTimeouts,
+    scan_options: ScanOptions }`, deriva `Clone` (barato; `run` clona por
+    solicitud para despacharla a `tokio::spawn`).
+  - `process_one(&self, ScanRequest)`: `ssh::connect` -> `scanner::run_scan_with`
+    -> `parser::parse` -> `repo.save` -> `sink.publish(Completed)`. Cualquier
+    `Err` de etapa 1-4 -> `ScanOutcome::failed(correlation_id, err.to_string())`
+    publicado. Nunca propaga error ni hace panic. Si `sink.publish` falla ->
+    `tracing::error!` (con `correlation_id`, sin credenciales) y termina, sin
+    reintentos. Loggea inicio y desenlace.
+  - `run(&self, Arc<dyn ScanRequestSource>)`: bucle consumidor. `Ok(Some)` ->
+    `tokio::spawn(process_one)` (concurrencia real). `Ok(None)` -> sale.
+    `MalformedPayload|InvalidSchema` -> `warn!` y continúa. `Transport` ->
+    `error!` y sale (reconexión/backoff = responsabilidad del adaptador de
+    broker concreto, aún sin decidir). Al salir, `JoinSet` espera las tareas en
+    vuelo.
+  - Helper libre `next_valid_request` (extraído para testear el bucle sin
+    Docker). 3 tests unitarios sin Docker (skip de mensajes envenenados + fin
+    en `Ok(None)`; parada en `Transport`; construcción del `Failed` con
+    `correlation_id` correcto y `reason` sin credencial).
+- **`src/lib.rs`** — `run()` como composition root: `Config::from_env` ->
+  `MongoRepository::connect(&mongo_uri, &mongo_db)` -> `Arc<dyn HostKeyStore> =
+  Arc::new(repo.host_key_store())` (**el store de producción es el de Mongo**,
+  no el `InMemory`) -> construye `ScanPipeline` con `SshTimeouts` de la config,
+  `cfg.ssh_port` y `ScanOptions::default()`. No existe adaptador de broker real
+  todavía (features 8/9 sólo tienen stubs `InMemory`) -> `run()` valida config,
+  comprueba Mongo, deja el pipeline construido, emite `tracing::warn!` y retorna
+  limpio. Firma `run()` sin cambios (`-> ()`), `main.rs` intacto, sin `anyhow`.
+- **`src/messaging/publisher.rs`** (revisión ronda 1): 2 doc-comments (líneas
+  170/174) — enlace intra-doc a ítem privado `outcome_log_fields` -> texto
+  plano (0 warnings con `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`).
+- **`Cargo.toml`**: sin cambios (`tokio::task::JoinSet` ya disponible vía
+  `rt-multi-thread`).
+
+### Tests
+
+- **`tests/scan_pipeline.rs`** (nuevo, e2e `#[ignore = "requiere Docker"]`). El
+  stub de `nmap` vuelca el fixture real **`tests/fixtures/vuln_findings.xml`**
+  (ya documentado en `tests/fixtures/README.md`; no se añadió fixture nuevo —
+  revisión ronda 1).
+  - `stub_fixture_parses_into_the_expected_scan_result` (sin Docker): valida el
+    parseo del fixture (host 172.18.0.4, puertos 21/6667 open, `vsftpd 2.3.4`,
+    2 hallazgos `CVE-2011-2523`).
+  - `valid_request_flows_through_pipeline_and_is_published_and_persisted`
+    (criterios 1 y 2): sshd + stub nmap + `mongo:7`; 1 `Completed` con
+    `correlation_id` y contenido correctos; `ScanResult` en Mongo
+    (`find_by_correlation_id`); una segunda instancia de `MongoHostKeyStore` ve
+    el fingerprint TOFU (prueba que el pipeline usó el store de Mongo).
+  - `stage_failure_is_published_as_failed_outcome_without_crashing`
+    (criterio 3): objetivo sin stub de nmap -> `ScanError::ToolNotAvailable` ->
+    1 `Failed` con `correlation_id`, `reason` menciona nmap y no filtra la
+    credencial; sin panic; nada persistido.
+  - `multiple_requests_are_processed_concurrently` (criterio 4):
+    `#[tokio::test(flavor = "multi_thread")]`, 3 solicitudes concurrentes al
+    mismo sshd -> 3 `Completed`, cada uno con su `correlation_id`, los 3
+    persistidos. Warm-up TOFU previo para que la contención sea del pipeline y
+    no del upsert inicial del trust store.
+
+### Revisión
+
+- Ronda 1: `CHANGES_REQUESTED` — (1) fixture nuevo sin procedencia documentada
+  -> eliminado `tests/fixtures/pipeline_stub_scan.xml`, el e2e reutiliza
+  `vuln_findings.xml`; (2) 2 warnings de `cargo doc` en `publisher.rs` ->
+  corregidos.
+- Ronda 2: **APROBADO**.
+- Detalle: `progress/impl_scan_pipeline_wiring.md`,
+  `progress/review_scan_pipeline_wiring.md`.
+
+### Verificación
+
+- `./init.sh` verde y estable: 3 corridas tras implementación + 3 tras revisión
+  ronda 1 + 2 al cierre (exit 0, 0 `[FAIL]`), incluye `cargo test -- --ignored`
+  con contenedores reales sshd + `mongo:7`.
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` limpios.
+- Sin regresión: 82 tests unitarios + integración de features 1-9 verdes. Sin
+  `unwrap`/`expect`/`panic!` fuera de tests. Sin llamadas bloqueantes en async.
+- Commit pendiente (lo gestiona el leader): `src/config.rs`, `src/pipeline.rs`,
+  `src/lib.rs`, `src/messaging/publisher.rs`, `tests/scan_pipeline.rs`,
+  `feature_list.json`, `progress/*.md`.

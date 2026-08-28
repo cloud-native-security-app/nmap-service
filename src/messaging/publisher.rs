@@ -167,11 +167,11 @@ pub fn encode_outcome(outcome: &ScanOutcome) -> Result<Vec<u8>, PublishError> {
 ///
 /// # Seguridad
 ///
-/// Sólo emite los campos que devuelve [`outcome_log_fields`]: `correlation_id`,
+/// Sólo emite los campos que devuelve `outcome_log_fields`: `correlation_id`,
 /// `status` y, para el caso de éxito, los recuentos de puertos y
 /// vulnerabilidades. Esa función no tiene forma de exponer el `reason` de un
 /// fallo ni el `ScanResult` completo (ver `docs/security-scope.md`); testear
-/// [`outcome_log_fields`] directamente evita depender de un subscriber global de
+/// `outcome_log_fields` directamente evita depender de un subscriber global de
 /// `tracing` en los tests.
 pub fn log_outcome_published(outcome: &ScanOutcome) {
     let fields = outcome_log_fields(outcome);

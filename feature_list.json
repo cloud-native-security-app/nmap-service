@@ -146,7 +146,7 @@
         "Un fallo en cualquier etapa (SSH, nmap, parseo, Mongo) se traduce en un mensaje de error publicado hacia el Broker, no en un crash del proceso",
         "El proceso maneja múltiples solicitudes concurrentes sin bloquear el runtime (async/await correcto, sin llamadas bloqueantes fuera de spawn_blocking)"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 11,
