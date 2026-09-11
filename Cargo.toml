@@ -27,7 +27,14 @@ roxmltree = "0.21"
 mongodb = "3"
 async-trait = "0.1"
 csv = "1"
+# Cliente HTTP para el adaptador `enrichment::nvd::NvdApiEnricher` (API NVD
+# 2.0). `default-features = false` + `rustls-tls` evita arrastrar OpenSSL/
+# `native-tls`: mismo TLS que ya usa `mongodb` en este crate.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 testcontainers = "0.24"
 time = { version = "0.3", features = ["macros"] }
+# Servidor HTTP mock local para testear `NvdApiEnricher` sin egress de red real
+# hacia `services.nvd.nist.gov` (ver `docs/security-scope.md`).
+wiremock = "0.6"

@@ -61,7 +61,8 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
   | `ssh::RemoteExecutor` (`connect`)  | `ssh`         | `ssh::RusshExecutor`             |
   | `ssh::RemoteSession` (`run_command`) | `ssh`       | `ssh::SshSession`               |
   | `scanner::NmapScanner`             | `scanner`     | `scanner::NmapCliScanner`        |
-  | `enrichment::VulnEnricher`         | `enrichment`  | `enrichment::CompositeVulnEnricher` (con `enrichment::ExploitDbEnricher`) |
+  | `enrichment::VulnEnricher`         | `enrichment`  | `enrichment::CompositeVulnEnricher` (con `enrichment::ExploitDbEnricher` siempre, y `enrichment::NvdApiEnricher` si el egress a NVD está habilitado) |
+  | `enrichment::NvdCache`             | `enrichment`  | `repository::MongoNvdCache` (colección `nvd_cache`, TTL) |
   | `repository::ScanResultRepository` | `repository`  | `repository::MongoRepository`   |
 
   El **composition root** —el único sitio que nombra los adaptadores
@@ -78,7 +79,7 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 ## Capas
 
 1. **`config`** — carga de configuración desde variables de entorno (Mongo,
-   broker, timeouts SSH). Sin valores hardcodeados.
+   broker, timeouts SSH, egress opt-in de NVD). Sin valores hardcodeados.
 2. **`domain`** — tipos puros: `ScanRequest`, `ScanResult`, `PortFinding`,
    `VulnFinding`. Sin IO.
 3. **`ssh`** — conexión SSH y ejecución de comandos remotos. Expone
@@ -88,19 +89,35 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 5. **`parser`** — convierte el XML de `nmap` en `ScanResult`. Sin IO, testeable
    con fixtures. Captura también los `<cpe>` de cada servicio en
    `PortFinding.cpes`.
-6. **`enrichment` (`src/enrichment.rs`)** — etapa entre `parser` y `repository`:
-   cruza el `service`+`version` de cada `PortFinding` contra bases de
-   vulnerabilidades/exploits conocidos y añade `VulnFinding`s
-   (`source: VulnSource::ExploitDb`). Puerto `VulnEnricher` (dyn-compatible,
-   `async`). Adaptador actual: `ExploitDbEnricher`, un **lookup local sin egress
-   de red** sobre `files_exploits.csv` de Exploit-DB (bundleado en la imagen,
-   ver "Despliegue"); su matcher es deliberadamente conservador. `CompositeVulnEnricher`
-   combina varios enrichers y es el punto de extensión para adaptadores de API
-   futuros (NVD, Vulners, ...) sin tocar el pipeline. Es **best-effort**: un
-   fallo se registra con `tracing::warn!` y el escaneo continúa con los hallazgos
-   de `nmap` (nunca produce `ScanOutcome::Failed`). Los `VulnFinding` añadidos se
-   deduplican por CVE contra los que ya trajo `nmap`.
-7. **`repository`** — persistencia del `ScanResult` en MongoDB.
+6. **`enrichment` (`src/enrichment/`)** — etapa entre `parser` y `repository`:
+   cruza el `service`+`version`/CPE de cada `PortFinding` contra bases de
+   vulnerabilidades/exploits conocidos y añade `VulnFinding`s. Puerto
+   `VulnEnricher` (dyn-compatible, `async`), definido en `enrichment::mod`
+   junto con `CompositeVulnEnricher` y `EnrichError`. Dos adaptadores, cada uno
+   en su submódulo:
+   - `enrichment::exploitdb::ExploitDbEnricher` (`source: VulnSource::ExploitDb`):
+     un **lookup local sin egress de red** sobre `files_exploits.csv` de
+     Exploit-DB (bundleado en la imagen, ver "Despliegue"); su matcher es
+     deliberadamente conservador.
+   - `enrichment::nvd::NvdApiEnricher` (`source: VulnSource::Nvd`): consulta la
+     API NVD 2.0 por CPE. **Egress de red opt-in**
+     (`MS_NMAP_NVD_ENRICHMENT_ENABLED`, ver `docs/security-scope.md`), con caché
+     persistente en Mongo con TTL (`enrichment::NvdCache`, adaptador real
+     `repository::MongoNvdCache`) y rate limiting propio acorde a los límites de
+     NVD (sin dependencias externas de limitador).
+
+   `CompositeVulnEnricher` combina los adaptadores habilitados y es el punto de
+   extensión para adaptadores de API futuros (Vulners, ...) sin tocar el
+   pipeline. Es **best-effort**: un fallo se registra con `tracing::warn!` y el
+   escaneo continúa con los hallazgos de `nmap` (nunca produce
+   `ScanOutcome::Failed`); esto aplica tanto al composite (un enricher que falla
+   no tumba a los demás) como, dentro de `NvdApiEnricher`, a un CPE individual
+   (un CPE que falla no aborta los demás CPEs de la misma llamada). Los
+   `VulnFinding` añadidos se deduplican por CVE contra los que ya trajo `nmap` y
+   entre sí.
+7. **`repository`** — persistencia del `ScanResult` en MongoDB, del trust store
+   TOFU (`MongoHostKeyStore`) y de la caché de NVD con TTL (`MongoNvdCache`,
+   colección `nvd_cache`, índice `expireAfterSeconds` sobre `cached_at`).
 8. **`messaging`** — `consumer` (recibe `ScanRequest` del Broker) y
    `publisher` (envía `ScanResult` o error al Broker), cada uno detrás de un
    trait para no acoplar el resto del servicio a la tecnología del broker.
@@ -113,6 +130,8 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 10. **`wiring` (`src/wiring.rs`)** — composition root: construye los adaptadores
     reales de cada puerto desde la `Config` y los agrupa en `ServicePorts`. Si el
     CSV de Exploit-DB no carga, el servicio no arranca (`WiringError::Enrichment`).
+    `NvdApiEnricher` sólo se construye (y por tanto sólo existe la posibilidad de
+    egress hacia NVD) si `config.nvd_enrichment_enabled` es `true`.
 11. **`lib` (`src/lib.rs`)** — declara `pub mod` para cada capa anterior y
     expone `pub async fn run(ports, config, source)` que arma el `ScanPipeline`
     y lo pone a consumir.
@@ -138,8 +157,9 @@ Broker  ──(ScanRequest)──▶  messaging::consumer
                         parser::parse(xml)  →  ScanResult
                                    │
                                    ▼
-           enrichment::VulnEnricher::enrich(&ports)  (best-effort, offline)
-                    →  + VulnFinding{source: exploit_db}, dedup por CVE
+           enrichment::VulnEnricher::enrich(&ports)  (best-effort)
+                    →  + VulnFinding{source: exploit_db | nvd}, dedup por CVE
+                       (nvd sólo si egress habilitado, ver security-scope.md)
                                    │
                         ┌──────────┴──────────┐
                         ▼                     ▼
@@ -169,16 +189,20 @@ Broker  ──(ScanRequest)──▶  messaging::consumer
     `latest`/`main`). Sólo el CSV, no el CLI `searchsploit` (feature
     `vuln_enrichment`).
   - **Stage runtime** (`gcr.io/distroless/cc-debian12:nonroot`): contiene el
-    binario `ms-nmap`, los certificados CA del sistema (TLS a MongoDB y al Broker
-    vía `rustls`) y `files_exploits.csv` en `/opt/exploitdb/` (dato de sólo
-    lectura para `enrichment`; la ruta se fija con `ENV MS_NMAP_EXPLOITDB_CSV`).
-    Corre como usuario no-root (`nonroot`, uid 65532).
+    binario `ms-nmap`, los certificados CA del sistema (TLS a MongoDB, al Broker
+    y, si está habilitado, a la API NVD, todos vía `rustls`) y
+    `files_exploits.csv` en `/opt/exploitdb/` (dato de sólo lectura para
+    `enrichment`; la ruta se fija con `ENV MS_NMAP_EXPLOITDB_CSV`). Corre como
+    usuario no-root (`nonroot`, uid 65532).
 - La imagen final **no incluye**: la toolchain de Rust, el código fuente, shell
   ni coreutils, el CLI `searchsploit`, ni el binario `nmap`. `nmap` se ejecuta en
   la máquina objetivo vía SSH (ver "SSH al objetivo, no escaneo local"), no en el
   contenedor de `ms-nmap`. Tampoco lleva `openssh-client`: `russh` es Rust puro.
-  El enriquecimiento de vulnerabilidades es un lookup en memoria sobre el CSV
-  bundleado: **sin egress de red**.
+  El enriquecimiento de vulnerabilidades de Exploit-DB es un lookup en memoria
+  sobre el CSV bundleado: **sin egress de red**. El enriquecimiento de NVD
+  (`enrichment::nvd::NvdApiEnricher`) sí es egress de red, pero **opt-in**: sólo
+  ocurre si el despliegue fija `MS_NMAP_NVD_ENRICHMENT_ENABLED=true` (ver
+  `docs/security-scope.md`).
 - Toda la configuración se inyecta por variables de entorno (ver `config` y
   `README.md`). Las imágenes base se fijan por tag concreto y por digest
   `@sha256:...` (nunca `latest`).

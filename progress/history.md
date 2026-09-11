@@ -883,3 +883,107 @@ después (83 tras añadir un test unitario sin Docker).
   `tests/fixtures/{exploitdb_sample.csv,README.md}`, `feature_list.json`,
   `progress/*.md`.
 - Con esta feature, las 13 del `feature_list.json` quedan en `done`.
+
+---
+
+## 2026-09-11 — Feature 14: nvd_enrichment
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó sin cambios requeridos, ver
+  `progress/review_nvd_enrichment.md`)
+
+### Qué se hizo
+
+Segundo adaptador de `VulnEnricher` (feature 13), esta vez **online**:
+`NvdApiEnricher` consulta la API NVD 2.0 por CPE, con egress de red **opt-in**
+y caché persistente en Mongo con TTL.
+
+- **Split de módulo**: `src/enrichment.rs` (>500 líneas) se dividió en
+  `src/enrichment/{mod.rs, exploitdb.rs, nvd.rs}`. `mod.rs` conserva
+  `EnrichError`, el trait `VulnEnricher` y `CompositeVulnEnricher`;
+  `exploitdb.rs` es `ExploitDbEnricher` reubicado sin cambios; `nvd.rs` es el
+  adaptador nuevo.
+- **`src/domain.rs`**: `VulnSource::Nvd` + test de encoding estable.
+- **`src/enrichment/nvd.rs`** (nuevo): `NvdApiEnricher { client, api_key,
+  base_url, cache, min_interval, last_request }`. `new`/`with_base_url`
+  (constructor de test para apuntar a `wiremock`). Conversión CPE 2.2→2.3 pura
+  (`cpe22_to_cpe23`, rellena con `*` los 7 campos que `nmap` no reporta).
+  `enrich`: dedup de CPEs con `HashSet`, cache-first, rate limiting propio
+  (`tokio::sync::Mutex<Option<Instant>>`; 6.5s sin `apiKey`, 0.7s con ella —
+  límites documentados de NVD: 5/30s y 50/30s respectivamente), `EnrichError::
+  Backend` por CPE sin abortar los demás. Mapeo de severidad: v3.1 > v3.0 > v2
+  por `baseSeverity`; v2 sin `baseSeverity` usa umbrales NVD sobre `baseScore`
+  (<4.0/4.0-6.9/≥7.0); sin métricas → `Unknown`. Trait `NvdCache` (`get`/`put`
+  async) + `InMemoryNvdCache` (para tests sin Docker). Tests con `wiremock`
+  (servidor mock local, cero llamadas reales a NVD): mapeo completo,
+  conversión CPE con el CPE real del fixture, severidad (3 caminos), caché
+  evita segunda llamada HTTP, dedup de CPEs repetidos, HTTP 500 en un CPE no
+  aborta los demás, servidor caído → `Ok(vec![])` sin panic.
+- **`src/repository.rs`**: nueva colección `nvd_cache`; `MongoNvdCache`
+  implementa `NvdCache` (documento `{_id: <cpe23>, findings, cached_at:
+  BsonDateTime}` — **desviación documentada**: `cached_at` es una fecha BSON
+  nativa, no una cadena RFC 3339 como el resto del repositorio, porque el
+  índice TTL de Mongo sólo funciona sobre fechas BSON reales).
+  `MongoRepository::nvd_cache_store(ttl) -> Result<MongoNvdCache, RepoError>`
+  (async, a diferencia de `host_key_store()`: asegura el índice TTL de forma
+  idempotente, con fallback a `collMod` si el TTL ya existía con otro valor —
+  MongoDB rechaza cambiarlo vía `createIndexes`).
+- **`src/config.rs`**: `NVD_ENRICHMENT_ENABLED_VAR` (requerida, `"true"`/
+  `"false"` estricto), `NVD_API_KEY_VAR` (genuinamente opcional),
+  `NVD_CACHE_TTL_VAR` (requerida sólo si el enriquecimiento está habilitado).
+  9 tests nuevos cubriendo los 4 caminos pedidos por el acceptance.
+- **`src/wiring.rs`**: si `config.nvd_enrichment_enabled`, construye
+  `NvdApiEnricher` (con `repo.nvd_cache_store(ttl)` como caché) y lo añade al
+  `CompositeVulnEnricher` junto a `ExploitDbEnricher`; si no, el composite sólo
+  lleva ExploitDB — cero llamadas de red posibles (verificado en código, no
+  sólo en tests). `WiringError::InvalidNvdConfig` defensivo (invariante de
+  `Config` que no debería romperse nunca). `clone_secret` reconstruye el
+  `SecretString` de la API key porque `SecretString` no es `Clone`.
+- **`Cargo.toml`**: `+ reqwest` (`default-features = false` + `rustls-tls`,
+  mismo TLS que `mongodb`, sin OpenSSL/`native-tls`); `+ wiremock` (sólo
+  dev-dependency).
+- **Docs**: `docs/security-scope.md` (nueva sección "Enriquecimiento de
+  vulnerabilidades desde la API NVD": egress opt-in, único dato enviado
+  —el CPE—, caché, rate limiting, contrato best-effort), `docs/architecture.md`
+  (tabla de puertos/adaptadores, capa `enrichment` con submódulos, diagrama de
+  flujo, sección Despliegue), `README.md` (nuevas env vars + ejemplo de
+  `docker run` con NVD habilitado).
+- **Tests de integración** (`tests/repository.rs`, `#[ignore = "requiere
+  Docker"]`, `mongo:7` real): put/get de `MongoNvdCache`, miss de un CPE
+  desconocido, creación del índice TTL con el `expireAfterSeconds` esperado
+  (verificado vía `list_indexes` crudo), idempotencia al llamar dos veces con
+  el mismo TTL, actualización del TTL vía `collMod` al cambiarlo. Esperar la
+  expiración real (job de fondo de Mongo, ~60s) se consideró impráctico; se
+  documentó la decisión en el propio test.
+
+### Revisión
+
+- Ronda 1: **APROBADO** sin cambios requeridos. El reviewer verificó línea por
+  línea que `NvdApiEnricher` sólo se construye dentro del `if
+  config.nvd_enrichment_enabled` de `wiring.rs` (cero rutas de código con
+  posibilidad de egress si está deshabilitado), que sólo el CPE viaja en la
+  request HTTP (`PortFinding` no expone IP/`correlation_id`/credenciales al
+  enricher), y hizo `cargo tree -i native-tls`/`-i openssl-sys` sin resultados
+  (confirma que `rustls-tls` no arrastra OpenSSL). Los 14 criterios de
+  `acceptance` verificados con evidencia de código y test concretos.
+- Detalle: `progress/impl_nvd_enrichment.md`, `progress/review_nvd_enrichment.md`.
+
+### Verificación
+
+- `./init.sh` verde en 3 corridas del implementer + 3 del reviewer + 1 de
+  cierre (exit 0, 0 `[FAIL]`), incluye `cargo test -- --ignored` con
+  contenedores reales `mongo:7` + `sshd`.
+- `cargo test`: **115 unitarios** verdes (baseline 97 → +18: 9 `config`, 1
+  `domain`, 8 `enrichment::nvd`). `cargo test -- --ignored`: **23** verdes
+  (baseline 18 → +5, todos de `MongoNvdCache`).
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` limpios.
+- Sin `unwrap`/`expect`/`panic!` fuera de tests. Sin regresión en features
+  1-13. Sin llamadas reales a NVD en ningún test (`wiremock` local).
+- Commit pendiente (lo gestiona el leader): `Cargo.toml`, `Cargo.lock`,
+  `README.md`, `docs/architecture.md`, `docs/security-scope.md`,
+  `src/domain.rs`, `src/pipeline.rs`, `src/repository.rs`, `src/config.rs`,
+  `src/wiring.rs`, `src/enrichment.rs` (eliminado) →
+  `src/enrichment/{mod,exploitdb,nvd}.rs` (nuevos), `tests/repository.rs`,
+  `feature_list.json`, `progress/*.md`.
+- Con esta feature, las 14 del `feature_list.json` quedan en `done`.

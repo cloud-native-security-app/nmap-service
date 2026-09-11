@@ -32,15 +32,18 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
-use mongodb::bson::{doc, oid::ObjectId, Bson, Document};
+use mongodb::bson::{self, doc, oid::ObjectId, Bson, DateTime as BsonDateTime, Document};
 use mongodb::error::ErrorKind;
-use mongodb::{Client, Collection};
+use mongodb::options::IndexOptions;
+use mongodb::{Client, Collection, Database, IndexModel};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::domain::{CorrelationId, ScanResult};
+use crate::domain::{CorrelationId, ScanResult, VulnFinding};
+use crate::enrichment::{EnrichError, NvdCache};
 use crate::ssh::{Fingerprint, HostKeyStore, HostKeyStoreError};
 
 /// Colección donde se guardan los [`ScanResult`].
@@ -48,6 +51,13 @@ const SCAN_RESULTS_COLLECTION: &str = "scan_results";
 
 /// Colección donde [`MongoHostKeyStore`] guarda los fingerprints de host (TOFU).
 const HOST_KEYS_COLLECTION: &str = "ssh_host_keys";
+
+/// Colección donde [`MongoNvdCache`] cachea los hallazgos de NVD por CPE 2.3.
+const NVD_CACHE_COLLECTION: &str = "nvd_cache";
+
+/// Nombre del índice TTL (`expireAfterSeconds`) sobre `cached_at` en
+/// [`NVD_CACHE_COLLECTION`].
+const NVD_CACHE_TTL_INDEX_NAME: &str = "nvd_cache_ttl";
 
 /// Identificador de un [`ScanResult`] persistido: la representación hexadecimal
 /// (24 caracteres) del `ObjectId` que MongoDB asigna al documento.
@@ -157,8 +167,10 @@ struct StoredScan {
 /// de clonar (comparte el pool de conexiones del `Client` interno).
 #[derive(Debug, Clone)]
 pub struct MongoRepository {
+    database: Database,
     scans: Collection<StoredScan>,
     host_keys: Collection<Document>,
+    nvd_cache: Collection<Document>,
 }
 
 impl MongoRepository {
@@ -181,6 +193,8 @@ impl MongoRepository {
         Ok(Self {
             scans: database.collection(SCAN_RESULTS_COLLECTION),
             host_keys: database.collection(HOST_KEYS_COLLECTION),
+            nvd_cache: database.collection(NVD_CACHE_COLLECTION),
+            database,
         })
     }
 
@@ -190,6 +204,25 @@ impl MongoRepository {
         MongoHostKeyStore {
             collection: self.host_keys.clone(),
         }
+    }
+
+    /// Devuelve el [`NvdCache`] persistente respaldado por la colección
+    /// `nvd_cache` de esta misma base, asegurando de forma idempotente el
+    /// índice TTL (`expireAfterSeconds`) sobre `cached_at` con el valor `ttl`.
+    ///
+    /// Sólo se llama cuando el enriquecimiento NVD está habilitado (ver
+    /// [`crate::config::Config::nvd_enrichment_enabled`] y
+    /// [`crate::wiring::service_ports_from_config`]).
+    ///
+    /// # Errores
+    ///
+    /// [`RepoError`] si no se pudo crear o actualizar el índice TTL.
+    pub async fn nvd_cache_store(&self, ttl: Duration) -> Result<MongoNvdCache, RepoError> {
+        ensure_nvd_cache_ttl_index(&self.database, ttl).await?;
+        Ok(MongoNvdCache {
+            collection: self.nvd_cache.clone(),
+            ttl,
+        })
     }
 
     /// Persiste `result` junto con `correlation_id` y una marca temporal de
@@ -424,6 +457,136 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_default()
+}
+
+/// Documento tal como se guarda en la colección `nvd_cache`:
+/// `{ "_id": "<cpe23>", "findings": [...], "cached_at": <fecha BSON> }`.
+///
+/// ## Desviación respecto al `acceptance` de la feature (documentada)
+///
+/// El `acceptance` describe `cached_at` como una cadena RFC 3339 (mismo
+/// criterio que [`ScanResult::scanned_at`] o el `timestamp` de
+/// `scan_results`). Aquí se usa deliberadamente [`BsonDateTime`] (una fecha
+/// BSON nativa) en su lugar: el índice TTL de MongoDB (`expireAfterSeconds`)
+/// **sólo funciona sobre campos de tipo fecha BSON**, nunca sobre cadenas — con
+/// una cadena el documento nunca expiraría y la caché crecería sin límite. Es
+/// la misma clase de desviación pragmática que ya documenta este módulo para
+/// `save`/`connect`.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredNvdCacheEntry {
+    #[serde(rename = "_id")]
+    id: String,
+    findings: Vec<VulnFinding>,
+    cached_at: BsonDateTime,
+}
+
+/// Implementación de [`NvdCache`] respaldada por la colección `nvd_cache` de
+/// MongoDB, con un índice TTL sobre `cached_at` para expirar automáticamente
+/// las entradas tras `ttl`.
+///
+/// Se construye con [`MongoRepository::nvd_cache_store`], que asegura el
+/// índice antes de devolver la instancia. Es barato de clonar.
+#[derive(Debug, Clone)]
+pub struct MongoNvdCache {
+    collection: Collection<Document>,
+    ttl: Duration,
+}
+
+impl MongoNvdCache {
+    /// TTL configurado para esta caché (el mismo que se usó para construir su
+    /// índice `expireAfterSeconds`).
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+}
+
+#[async_trait::async_trait]
+impl NvdCache for MongoNvdCache {
+    async fn get(&self, cpe: &str) -> Result<Option<Vec<VulnFinding>>, EnrichError> {
+        let document = self
+            .collection
+            .find_one(doc! { "_id": cpe })
+            .await
+            .map_err(nvd_cache_error)?;
+
+        let Some(document) = document else {
+            return Ok(None);
+        };
+
+        let stored: StoredNvdCacheEntry = bson::from_document(document).map_err(|err| {
+            EnrichError::Backend(format!("documento de caché NVD inválido para {cpe}: {err}"))
+        })?;
+        Ok(Some(stored.findings))
+    }
+
+    async fn put(&self, cpe: &str, findings: &[VulnFinding]) -> Result<(), EnrichError> {
+        let entry = StoredNvdCacheEntry {
+            id: cpe.to_owned(),
+            findings: findings.to_vec(),
+            cached_at: BsonDateTime::now(),
+        };
+        let document = bson::to_document(&entry).map_err(|err| {
+            EnrichError::Backend(format!(
+                "no se pudo serializar la entrada de caché NVD para {cpe}: {err}"
+            ))
+        })?;
+
+        self.collection
+            .replace_one(doc! { "_id": cpe }, document)
+            .upsert(true)
+            .await
+            .map_err(nvd_cache_error)?;
+        Ok(())
+    }
+}
+
+fn nvd_cache_error(err: mongodb::error::Error) -> EnrichError {
+    EnrichError::Backend(err.to_string())
+}
+
+/// Crea (de forma idempotente) el índice TTL de [`NVD_CACHE_COLLECTION`] sobre
+/// `cached_at`, con `expireAfterSeconds = ttl`.
+///
+/// Si el índice ya existe con **el mismo** `ttl`, `create_index` no falla (es
+/// idempotente). Si ya existe con **otro** `ttl`, MongoDB rechaza
+/// `createIndexes` (error `IndexOptionsConflict`/`IndexKeySpecsConflict`):
+/// `collMod` es la única forma soportada de cambiar el `expireAfterSeconds` de
+/// un índice existente sin borrarlo primero, así que se usa como fallback.
+async fn ensure_nvd_cache_ttl_index(database: &Database, ttl: Duration) -> Result<(), RepoError> {
+    let collection: Collection<Document> = database.collection(NVD_CACHE_COLLECTION);
+    let index = IndexModel::builder()
+        .keys(doc! { "cached_at": 1 })
+        .options(
+            IndexOptions::builder()
+                .name(NVD_CACHE_TTL_INDEX_NAME.to_owned())
+                .expire_after(ttl)
+                .build(),
+        )
+        .build();
+
+    match collection.create_index(index).await {
+        Ok(_) => Ok(()),
+        Err(err) if is_index_options_conflict(&err) => {
+            database
+                .run_command(doc! {
+                    "collMod": NVD_CACHE_COLLECTION,
+                    "index": {
+                        "keyPattern": { "cached_at": 1 },
+                        "expireAfterSeconds": ttl.as_secs() as i64,
+                    }
+                })
+                .await?;
+            Ok(())
+        }
+        Err(err) => Err(RepoError::from(err)),
+    }
+}
+
+/// `true` si `err` es el error de MongoDB `IndexOptionsConflict` (código 85) o
+/// `IndexKeySpecsConflict` (código 86): el índice pedido ya existe con otras
+/// opciones (aquí, otro `expireAfterSeconds`).
+fn is_index_options_conflict(err: &mongodb::error::Error) -> bool {
+    matches!(&*err.kind, ErrorKind::Command(command) if command.code == 85 || command.code == 86)
 }
 
 #[cfg(test)]

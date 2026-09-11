@@ -243,6 +243,9 @@ pub enum VulnSource {
     /// El cruce offline contra el CSV de Exploit-DB
     /// ([`crate::enrichment::ExploitDbEnricher`]).
     ExploitDb,
+    /// La consulta online por CPE contra la API NVD 2.0
+    /// ([`crate::enrichment::NvdApiEnricher`]).
+    Nvd,
 }
 
 /// Un hallazgo de vulnerabilidad: de un script NSE de categoría `vuln`
@@ -462,6 +465,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&VulnSource::ExploitDb).expect("serializa"),
             "\"exploit_db\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VulnSource::Nvd).expect("serializa"),
+            "\"nvd\""
         );
     }
 

@@ -47,6 +47,29 @@ pub const SSH_COMMAND_TIMEOUT_VAR: &str = "MS_NMAP_SSH_COMMAND_TIMEOUT_SECS";
 /// fija esta variable con `ENV`).
 pub const EXPLOITDB_CSV_VAR: &str = "MS_NMAP_EXPLOITDB_CSV";
 
+/// Nombre de la variable de entorno que habilita (o no) el enriquecimiento
+/// online contra la API NVD 2.0 ([`crate::enrichment::NvdApiEnricher`]).
+///
+/// Es **egress opt-in**: requerida, sin valor por defecto, y su valor debe ser
+/// exactamente `"true"` o `"false"`. Si es `"false"`, [`crate::wiring`] no
+/// añade el adaptador NVD al composite y el servicio no hace ninguna llamada
+/// de red hacia `services.nvd.nist.gov` (ver `docs/security-scope.md`).
+pub const NVD_ENRICHMENT_ENABLED_VAR: &str = "MS_NMAP_NVD_ENRICHMENT_ENABLED";
+
+/// Nombre de la variable de entorno con la API key de NVD.
+///
+/// Genuinamente **opcional**: la propia API NVD 2.0 trata la key como
+/// opcional (sube el límite de tasa permitido, pero funciona sin ella). Vacía
+/// o ausente se interpreta como "sin autenticar", nunca como error.
+pub const NVD_API_KEY_VAR: &str = "MS_NMAP_NVD_API_KEY";
+
+/// Nombre de la variable de entorno con el TTL (segundos) de la caché
+/// persistente de hallazgos de NVD ([`crate::repository::MongoNvdCache`]).
+///
+/// Sólo es requerida si [`NVD_ENRICHMENT_ENABLED_VAR`] es `"true"`; si el
+/// enriquecimiento NVD está deshabilitado no se exige (ni se lee su valor).
+pub const NVD_CACHE_TTL_VAR: &str = "MS_NMAP_NVD_CACHE_TTL_SECS";
+
 /// Errores posibles al construir la [`Config`] del servicio.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -93,6 +116,17 @@ pub struct Config {
     /// Ruta al CSV de Exploit-DB (`files_exploits.csv`) para el enriquecimiento
     /// offline de vulnerabilidades.
     pub exploitdb_csv: String,
+    /// Si el enriquecimiento online contra la API NVD 2.0 está habilitado.
+    /// Egress opt-in: si es `false`, [`crate::wiring`] no construye el
+    /// adaptador NVD y no hay llamadas de red.
+    pub nvd_enrichment_enabled: bool,
+    /// API key de NVD. Genuinamente opcional: `None` si está ausente o vacía.
+    /// Contenido redactado en `Debug`.
+    pub nvd_api_key: Option<SecretString>,
+    /// TTL de la caché persistente de hallazgos de NVD. `Some` sólo si
+    /// [`Config::nvd_enrichment_enabled`] es `true` (en ese caso es
+    /// obligatorio); `None` si el enriquecimiento NVD está deshabilitado.
+    pub nvd_cache_ttl: Option<Duration>,
 }
 
 impl Config {
@@ -103,11 +137,14 @@ impl Config {
     /// - [`ConfigError::MissingVar`] si falta (o está vacía) una variable
     ///   requerida: [`MONGO_URI_VAR`], [`MONGO_DB_VAR`], [`SSH_PORT_VAR`],
     ///   [`BROKER_ENDPOINT_VAR`], [`BROKER_CREDENTIAL_VAR`],
-    ///   [`SSH_CONNECT_TIMEOUT_VAR`], [`SSH_COMMAND_TIMEOUT_VAR`] o
-    ///   [`EXPLOITDB_CSV_VAR`].
+    ///   [`SSH_CONNECT_TIMEOUT_VAR`], [`SSH_COMMAND_TIMEOUT_VAR`],
+    ///   [`EXPLOITDB_CSV_VAR`], [`NVD_ENRICHMENT_ENABLED_VAR`], o
+    ///   [`NVD_CACHE_TTL_VAR`] cuando [`NVD_ENRICHMENT_ENABLED_VAR`] es
+    ///   `"true"`.
     /// - [`ConfigError::InvalidValue`] si un timeout está presente pero no es
-    ///   un entero de segundos positivo, o si [`SSH_PORT_VAR`] no es un entero
-    ///   en el rango `1..=65535`.
+    ///   un entero de segundos positivo, si [`SSH_PORT_VAR`] no es un entero en
+    ///   el rango `1..=65535`, o si [`NVD_ENRICHMENT_ENABLED_VAR`] no es
+    ///   exactamente `"true"` o `"false"`.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_source(|key| std::env::var(key).ok())
     }
@@ -131,6 +168,17 @@ impl Config {
             parse_timeout(SSH_COMMAND_TIMEOUT_VAR, lookup(SSH_COMMAND_TIMEOUT_VAR))?;
         let exploitdb_csv = required(EXPLOITDB_CSV_VAR, lookup(EXPLOITDB_CSV_VAR))?;
 
+        let nvd_enrichment_enabled = parse_strict_bool(
+            NVD_ENRICHMENT_ENABLED_VAR,
+            lookup(NVD_ENRICHMENT_ENABLED_VAR),
+        )?;
+        let nvd_api_key = optional_secret(lookup(NVD_API_KEY_VAR));
+        let nvd_cache_ttl = if nvd_enrichment_enabled {
+            Some(parse_timeout(NVD_CACHE_TTL_VAR, lookup(NVD_CACHE_TTL_VAR))?)
+        } else {
+            None
+        };
+
         Ok(Self {
             mongo_uri,
             mongo_db,
@@ -140,6 +188,9 @@ impl Config {
             ssh_connect_timeout,
             ssh_command_timeout,
             exploitdb_csv,
+            nvd_enrichment_enabled,
+            nvd_api_key,
+            nvd_cache_ttl,
         })
     }
 }
@@ -197,6 +248,29 @@ fn parse_timeout(var: &'static str, raw: Option<String>) -> Result<Duration, Con
     Ok(Duration::from_secs(secs))
 }
 
+/// Parsea una variable booleana requerida cuyo valor debe ser exactamente
+/// `"true"` o `"false"` (sin `"1"`/`"0"`/mayúsculas ni ningún otro alias): una
+/// variable de egress opt-in como [`NVD_ENRICHMENT_ENABLED_VAR`] no debe
+/// tener ambigüedad sobre qué valor la activa.
+fn parse_strict_bool(var: &'static str, raw: Option<String>) -> Result<bool, ConfigError> {
+    let value = required(var, raw)?;
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(ConfigError::InvalidValue {
+            var,
+            reason: format!("se esperaba \"true\" o \"false\", se recibió {other:?}"),
+        }),
+    }
+}
+
+/// Lee una variable genuinamente opcional como [`SecretString`]: ausente o
+/// vacía (tras `trim`) es `None`, sin error; cualquier otro valor es `Some`.
+fn optional_secret(raw: Option<String>) -> Option<SecretString> {
+    raw.filter(|value| !value.trim().is_empty())
+        .map(SecretString::from)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -217,6 +291,7 @@ mod tests {
             (SSH_CONNECT_TIMEOUT_VAR, "7"),
             (SSH_COMMAND_TIMEOUT_VAR, "120"),
             (EXPLOITDB_CSV_VAR, "/opt/exploitdb/files_exploits.csv"),
+            (NVD_ENRICHMENT_ENABLED_VAR, "false"),
         ])
     }
 
@@ -239,6 +314,104 @@ mod tests {
         assert_eq!(config.ssh_connect_timeout, Duration::from_secs(7));
         assert_eq!(config.ssh_command_timeout, Duration::from_secs(120));
         assert_eq!(config.exploitdb_csv, "/opt/exploitdb/files_exploits.csv");
+        assert!(!config.nvd_enrichment_enabled);
+        assert!(config.nvd_api_key.is_none());
+        assert!(config.nvd_cache_ttl.is_none());
+    }
+
+    #[test]
+    fn nvd_enabled_without_cache_ttl_is_a_typed_error() {
+        let mut vars = valid_vars();
+        vars.insert(NVD_ENRICHMENT_ENABLED_VAR, "true");
+        // Sin NVD_CACHE_TTL_VAR.
+
+        let err = config_from(&vars).expect_err("NVD habilitado sin TTL de caché debe fallar");
+
+        assert!(matches!(err, ConfigError::MissingVar(NVD_CACHE_TTL_VAR)));
+    }
+
+    #[test]
+    fn nvd_enabled_with_cache_ttl_loads_ok() {
+        let mut vars = valid_vars();
+        vars.insert(NVD_ENRICHMENT_ENABLED_VAR, "true");
+        vars.insert(NVD_CACHE_TTL_VAR, "86400");
+
+        let config = config_from(&vars).expect("NVD habilitado con TTL debe cargar");
+
+        assert!(config.nvd_enrichment_enabled);
+        assert_eq!(config.nvd_cache_ttl, Some(Duration::from_secs(86400)));
+    }
+
+    #[test]
+    fn nvd_disabled_without_cache_ttl_or_api_key_loads_ok() {
+        let mut vars = valid_vars();
+        vars.insert(NVD_ENRICHMENT_ENABLED_VAR, "false");
+        // Sin NVD_CACHE_TTL_VAR ni NVD_API_KEY_VAR: no se exigen deshabilitado.
+
+        let config = config_from(&vars).expect("NVD deshabilitado no exige TTL ni API key");
+
+        assert!(!config.nvd_enrichment_enabled);
+        assert!(config.nvd_cache_ttl.is_none());
+        assert!(config.nvd_api_key.is_none());
+    }
+
+    #[test]
+    fn nvd_enrichment_enabled_var_rejects_non_boolean_values() {
+        for bad in ["1", "yes", "TRUE", ""] {
+            let mut vars = valid_vars();
+            vars.insert(NVD_ENRICHMENT_ENABLED_VAR, bad);
+
+            let err = config_from(&vars).expect_err(&format!("{bad:?} no es un booleano válido"));
+
+            match (bad, err) {
+                ("", ConfigError::MissingVar(NVD_ENRICHMENT_ENABLED_VAR)) => {}
+                (_, ConfigError::InvalidValue { var, .. }) => {
+                    assert_eq!(var, NVD_ENRICHMENT_ENABLED_VAR)
+                }
+                (bad, other) => {
+                    panic!("valor {bad:?}: se esperaba error tipado, se obtuvo {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_nvd_enrichment_enabled_var_yields_typed_missing_var_error() {
+        let mut vars = valid_vars();
+        vars.remove(NVD_ENRICHMENT_ENABLED_VAR);
+
+        let err = config_from(&vars).expect_err("sin NVD_ENRICHMENT_ENABLED debe fallar");
+
+        assert!(matches!(
+            err,
+            ConfigError::MissingVar(NVD_ENRICHMENT_ENABLED_VAR)
+        ));
+    }
+
+    #[test]
+    fn empty_nvd_api_key_is_none() {
+        let mut vars = valid_vars();
+        vars.insert(NVD_API_KEY_VAR, "   ");
+
+        let config = config_from(&vars).expect("API key vacía no debe fallar la carga");
+
+        assert!(config.nvd_api_key.is_none());
+    }
+
+    #[test]
+    fn present_nvd_api_key_is_some() {
+        let mut vars = valid_vars();
+        vars.insert(NVD_API_KEY_VAR, "abc123-api-key");
+
+        let config = config_from(&vars).expect("config válida");
+
+        assert_eq!(
+            config
+                .nvd_api_key
+                .expect("API key presente debe ser Some")
+                .expose_secret(),
+            "abc123-api-key"
+        );
     }
 
     #[test]
@@ -393,6 +566,20 @@ mod tests {
         assert!(
             !rendered.contains("s3cr3t-token"),
             "Debug de Config no debe exponer la credencial: {rendered}"
+        );
+    }
+
+    #[test]
+    fn debug_output_does_not_leak_nvd_api_key() {
+        let mut vars = valid_vars();
+        vars.insert(NVD_API_KEY_VAR, "nvd-super-secret-key");
+
+        let config = config_from(&vars).expect("config válida");
+        let rendered = format!("{config:?}");
+
+        assert!(
+            !rendered.contains("nvd-super-secret-key"),
+            "Debug de Config no debe exponer la API key de NVD: {rendered}"
         );
     }
 }

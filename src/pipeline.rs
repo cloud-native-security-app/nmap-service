@@ -52,7 +52,9 @@ pub struct ServicePorts {
     /// Puerto de enriquecimiento de vulnerabilidades: se ejecuta entre `parser`
     /// y `repository` (adaptador real
     /// [`crate::enrichment::CompositeVulnEnricher`] con
-    /// [`crate::enrichment::ExploitDbEnricher`] dentro).
+    /// [`crate::enrichment::ExploitDbEnricher`] siempre, y
+    /// [`crate::enrichment::NvdApiEnricher`] sólo si el enriquecimiento NVD
+    /// está habilitado, ver `docs/security-scope.md`).
     pub enricher: Arc<dyn VulnEnricher>,
     /// Almacén de host keys TOFU. En producción es el respaldado por Mongo
     /// ([`crate::repository::MongoHostKeyStore`]), para que sobreviva reinicios

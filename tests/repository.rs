@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use mongodb::bson::{doc, oid::ObjectId, Document};
+use mongodb::IndexModel;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -21,6 +22,7 @@ use time::OffsetDateTime;
 use nmap_service::domain::{
     CorrelationId, PortFinding, PortState, Protocol, ScanResult, Severity, VulnFinding, VulnSource,
 };
+use nmap_service::enrichment::NvdCache;
 use nmap_service::repository::{MongoRepository, ScanId};
 use nmap_service::ssh::{Fingerprint, HostKeyStore};
 
@@ -288,4 +290,149 @@ async fn mongo_host_key_store_persists_across_new_instances() {
             .expect("consulta al almacén"),
         Some(Fingerprint::from_sha256_bytes([7u8; 32]))
     );
+}
+
+fn sample_nvd_findings() -> Vec<VulnFinding> {
+    vec![VulnFinding {
+        id: Some("CVE-2024-9999".to_owned()),
+        severity: Severity::High,
+        description: "hallazgo de prueba de la caché NVD".to_owned(),
+        nse_script: String::new(),
+        source: VulnSource::Nvd,
+        references: vec!["https://example.test/advisory".to_owned()],
+    }]
+}
+
+/// Devuelve `(keys, expire_after_seconds)` del índice cuyo `keys` sea
+/// exactamente `{"cached_at": 1}` en la colección `nvd_cache`, o `None` si no
+/// existe. Se consulta con un cliente "crudo" (no vía `MongoNvdCache`) para
+/// verificar la forma real del índice en el servidor.
+async fn nvd_cache_ttl_index_expire_after_seconds(
+    container: &ContainerAsync<GenericImage>,
+) -> Option<Duration> {
+    let client = mongodb::Client::with_uri_str(&uri(container).await)
+        .await
+        .expect("cliente raw");
+    let raw: mongodb::Collection<Document> = client.database(TEST_DB).collection("nvd_cache");
+
+    let mut cursor = raw.list_indexes().await.expect("listIndexes");
+    let mut found = None;
+    while cursor
+        .advance()
+        .await
+        .expect("avanzar el cursor de índices")
+    {
+        let index: IndexModel = cursor
+            .deserialize_current()
+            .expect("el índice se deserializa como IndexModel");
+        if index.keys == doc! { "cached_at": 1 } {
+            found = index.options.and_then(|options| options.expire_after);
+        }
+    }
+    found
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn nvd_cache_put_then_get_returns_the_same_findings() {
+    let container = start_mongo().await;
+    let repo = connect(&container).await;
+    let cache = repo
+        .nvd_cache_store(Duration::from_secs(3600))
+        .await
+        .expect("nvd_cache_store debe crear el índice TTL y devolver la caché");
+
+    let cpe = "cpe:2.3:a:openbsd:openssh:9.9:*:*:*:*:*:*:*";
+    assert!(
+        cache
+            .get(cpe)
+            .await
+            .expect("consulta a la caché no debe fallar")
+            .is_none(),
+        "un CPE nunca cacheado debe ser un miss"
+    );
+
+    let findings = sample_nvd_findings();
+    cache.put(cpe, &findings).await.expect("put no debe fallar");
+
+    let cached = cache
+        .get(cpe)
+        .await
+        .expect("consulta a la caché no debe fallar")
+        .expect("debe haber un hit justo después del put");
+    assert_eq!(cached, findings);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn nvd_cache_get_of_unknown_cpe_is_a_miss_not_an_error() {
+    let container = start_mongo().await;
+    let repo = connect(&container).await;
+    let cache = repo
+        .nvd_cache_store(Duration::from_secs(3600))
+        .await
+        .expect("nvd_cache_store no debe fallar");
+
+    let result = cache
+        .get("cpe:2.3:a:nadie:nada:0.0:*:*:*:*:*:*:*")
+        .await
+        .expect("un miss no es un error");
+    assert!(result.is_none());
+}
+
+/// El índice TTL de MongoDB expira documentos con un job de fondo que corre
+/// cada ~60s por defecto: esperar el borrado real dentro de un test haría el
+/// test lento y flaky. En su lugar, se verifica directamente contra el
+/// servidor que el índice `expireAfterSeconds` sobre `cached_at` se creó con
+/// el valor de `ttl` pasado a `nvd_cache_store` (documentado en
+/// `progress/impl_nvd_enrichment.md`).
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn nvd_cache_store_creates_a_ttl_index_with_the_configured_expire_after_seconds() {
+    let container = start_mongo().await;
+    let repo = connect(&container).await;
+
+    repo.nvd_cache_store(Duration::from_secs(3600))
+        .await
+        .expect("nvd_cache_store debe crear el índice TTL");
+
+    let expire_after = nvd_cache_ttl_index_expire_after_seconds(&container).await;
+    assert_eq!(expire_after, Some(Duration::from_secs(3600)));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn nvd_cache_store_is_idempotent_when_called_twice_with_the_same_ttl() {
+    let container = start_mongo().await;
+    let repo = connect(&container).await;
+
+    repo.nvd_cache_store(Duration::from_secs(1800))
+        .await
+        .expect("primera llamada debe crear el índice");
+    repo.nvd_cache_store(Duration::from_secs(1800))
+        .await
+        .expect("segunda llamada con el mismo TTL debe ser idempotente, no un error");
+
+    let expire_after = nvd_cache_ttl_index_expire_after_seconds(&container).await;
+    assert_eq!(expire_after, Some(Duration::from_secs(1800)));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn nvd_cache_store_updates_the_ttl_via_collmod_when_the_ttl_changes() {
+    let container = start_mongo().await;
+    let repo = connect(&container).await;
+
+    repo.nvd_cache_store(Duration::from_secs(60))
+        .await
+        .expect("primer TTL debe crear el índice");
+    // MongoDB rechaza `createIndexes` para un índice ya existente con otro
+    // `expireAfterSeconds` (ver `ensure_nvd_cache_ttl_index` en
+    // `src/repository.rs`); esta llamada debe recurrir a `collMod` y no fallar.
+    repo.nvd_cache_store(Duration::from_secs(120))
+        .await
+        .expect("cambiar el TTL debe actualizar el índice vía collMod, no fallar");
+
+    let expire_after = nvd_cache_ttl_index_expire_after_seconds(&container).await;
+    assert_eq!(expire_after, Some(Duration::from_secs(120)));
 }

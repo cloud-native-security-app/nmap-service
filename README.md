@@ -46,8 +46,11 @@ docker build -t ms-nmap .
 
 ### Ejecutar
 
-`ms-nmap` lee **toda** su configuración de variables de entorno; todas son
-obligatorias (si falta alguna, registra el error y termina sin arrancar):
+`ms-nmap` lee **toda** su configuración de variables de entorno. La mayoría son
+obligatorias (si falta alguna, registra el error y termina sin arrancar); las
+excepciones son `MS_NMAP_NVD_API_KEY` (genuinamente opcional) y
+`MS_NMAP_NVD_CACHE_TTL_SECS` (obligatoria sólo si el enriquecimiento NVD está
+habilitado):
 
 | Variable | Descripción |
 |----------|-------------|
@@ -59,11 +62,17 @@ obligatorias (si falta alguna, registra el error y termina sin arrancar):
 | `MS_NMAP_SSH_CONNECT_TIMEOUT_SECS` | Timeout en segundos para establecer la conexión SSH con el objetivo |
 | `MS_NMAP_SSH_COMMAND_TIMEOUT_SECS` | Timeout en segundos para la ejecución del comando `nmap` remoto |
 | `MS_NMAP_EXPLOITDB_CSV` | Ruta al CSV `files_exploits.csv` de Exploit-DB para el enriquecimiento offline de vulnerabilidades. En la imagen Docker ya viene fijada por `ENV` a `/opt/exploitdb/files_exploits.csv` (el CSV se bundlea en la build); sólo hay que definirla al ejecutar fuera del contenedor |
+| `MS_NMAP_NVD_ENRICHMENT_ENABLED` | `true`/`false` (obligatoria, sin default): habilita el enriquecimiento online contra la API NVD 2.0. En `false`, `ms-nmap` no hace ninguna llamada de red hacia NVD |
+| `MS_NMAP_NVD_API_KEY` | API key de NVD (opcional; sube el límite de tasa permitido). Vacía o ausente = modo sin autenticar |
+| `MS_NMAP_NVD_CACHE_TTL_SECS` | TTL en segundos de la caché de hallazgos de NVD en MongoDB. Sólo obligatoria si `MS_NMAP_NVD_ENRICHMENT_ENABLED=true`; si es `false`, no se lee |
 
-El enriquecimiento de vulnerabilidades (cruce de servicio+versión contra
-Exploit-DB) es **offline**: `ms-nmap` indexa el CSV bundleado en memoria y
-resuelve el lookup localmente, sin llamadas de red a Exploit-DB ni a ninguna
-API. Es detección pasiva, misma categoría que `nmap --script vuln` (ver
+El enriquecimiento de vulnerabilidades offline (cruce de servicio+versión
+contra Exploit-DB) es **offline**: `ms-nmap` indexa el CSV bundleado en
+memoria y resuelve el lookup localmente, sin llamadas de red a Exploit-DB ni a
+ninguna API. El enriquecimiento por CPE contra la API NVD 2.0 sí hace egress de
+red, pero es **opt-in** (`MS_NMAP_NVD_ENRICHMENT_ENABLED`) y sólo envía el CPE
+del servicio (nunca la IP del objetivo, el `correlation_id` ni credenciales).
+Ambos son detección pasiva, misma categoría que `nmap --script vuln` (ver
 `docs/security-scope.md`).
 
 ```
@@ -75,5 +84,16 @@ docker run --rm \
   -e MS_NMAP_BROKER_CREDENTIAL=*** \
   -e MS_NMAP_SSH_CONNECT_TIMEOUT_SECS=10 \
   -e MS_NMAP_SSH_COMMAND_TIMEOUT_SECS=300 \
+  -e MS_NMAP_NVD_ENRICHMENT_ENABLED=false \
   ms-nmap
 ```
+
+Para habilitar el enriquecimiento NVD, añade además:
+
+```
+  -e MS_NMAP_NVD_ENRICHMENT_ENABLED=true \
+  -e MS_NMAP_NVD_CACHE_TTL_SECS=86400 \
+  -e MS_NMAP_NVD_API_KEY=*** \
+```
+
+(`MS_NMAP_NVD_API_KEY` es opcional incluso con el enriquecimiento habilitado.)

@@ -23,7 +23,7 @@
 
 - [ ] `src/` solo contiene los módulos previstos en `docs/architecture.md`
       (`config`, `domain`, `ssh`, `scanner`, `parser`, `repository`,
-      `messaging`).
+      `messaging`, `enrichment`, `pipeline`, `wiring`).
 - [ ] Toda dependencia en `Cargo.toml` está justificada por una feature de
       `feature_list.json` o por `docs/architecture.md`.
 - [ ] No hay `println!`/`dbg!` sueltos para debug, ni `unwrap()`/`panic!()`
