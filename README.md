@@ -25,14 +25,18 @@ Antes de tocar código, lee `CLAUDE.md`.
 El `Dockerfile` de la raíz produce una imagen multi-stage:
 
 - **builder**: `rust:1.98-bookworm`, compila el binario `ms-nmap` en release.
-- **runtime**: `gcr.io/distroless/cc-debian12:nonroot`, contiene **solo** el
-  binario y los certificados CA del sistema, y corre como usuario no-root
-  (`nonroot`, uid 65532).
+- **exploitdb**: descarga `files_exploits.csv` de Exploit-DB, pineado a un
+  commit concreto.
+- **runtime**: `gcr.io/distroless/cc-debian12:nonroot`, contiene el binario
+  `ms-nmap`, el CSV `files_exploits.csv` (dato de sólo lectura) y los
+  certificados CA del sistema, y corre como usuario no-root (`nonroot`, uid
+  65532).
 
-La imagen final **no incluye**: la toolchain de Rust, el código fuente, ni el
-binario `nmap`. `nmap` se ejecuta en la máquina objetivo vía SSH, no en este
-contenedor (ver `docs/architecture.md`). El servicio es un worker asíncrono
-puro: **no expone ningún servidor ni puerto HTTP**.
+La imagen final **no incluye**: la toolchain de Rust, el código fuente, shell
+ni coreutils, el CLI `searchsploit`, ni el binario `nmap`. `nmap` se ejecuta en
+la máquina objetivo vía SSH, no en este contenedor (ver `docs/architecture.md`).
+El servicio es un worker asíncrono puro: **no expone ningún servidor ni puerto
+HTTP**.
 
 ### Construir
 
@@ -54,6 +58,13 @@ obligatorias (si falta alguna, registra el error y termina sin arrancar):
 | `MS_NMAP_BROKER_CREDENTIAL` | Credencial/token de autenticación contra el Broker (secreto) |
 | `MS_NMAP_SSH_CONNECT_TIMEOUT_SECS` | Timeout en segundos para establecer la conexión SSH con el objetivo |
 | `MS_NMAP_SSH_COMMAND_TIMEOUT_SECS` | Timeout en segundos para la ejecución del comando `nmap` remoto |
+| `MS_NMAP_EXPLOITDB_CSV` | Ruta al CSV `files_exploits.csv` de Exploit-DB para el enriquecimiento offline de vulnerabilidades. En la imagen Docker ya viene fijada por `ENV` a `/opt/exploitdb/files_exploits.csv` (el CSV se bundlea en la build); sólo hay que definirla al ejecutar fuera del contenedor |
+
+El enriquecimiento de vulnerabilidades (cruce de servicio+versión contra
+Exploit-DB) es **offline**: `ms-nmap` indexa el CSV bundleado en memoria y
+resuelve el lookup localmente, sin llamadas de red a Exploit-DB ni a ninguna
+API. Es detección pasiva, misma categoría que `nmap --script vuln` (ver
+`docs/security-scope.md`).
 
 ```
 docker run --rm \

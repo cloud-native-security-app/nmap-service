@@ -19,7 +19,7 @@ use time::macros::datetime;
 use time::OffsetDateTime;
 
 use nmap_service::domain::{
-    CorrelationId, PortFinding, PortState, Protocol, ScanResult, Severity, VulnFinding,
+    CorrelationId, PortFinding, PortState, Protocol, ScanResult, Severity, VulnFinding, VulnSource,
 };
 use nmap_service::repository::{MongoRepository, ScanId};
 use nmap_service::ssh::{Fingerprint, HostKeyStore};
@@ -68,6 +68,7 @@ fn sample_result() -> ScanResult {
                 state: PortState::Open,
                 service: Some("ssh".to_owned()),
                 version: Some("OpenSSH 9.6p1".to_owned()),
+                cpes: vec!["cpe:/a:openbsd:openssh:9.6p1".to_owned()],
             },
             PortFinding {
                 port: 443,
@@ -75,6 +76,7 @@ fn sample_result() -> ScanResult {
                 state: PortState::Filtered,
                 service: Some("https".to_owned()),
                 version: None,
+                cpes: Vec::new(),
             },
         ],
         vulnerabilities: vec![VulnFinding {
@@ -82,6 +84,8 @@ fn sample_result() -> ScanResult {
             severity: Severity::High,
             description: "ssh-agent PKCS#11 arbitrary code execution".to_owned(),
             nse_script: "ssh-vuln-cve2023-38408".to_owned(),
+            source: VulnSource::NmapNse,
+            references: vec!["https://www.openssh.com/txt/release-9.3p2".to_owned()],
         }],
         scanned_at: datetime!(2026-08-27 12:30:00 UTC),
     }

@@ -70,6 +70,25 @@
 - Si una futura feature requiere explotación activa, se documenta y discute
   explícitamente con el usuario antes de implementarse — no se añade como
   efecto secundario de otra feature.
+
+### Enriquecimiento de vulnerabilidades (Exploit-DB, feature `vuln_enrichment`)
+
+- Tras el escaneo, `ms-nmap` cruza el `service`+`version` de cada puerto
+  detectado contra el CSV `files_exploits.csv` de Exploit-DB y añade
+  `VulnFinding`s (`source: exploit_db`). Es **detección pasiva**: buscar
+  exploits/CVE *conocidos* para versiones ya detectadas, la misma categoría que
+  `nmap --script vuln`. **No ejecuta exploits.**
+- El adaptador `ExploitDbEnricher` es un **lookup local sin egress de red**: el
+  CSV se bundlea en la imagen (pineado a un commit), se indexa en memoria al
+  arrancar y todas las consultas se resuelven localmente. No contacta a
+  Exploit-DB ni a ninguna API en tiempo de ejecución.
+- El matcher es deliberadamente conservador para no inundar el informe de falsos
+  positivos, pero los falsos positivos siguen siendo un riesgo conocido: los
+  hallazgos `exploit_db` son pistas a verificar, no confirmaciones.
+- Los **adaptadores de API futuros** (NVD, Vulners, ...) sí harían egress de red
+  (HTTP saliente + posible caché en Mongo). Cuando se implementen se añadirá aquí
+  su análisis de alcance (a qué endpoints se conecta, qué datos se envían — sólo
+  producto/versión/CPE, nunca IP del objetivo ni credenciales); hoy no existen.
 - La intensidad de escaneo (`-T`) usa un valor por defecto conservador para
   minimizar el riesgo de degradar el servicio del objetivo (evitar
   timing agresivo tipo `-T4`/`-T5` como default).

@@ -25,6 +25,7 @@
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::enrichment::{CompositeVulnEnricher, EnrichError, ExploitDbEnricher, VulnEnricher};
 use crate::messaging::publisher::{InMemoryScanResultSink, ScanResultSink};
 use crate::repository::{MongoRepository, RepoError, ScanResultRepository};
 use crate::scanner::{NmapCliScanner, NmapScanner};
@@ -38,6 +39,12 @@ pub enum WiringError {
     /// repositorio y el almacén de host keys.
     #[error("no se pudo conectar con MongoDB: {0}")]
     Mongo(#[from] RepoError),
+
+    /// No se pudo cargar el CSV de Exploit-DB para el enriquecimiento offline
+    /// ([`crate::config::EXPLOITDB_CSV_VAR`]). Fallar al arrancar es correcto: el
+    /// enriquecimiento es una capacidad obligatoria del servicio.
+    #[error("no se pudo cargar el CSV de Exploit-DB: {0}")]
+    Enrichment(#[from] EnrichError),
 }
 
 /// Construye los [`ServicePorts`] con los adaptadores de producción a partir de
@@ -57,6 +64,17 @@ pub async fn service_ports_from_config(config: &Config) -> Result<ServicePorts, 
     let repository: Arc<dyn ScanResultRepository> = Arc::new(repo);
     let executor: Arc<dyn RemoteExecutor> = Arc::new(RusshExecutor);
     let scanner: Arc<dyn NmapScanner> = Arc::new(NmapCliScanner);
+
+    // Enriquecimiento: hoy sólo el adaptador offline de Exploit-DB, envuelto en
+    // el composite que es el punto de extensión para las APIs futuras (NVD,
+    // Vulners, ...). El CSV se carga aquí; si no está disponible, el servicio no
+    // arranca (la feature exige el CSV).
+    let exploitdb = ExploitDbEnricher::from_csv_path(&config.exploitdb_csv).await?;
+    let enricher: Arc<dyn VulnEnricher> =
+        Arc::new(CompositeVulnEnricher::new(vec![
+            Arc::new(exploitdb) as Arc<dyn VulnEnricher>
+        ]));
+
     // Sin adaptador real de broker todavía (ver el módulo): stub en memoria.
     let sink: Arc<dyn ScanResultSink> = Arc::new(InMemoryScanResultSink::new());
 
@@ -64,6 +82,7 @@ pub async fn service_ports_from_config(config: &Config) -> Result<ServicePorts, 
         executor,
         scanner,
         repository,
+        enricher,
         host_key_store,
         sink,
     })

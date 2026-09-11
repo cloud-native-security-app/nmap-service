@@ -223,20 +223,57 @@ pub struct PortFinding {
     pub service: Option<String>,
     /// Versión del servicio detectada por `-sV`, si `nmap` la identificó.
     pub version: Option<String>,
+    /// Identificadores CPE (`cpe:/a:openbsd:openssh:9.9`, ...) que `nmap`
+    /// reporta como hijos `<cpe>` del `<service>`. Habilita el cruce por CPE de
+    /// los enriquecedores de vulnerabilidades (ver [`crate::enrichment`]). Vacío
+    /// si `nmap` no reportó ninguno.
+    #[serde(default)]
+    pub cpes: Vec<String>,
 }
 
-/// Un hallazgo de vulnerabilidad producido por un script NSE de categoría
-/// `vuln`.
+/// Origen de un [`VulnFinding`]: qué componente lo produjo.
+///
+/// Se serializa en `snake_case` (`nmap_nse`, `exploit_db`) para tener una
+/// codificación estable en MongoDB y en los mensajes al Broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VulnSource {
+    /// Un script NSE de categoría `vuln` ejecutado por `nmap` en el objetivo.
+    NmapNse,
+    /// El cruce offline contra el CSV de Exploit-DB
+    /// ([`crate::enrichment::ExploitDbEnricher`]).
+    ExploitDb,
+}
+
+/// Un hallazgo de vulnerabilidad: de un script NSE de categoría `vuln`
+/// ([`VulnSource::NmapNse`]) o de un enriquecedor posterior como Exploit-DB
+/// ([`VulnSource::ExploitDb`], ver [`crate::enrichment`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulnFinding {
-    /// Identificador de la vulnerabilidad (CVE u otro), si el script lo indica.
+    /// Identificador de la vulnerabilidad (CVE u otro), si se conoce.
     pub id: Option<String>,
     /// Severidad informada o inferida.
     pub severity: Severity,
     /// Descripción legible del hallazgo.
     pub description: String,
-    /// Nombre del script NSE que generó el hallazgo (p. ej. `http-vuln-cve2017-5638`).
+    /// Nombre del script NSE que generó el hallazgo (p. ej.
+    /// `http-vuln-cve2017-5638`). Cadena vacía si el hallazgo no proviene de un
+    /// script NSE (p. ej. los de [`VulnSource::ExploitDb`]).
     pub nse_script: String,
+    /// Componente que produjo el hallazgo.
+    #[serde(default = "default_vuln_source")]
+    pub source: VulnSource,
+    /// URLs de referencia del hallazgo (aviso, entrada de Exploit-DB, ...).
+    /// Vacío si no hay ninguna.
+    #[serde(default)]
+    pub references: Vec<String>,
+}
+
+/// Origen por defecto al deserializar un [`VulnFinding`] persistido antes de
+/// que existiera el campo `source` (feature `vuln_enrichment`): esos documentos
+/// sólo podían venir de scripts NSE.
+fn default_vuln_source() -> VulnSource {
+    VulnSource::NmapNse
 }
 
 /// Resultado de un escaneo: todo lo descubierto sobre un host.
@@ -274,6 +311,7 @@ mod tests {
                     state: PortState::Open,
                     service: Some("ssh".to_owned()),
                     version: Some("OpenSSH 9.6p1".to_owned()),
+                    cpes: vec!["cpe:/a:openbsd:openssh:9.6p1".to_owned()],
                 },
                 PortFinding {
                     port: 80,
@@ -281,6 +319,7 @@ mod tests {
                     state: PortState::Filtered,
                     service: Some("http".to_owned()),
                     version: None,
+                    cpes: Vec::new(),
                 },
                 PortFinding {
                     port: 53,
@@ -288,14 +327,28 @@ mod tests {
                     state: PortState::OpenFiltered,
                     service: None,
                     version: None,
+                    cpes: Vec::new(),
                 },
             ],
-            vulnerabilities: vec![VulnFinding {
-                id: Some("CVE-2023-38408".to_owned()),
-                severity: Severity::High,
-                description: "ssh-agent PKCS#11 arbitrary code execution".to_owned(),
-                nse_script: "ssh-vuln-cve2023-38408".to_owned(),
-            }],
+            vulnerabilities: vec![
+                VulnFinding {
+                    id: Some("CVE-2023-38408".to_owned()),
+                    severity: Severity::High,
+                    description: "ssh-agent PKCS#11 arbitrary code execution".to_owned(),
+                    nse_script: "ssh-vuln-cve2023-38408".to_owned(),
+                    source: VulnSource::NmapNse,
+                    references: vec!["https://www.openssh.com/txt/release-9.3p2".to_owned()],
+                },
+                VulnFinding {
+                    id: Some("CVE-2011-2523".to_owned()),
+                    severity: Severity::Unknown,
+                    description: "vsftpd 2.3.4 - Backdoor Command Execution (Exploit-DB 49757)"
+                        .to_owned(),
+                    nse_script: String::new(),
+                    source: VulnSource::ExploitDb,
+                    references: vec!["https://www.exploit-db.com/exploits/49757".to_owned()],
+                },
+            ],
             scanned_at: datetime!(2026-08-27 12:30:00 UTC),
         }
     }
@@ -402,5 +455,30 @@ mod tests {
             serde_json::to_string(&Severity::Critical).expect("serializa"),
             "\"critical\""
         );
+        assert_eq!(
+            serde_json::to_string(&VulnSource::NmapNse).expect("serializa"),
+            "\"nmap_nse\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VulnSource::ExploitDb).expect("serializa"),
+            "\"exploit_db\""
+        );
+    }
+
+    #[test]
+    fn vuln_finding_deserializes_with_defaults_for_pre_enrichment_documents() {
+        // Documento persistido antes de la feature `vuln_enrichment`: sin
+        // `source` ni `references`.
+        let json = r#"{
+            "id": "CVE-2011-2523",
+            "severity": "high",
+            "description": "vsFTPd 2.3.4 backdoor",
+            "nse_script": "ftp-vsftpd-backdoor"
+        }"#;
+
+        let finding: VulnFinding = serde_json::from_str(json).expect("deserializa");
+
+        assert_eq!(finding.source, VulnSource::NmapNse);
+        assert!(finding.references.is_empty());
     }
 }

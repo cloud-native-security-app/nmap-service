@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 pub mod config;
 pub mod domain;
+pub mod enrichment;
 pub mod messaging;
 pub mod parser;
 pub mod pipeline;

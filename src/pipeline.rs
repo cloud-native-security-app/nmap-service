@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use tokio::task::JoinSet;
 
-use crate::domain::{ScanRequest, ScanResult};
+use crate::domain::{ScanRequest, ScanResult, VulnFinding};
+use crate::enrichment::VulnEnricher;
 use crate::messaging::consumer::{ConsumeError, ScanRequestSource};
 use crate::messaging::publisher::{ScanOutcome, ScanResultSink};
 use crate::parser;
@@ -48,6 +49,11 @@ pub struct ServicePorts {
     /// Puerto de persistencia del [`ScanResult`] (adaptador real
     /// [`crate::repository::MongoRepository`]).
     pub repository: Arc<dyn ScanResultRepository>,
+    /// Puerto de enriquecimiento de vulnerabilidades: se ejecuta entre `parser`
+    /// y `repository` (adaptador real
+    /// [`crate::enrichment::CompositeVulnEnricher`] con
+    /// [`crate::enrichment::ExploitDbEnricher`] dentro).
+    pub enricher: Arc<dyn VulnEnricher>,
     /// Almacén de host keys TOFU. En producción es el respaldado por Mongo
     /// ([`crate::repository::MongoHostKeyStore`]), para que sobreviva reinicios
     /// y se comparta entre réplicas.
@@ -79,6 +85,7 @@ pub struct ScanPipeline {
     executor: Arc<dyn RemoteExecutor>,
     scanner: Arc<dyn NmapScanner>,
     repository: Arc<dyn ScanResultRepository>,
+    enricher: Arc<dyn VulnEnricher>,
     host_key_store: Arc<dyn HostKeyStore>,
     sink: Arc<dyn ScanResultSink>,
     config: PipelineConfig,
@@ -97,6 +104,7 @@ impl ScanPipeline {
             executor: ports.executor,
             scanner: ports.scanner,
             repository: ports.repository,
+            enricher: ports.enricher,
             host_key_store: ports.host_key_store,
             sink: ports.sink,
             config,
@@ -173,7 +181,24 @@ impl ScanPipeline {
             .await
             .map_err(|err| err.to_string())?;
 
-        let result = parser::parse(&xml).map_err(|err| err.to_string())?;
+        let mut result = parser::parse(&xml).map_err(|err| err.to_string())?;
+
+        // Enriquecimiento best-effort: un fallo aquí NUNCA convierte el escaneo
+        // en `ScanOutcome::Failed`; se registra y se continúa con los hallazgos
+        // de `nmap` (ver `docs/architecture.md`, capa `enrichment`).
+        let extra = self
+            .enricher
+            .enrich(&result.ports)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    correlation_id = %request.correlation_id,
+                    "enriquecimiento de vulnerabilidades falló; se continúa con los hallazgos de nmap"
+                );
+                Vec::new()
+            });
+        merge_enrichment_findings(&mut result.vulnerabilities, extra);
 
         self.repository
             .save(&result, &request.correlation_id)
@@ -240,6 +265,32 @@ async fn next_valid_request(source: &dyn ScanRequestSource) -> Option<ScanReques
     }
 }
 
+/// Fusiona los hallazgos del enriquecimiento (`extra`) sobre los que ya trajo
+/// `nmap` (`existing`), sin duplicar.
+///
+/// Un hallazgo de `extra` se descarta si:
+///
+/// - tiene `id` (CVE) y ese `id` ya está en `existing` (contando los que se van
+///   añadiendo, así también se deduplican dos filas de Exploit-DB con el mismo
+///   CVE), o
+/// - no tiene `id` y ya hay en `existing` otro sin `id` con la misma
+///   `description`.
+fn merge_enrichment_findings(existing: &mut Vec<VulnFinding>, extra: Vec<VulnFinding>) {
+    for finding in extra {
+        let is_duplicate = match &finding.id {
+            Some(id) => existing
+                .iter()
+                .any(|v| v.id.as_deref() == Some(id.as_str())),
+            None => existing
+                .iter()
+                .any(|v| v.id.is_none() && v.description == finding.description),
+        };
+        if !is_duplicate {
+            existing.push(finding);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
@@ -249,7 +300,8 @@ mod tests {
     use secrecy::SecretString;
 
     use super::*;
-    use crate::domain::{CorrelationId, SshCredentialsRef};
+    use crate::domain::{CorrelationId, PortFinding, Severity, SshCredentialsRef, VulnSource};
+    use crate::enrichment::EnrichError;
     use crate::messaging::consumer::{InMemoryScanRequestSource, IncomingScanRequest};
     use crate::messaging::publisher::InMemoryScanResultSink;
     use crate::parser::ParseError;
@@ -353,6 +405,87 @@ mod tests {
         }
     }
 
+    /// Doble de [`VulnEnricher`] que devuelve una lista fija de hallazgos.
+    struct StubEnricher(Vec<VulnFinding>);
+
+    #[async_trait::async_trait]
+    impl VulnEnricher for StubEnricher {
+        async fn enrich(&self, _ports: &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn vuln(id: Option<&str>, description: &str, source: VulnSource) -> VulnFinding {
+        VulnFinding {
+            id: id.map(str::to_owned),
+            severity: Severity::Unknown,
+            description: description.to_owned(),
+            nse_script: String::new(),
+            source,
+            references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_enrichment_adds_new_cves_and_skips_ones_nmap_already_found() {
+        let mut existing = vec![vuln(
+            Some("CVE-2011-2523"),
+            "vsFTPd backdoor (nmap)",
+            VulnSource::NmapNse,
+        )];
+        let extra = vec![
+            // Ya lo trajo nmap -> se descarta.
+            vuln(
+                Some("CVE-2011-2523"),
+                "vsftpd 2.3.4 - Backdoor (Exploit-DB 49757)",
+                VulnSource::ExploitDb,
+            ),
+            // Nuevo -> se añade.
+            vuln(
+                Some("CVE-2010-2075"),
+                "UnrealIRCd 3.2.8.1 - Backdoor (Exploit-DB 16922)",
+                VulnSource::ExploitDb,
+            ),
+            // Otra fila de Exploit-DB con el mismo CVE nuevo -> se deduplica.
+            vuln(
+                Some("CVE-2010-2075"),
+                "UnrealIRCd 3.2.8.1 - Downloader (Exploit-DB 13853)",
+                VulnSource::ExploitDb,
+            ),
+        ];
+
+        merge_enrichment_findings(&mut existing, extra);
+
+        assert_eq!(existing.len(), 2);
+        assert_eq!(
+            existing
+                .iter()
+                .filter(|v| v.id.as_deref() == Some("CVE-2010-2075"))
+                .count(),
+            1
+        );
+        assert!(
+            existing
+                .iter()
+                .any(|v| v.id.as_deref() == Some("CVE-2010-2075")
+                    && v.source == VulnSource::ExploitDb)
+        );
+    }
+
+    #[test]
+    fn merge_enrichment_dedups_findings_without_id_by_description() {
+        let mut existing = vec![vuln(None, "misconfig X", VulnSource::NmapNse)];
+        let extra = vec![
+            vuln(None, "misconfig X", VulnSource::ExploitDb),
+            vuln(None, "misconfig Y", VulnSource::ExploitDb),
+        ];
+
+        merge_enrichment_findings(&mut existing, extra);
+
+        assert_eq!(existing.len(), 2);
+        assert!(existing.iter().any(|v| v.description == "misconfig Y"));
+    }
+
     /// Adaptador falso de [`RemoteExecutor`] que siempre falla la conexión.
     struct FailingExecutor;
 
@@ -440,6 +573,7 @@ mod tests {
             executor: Arc::new(FailingExecutor),
             scanner: Arc::new(UnusedScanner),
             repository: Arc::new(UnusedRepository),
+            enricher: Arc::new(StubEnricher(Vec::new())),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
         };

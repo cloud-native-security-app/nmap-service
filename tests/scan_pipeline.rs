@@ -19,7 +19,8 @@ use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
 };
 
-use nmap_service::domain::{CorrelationId, PortState, ScanRequest, SshCredentialsRef};
+use nmap_service::domain::{CorrelationId, PortState, ScanRequest, SshCredentialsRef, VulnSource};
+use nmap_service::enrichment::{CompositeVulnEnricher, ExploitDbEnricher, VulnEnricher};
 use nmap_service::messaging::consumer::InMemoryScanRequestSource;
 use nmap_service::messaging::publisher::{InMemoryScanResultSink, ScanOutcome, ScanResultSink};
 use nmap_service::parser;
@@ -148,15 +149,34 @@ async fn sshd_endpoint(container: &ContainerAsync<GenericImage>) -> (IpAddr, u16
     (ip, port)
 }
 
+/// CSV fixture con filas reales de Exploit-DB (ver `tests/fixtures/README.md`):
+/// incluye `vsftpd 2.3.4` (CVE-2011-2523) y `UnrealIRCd 3.2.8.1` (CVE-2010-2075),
+/// que son los servicios de `vuln_findings.xml`.
+const EXPLOITDB_SAMPLE_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/exploitdb_sample.csv"
+);
+
+async fn sample_enricher() -> Arc<dyn VulnEnricher> {
+    let exploitdb = ExploitDbEnricher::from_csv_path(EXPLOITDB_SAMPLE_CSV)
+        .await
+        .expect("el CSV fixture de Exploit-DB debe cargar");
+    Arc::new(CompositeVulnEnricher::new(vec![
+        Arc::new(exploitdb) as Arc<dyn VulnEnricher>
+    ]))
+}
+
 fn build_pipeline(
     repo: &MongoRepository,
     sink: &Arc<InMemoryScanResultSink>,
+    enricher: Arc<dyn VulnEnricher>,
     ssh_port: u16,
 ) -> ScanPipeline {
     let ports = ServicePorts {
         executor: Arc::new(RusshExecutor) as Arc<dyn RemoteExecutor>,
         scanner: Arc::new(NmapCliScanner) as Arc<dyn NmapScanner>,
         repository: Arc::new(repo.clone()) as Arc<dyn ScanResultRepository>,
+        enricher,
         host_key_store: Arc::new(repo.host_key_store()) as Arc<dyn HostKeyStore>,
         sink: sink.clone() as Arc<dyn ScanResultSink>,
     };
@@ -217,7 +237,7 @@ async fn valid_request_flows_through_pipeline_and_is_published_and_persisted() {
         .await
         .expect("debe conectar con el contenedor mongo");
     let sink: Arc<InMemoryScanResultSink> = Arc::new(InMemoryScanResultSink::new());
-    let pipeline = build_pipeline(&repo, &sink, port);
+    let pipeline = build_pipeline(&repo, &sink, sample_enricher().await, port);
 
     let source = Arc::new(InMemoryScanRequestSource::from_requests([scan_request(
         ip,
@@ -249,15 +269,56 @@ async fn valid_request_flows_through_pipeline_and_is_published_and_persisted() {
         result.ports.iter().find(|p| p.port == 6667).unwrap().state,
         PortState::Open
     );
-    assert_eq!(result.vulnerabilities.len(), 2);
-    assert!(result
+    // Hallazgos de nmap (`--script vuln`): siguen presentes, con su origen NSE.
+    assert!(
+        result
+            .vulnerabilities
+            .iter()
+            .any(|v| v.nse_script == "ftp-vsftpd-backdoor"
+                && v.id.as_deref() == Some("CVE-2011-2523")
+                && v.source == VulnSource::NmapNse),
+        "el hallazgo NSE de nmap debe seguir presente: {:?}",
+        result.vulnerabilities
+    );
+
+    // Enriquecimiento offline (feature vuln_enrichment): el puerto 6667
+    // (`UnrealIRCd`) cruza con el CSV de Exploit-DB y aporta CVE-2010-2075, que
+    // nmap no trajo -> sobrevive al dedup.
+    let enriched: Vec<_> = result
         .vulnerabilities
         .iter()
-        .all(|v| v.id.as_deref() == Some("CVE-2011-2523")));
-    assert!(result
-        .vulnerabilities
-        .iter()
-        .any(|v| v.nse_script == "ftp-vsftpd-backdoor"));
+        .filter(|v| v.source == VulnSource::ExploitDb)
+        .collect();
+    assert!(
+        !enriched.is_empty(),
+        "el ScanResult debe incluir hallazgos de enrichment: {:?}",
+        result.vulnerabilities
+    );
+    assert!(
+        enriched
+            .iter()
+            .any(|v| v.id.as_deref() == Some("CVE-2010-2075")),
+        "enrichment debe aportar CVE-2010-2075 (UnrealIRCd): {enriched:?}"
+    );
+    assert!(
+        enriched.iter().all(|v| v.nse_script.is_empty()
+            && v.references
+                .iter()
+                .any(|r| r.starts_with("https://www.exploit-db.com/exploits/"))),
+        "los hallazgos de Exploit-DB llevan referencia y sin script NSE: {enriched:?}"
+    );
+
+    // dedup: CVE-2011-2523 lo trajo nmap -> no debe duplicarse desde Exploit-DB.
+    assert_eq!(
+        result
+            .vulnerabilities
+            .iter()
+            .filter(|v| v.id.as_deref() == Some("CVE-2011-2523"))
+            .count(),
+        2,
+        "CVE-2011-2523 sólo desde los 2 scripts NSE, sin duplicado de Exploit-DB: {:?}",
+        result.vulnerabilities
+    );
 
     // criterio 1: el ScanResult quedó persistido en Mongo.
     let persisted = repo
@@ -296,7 +357,7 @@ async fn stage_failure_is_published_as_failed_outcome_without_crashing() {
         .await
         .expect("debe conectar con el contenedor mongo");
     let sink: Arc<InMemoryScanResultSink> = Arc::new(InMemoryScanResultSink::new());
-    let pipeline = build_pipeline(&repo, &sink, port);
+    let pipeline = build_pipeline(&repo, &sink, sample_enricher().await, port);
 
     let source = Arc::new(InMemoryScanRequestSource::from_requests([scan_request(
         ip,
@@ -361,7 +422,7 @@ async fn multiple_requests_are_processed_concurrently() {
     .await
     .expect("warm-up de la conexión SSH");
 
-    let pipeline = build_pipeline(&repo, &sink, port);
+    let pipeline = build_pipeline(&repo, &sink, sample_enricher().await, port);
 
     let ids = ["corr-c1", "corr-c2", "corr-c3"];
     let source = Arc::new(InMemoryScanRequestSource::from_requests(

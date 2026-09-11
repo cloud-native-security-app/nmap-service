@@ -38,3 +38,38 @@ fixtures.
 
 Ningún fixture fue recortado ni modificado. Son la salida `-oX` literal de Nmap
 7.98.
+
+## `exploitdb_sample.csv` — fixture del enricher de Exploit-DB (feature 13)
+
+CSV pequeño (20 filas de datos + cabecera) para los tests de
+`nmap_service::enrichment::ExploitDbEnricher`. **Todas las filas son reales**:
+se extrajeron literalmente (sin editar ni un carácter) de
+`/usr/share/exploitdb/files_exploits.csv` del paquete `exploitdb` instalado en la
+máquina de desarrollo, seleccionando por la primera columna (`id` / EDB-ID):
+
+```sh
+ids="16929 19046 49757 17491 16270 5814 49719 16922 13853 27407 \
+     18011 40136 40888 39569 45939 42060 16320 37262 50383 14611"
+{ head -1 files_exploits.csv; \
+  for i in $ids; do awk -F, -v id="$i" '$1==id' files_exploits.csv; done; } \
+  > exploitdb_sample.csv
+```
+
+La cabecera es la del CSV oficial:
+`id,file,description,date_published,author,type,platform,port,date_added,date_updated,verified,codes,tags,aliases,screenshot_url,application_url,source_url`.
+
+Cobertura buscada:
+
+- `vsftpd 2.3.4` → EDB 49757 (`codes = CVE-2011-2523`) y EDB 17491
+  (`codes = OSVDB-73573;CVE-2011-2523`, para probar la extracción del primer CVE
+  cuando hay códigos no-CVE por delante). Es el servicio del puerto 21 de
+  `vuln_findings.xml`.
+- `UnrealIRCd 3.2.8.1` → EDB 16922 y 13853 (`CVE-2010-2075`), EDB 27407
+  (`UnrealIRCd 3.x`, `CVE-2006-1214`) y EDB 18011 (`codes = OSVDB-83430`, sin
+  CVE → `VulnFinding.id = None`). Es el servicio del puerto 6667 de
+  `vuln_findings.xml`; nmap no reporta versión para él, así que el enricher
+  matchea sólo por tokens.
+- `vsftpd 2.3.2` / `2.0.5` / `3.0.3` → casos de versión que NO debe casar con
+  `2.3.4` (uno de ellos, EDB 49719, con `codes` vacío).
+- `OpenSSH 7.2*`, `Samba`, `ProFTPd 1.3.5`, `Apache 2.4.49`, entradas AIX y
+  Windows → ruido realista / casos de "sin match".

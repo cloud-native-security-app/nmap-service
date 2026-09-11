@@ -1,0 +1,510 @@
+//! Enriquecimiento de vulnerabilidades: una etapa del pipeline situada entre
+//! `parser` y `repository` que cruza los servicios+versiones descubiertos por
+//! `nmap -sV` contra bases de vulnerabilidades/exploits conocidos y añade
+//! [`VulnFinding`]s al [`crate::domain::ScanResult`].
+//!
+//! El puerto hexagonal es [`VulnEnricher`]. Hoy hay un único adaptador,
+//! [`ExploitDbEnricher`], que es **offline**: un lookup en memoria sobre el CSV
+//! `files_exploits.csv` de Exploit-DB, **sin egress de red** (ver
+//! `docs/security-scope.md`: es detección pasiva, misma categoría que
+//! `--script vuln`). Los futuros adaptadores de API (NVD, Vulners, ...) se
+//! añadirán detrás del mismo trait y se combinan con [`CompositeVulnEnricher`].
+
+use std::path::Path;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::domain::{PortFinding, Severity, VulnFinding, VulnSource};
+
+/// Número mínimo de tokens que debe tener la consulta de un puerto para
+/// intentar un match. Con un solo token (típicamente el nombre de servicio,
+/// `ssh`/`ftp`/...) el riesgo de falsos positivos es inaceptable.
+const MIN_QUERY_TOKENS: usize = 2;
+
+/// Error de un [`VulnEnricher`].
+#[derive(Debug, thiserror::Error)]
+pub enum EnrichError {
+    /// No se pudo leer o parsear la fuente de datos local (p. ej. el CSV de
+    /// Exploit-DB no existe o no tiene las columnas esperadas).
+    #[error("fuente de datos de enriquecimiento inaccesible: {0}")]
+    DataSource(String),
+    /// Un backend remoto de enriquecimiento (APIs futuras: NVD, Vulners, ...)
+    /// falló. Hoy nunca se produce: no hay adaptadores con egress de red.
+    #[error("backend de enriquecimiento falló: {0}")]
+    Backend(String),
+}
+
+/// Puerto hexagonal: dado el conjunto de [`PortFinding`]s descubiertos, devuelve
+/// [`VulnFinding`]s adicionales cruzándolos contra una base de vulnerabilidades.
+///
+/// El pipeline lo invoca en modo *best-effort*: un [`Err`] no aborta el escaneo
+/// (ver [`crate::pipeline`]).
+#[async_trait]
+pub trait VulnEnricher: Send + Sync {
+    /// Devuelve los hallazgos adicionales para `ports`. No modifica `ports` ni
+    /// hace suposiciones sobre el orden.
+    ///
+    /// # Errores
+    ///
+    /// [`EnrichError`] si la fuente de datos subyacente no está disponible.
+    async fn enrich(&self, ports: &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError>;
+}
+
+/// Fila del CSV de Exploit-DB ya indexada en memoria.
+#[derive(Debug, Clone)]
+struct ExploitRow {
+    /// EDB-ID (columna `id`), que forma la URL `.../exploits/<edb_id>`.
+    edb_id: String,
+    /// Título del exploit (columna `description`).
+    title: String,
+    /// Título en minúsculas, para el matcher case-insensitive.
+    title_lower: String,
+    /// Tokens del título en minúsculas (se guardan aunque el matcher use el
+    /// título completo, por si un adaptador futuro necesita un índice invertido).
+    #[allow(dead_code)]
+    title_tokens: Vec<String>,
+    /// CVEs extraídos de la columna `codes`, en orden de aparición.
+    cves: Vec<String>,
+    /// URL de origen (columna `source_url`), si la fila la trae.
+    source_url: String,
+}
+
+/// Enriquecedor **offline** que cruza servicio+versión contra el CSV
+/// `files_exploits.csv` de Exploit-DB. No hace egress de red: indexa el CSV en
+/// memoria al construirse y a partir de ahí resuelve todo localmente.
+///
+/// # El matcher es deliberadamente conservador
+///
+/// Para cada puerto con `version` identificada por `nmap -sV` se construye una
+/// consulta con los tokens de `"<service> <version>"` (en minúsculas, separados
+/// por caracteres no alfanuméricos, conservando el punto de los números de
+/// versión). Una fila del CSV **matchea** si:
+///
+/// - la consulta tiene al menos dos tokens (`MIN_QUERY_TOKENS`), y
+/// - **todos** los tokens aparecen como substring (case-insensitive) en el
+///   título del exploit, y
+/// - si algún token es un número `mayor.menor(.patch)`, ese `mayor.menor`
+///   aparece en el título (evita casar `vsftpd 2.3.4` con exploits de `2.0.5`).
+///
+/// Es una heurística que **prioriza no inundar de falsos positivos** sobre
+/// recuperar todos los exploits relevantes: es preferible perder algún match a
+/// adjuntar decenas de entradas irrelevantes al informe. Aun así, los falsos
+/// positivos son un **riesgo conocido y asumido** de esta fuente — títulos que
+/// no distinguen la versión exacta, o nombres de producto que son substring de
+/// otros, pueden colarse. El consumidor del `ScanResult` (`ms-analisis`) debe
+/// tratar los hallazgos con `source == VulnSource::ExploitDb` como pistas a
+/// verificar, no como confirmaciones.
+#[derive(Debug)]
+pub struct ExploitDbEnricher {
+    rows: Vec<ExploitRow>,
+}
+
+impl ExploitDbEnricher {
+    /// Carga e indexa `files_exploits.csv` desde `path`.
+    ///
+    /// La lectura y el parseo del CSV (~10 MB, decenas de miles de filas) se
+    /// ejecutan en [`tokio::task::spawn_blocking`] para no bloquear el runtime
+    /// async. Se llama una sola vez, en el arranque del servicio
+    /// ([`crate::wiring`]).
+    ///
+    /// # Errores
+    ///
+    /// [`EnrichError::DataSource`] si el archivo no existe, no se puede leer o
+    /// no tiene las columnas `id`, `description` y `codes`.
+    pub async fn from_csv_path(path: &str) -> Result<Self, EnrichError> {
+        let owned = path.to_owned();
+        tokio::task::spawn_blocking(move || Self::load_blocking(Path::new(&owned)))
+            .await
+            .map_err(|e| EnrichError::DataSource(format!("tarea de carga cancelada: {e}")))?
+    }
+
+    fn load_blocking(path: &Path) -> Result<Self, EnrichError> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_path(path)
+            .map_err(|e| EnrichError::DataSource(format!("{}: {e}", path.display())))?;
+
+        let headers = reader
+            .headers()
+            .map_err(|e| EnrichError::DataSource(format!("cabecera del CSV: {e}")))?
+            .clone();
+        let column = |name: &str| headers.iter().position(|h| h == name);
+        let id_col = column("id")
+            .ok_or_else(|| EnrichError::DataSource("falta la columna 'id'".to_owned()))?;
+        let desc_col = column("description")
+            .ok_or_else(|| EnrichError::DataSource("falta la columna 'description'".to_owned()))?;
+        let codes_col = column("codes")
+            .ok_or_else(|| EnrichError::DataSource("falta la columna 'codes'".to_owned()))?;
+        let source_url_col = column("source_url");
+
+        let mut rows = Vec::new();
+        for record in reader.records() {
+            let record =
+                record.map_err(|e| EnrichError::DataSource(format!("fila del CSV: {e}")))?;
+
+            let title = record.get(desc_col).unwrap_or_default().trim();
+            let edb_id = record.get(id_col).unwrap_or_default().trim();
+            if title.is_empty() || edb_id.is_empty() {
+                continue;
+            }
+
+            let title_lower = title.to_lowercase();
+            let title_tokens = tokenize(&title_lower);
+            let cves = extract_cves(record.get(codes_col).unwrap_or_default());
+            let source_url = source_url_col
+                .and_then(|c| record.get(c))
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+
+            rows.push(ExploitRow {
+                edb_id: edb_id.to_owned(),
+                title: title.to_owned(),
+                title_lower,
+                title_tokens,
+                cves,
+                source_url,
+            });
+        }
+
+        Ok(Self { rows })
+    }
+}
+
+#[async_trait]
+impl VulnEnricher for ExploitDbEnricher {
+    async fn enrich(&self, ports: &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError> {
+        let mut findings = Vec::new();
+        for port in ports {
+            if port.version.is_none() {
+                continue;
+            }
+            let tokens = query_tokens(port);
+            if tokens.len() < MIN_QUERY_TOKENS {
+                continue;
+            }
+            let version_prefixes: Vec<String> =
+                tokens.iter().filter_map(|t| version_prefix(t)).collect();
+
+            for row in &self.rows {
+                if row_matches(row, &tokens, &version_prefixes) {
+                    findings.push(finding_from_row(row));
+                }
+            }
+        }
+        Ok(findings)
+    }
+}
+
+/// Combina varios [`VulnEnricher`]: ejecuta **todos** y concatena sus hallazgos.
+///
+/// Es el punto de extensión para futuros adaptadores (NVD, Vulners, ...). Si uno
+/// devuelve [`Err`], se registra con `tracing::warn!` y se continúa con los
+/// demás: el enriquecimiento es best-effort y la ausencia de una fuente no debe
+/// tumbar a las otras. La deduplicación de los hallazgos (contra los de `nmap` y
+/// entre sí) la hace el pipeline, no este composite.
+pub struct CompositeVulnEnricher {
+    enrichers: Vec<Arc<dyn VulnEnricher>>,
+}
+
+impl CompositeVulnEnricher {
+    /// Crea el composite a partir de los enrichers dados (se ejecutan en orden).
+    pub fn new(enrichers: Vec<Arc<dyn VulnEnricher>>) -> Self {
+        Self { enrichers }
+    }
+}
+
+#[async_trait]
+impl VulnEnricher for CompositeVulnEnricher {
+    async fn enrich(&self, ports: &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError> {
+        let mut all = Vec::new();
+        for enricher in &self.enrichers {
+            match enricher.enrich(ports).await {
+                Ok(mut found) => all.append(&mut found),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "un enricher falló; se continúa con los demás"
+                ),
+            }
+        }
+        Ok(all)
+    }
+}
+
+fn tokenize(text_lower: &str) -> Vec<String> {
+    text_lower
+        .split(|c: char| !c.is_alphanumeric() && c != '.')
+        .map(|t| t.trim_matches('.'))
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn query_tokens(port: &PortFinding) -> Vec<String> {
+    let mut raw = String::new();
+    if let Some(service) = &port.service {
+        raw.push_str(service);
+        raw.push(' ');
+    }
+    if let Some(version) = &port.version {
+        raw.push_str(version);
+    }
+    let mut tokens = tokenize(&raw.to_lowercase());
+    tokens.dedup();
+    tokens
+}
+
+/// `"2.3.4"` -> `Some("2.3")`; `"9.9p1"` -> `None` (el segundo componente no es
+/// numérico); `"vsftpd"` -> `None`.
+fn version_prefix(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let numeric = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    (numeric(major) && numeric(minor)).then(|| format!("{major}.{minor}"))
+}
+
+fn row_matches(row: &ExploitRow, tokens: &[String], version_prefixes: &[String]) -> bool {
+    if !tokens.iter().all(|t| row.title_lower.contains(t.as_str())) {
+        return false;
+    }
+    if !version_prefixes.is_empty()
+        && !version_prefixes
+            .iter()
+            .any(|p| row.title_lower.contains(p.as_str()))
+    {
+        return false;
+    }
+    true
+}
+
+fn finding_from_row(row: &ExploitRow) -> VulnFinding {
+    let mut references = vec![format!(
+        "https://www.exploit-db.com/exploits/{}",
+        row.edb_id
+    )];
+    if !row.source_url.is_empty() {
+        references.push(row.source_url.clone());
+    }
+
+    VulnFinding {
+        id: row.cves.first().cloned(),
+        severity: Severity::Unknown,
+        description: format!("{} (Exploit-DB {})", row.title, row.edb_id),
+        nse_script: String::new(),
+        source: VulnSource::ExploitDb,
+        references,
+    }
+}
+
+/// Extrae los CVE de la columna `codes` del CSV (formato `CVE-2011-2523` o
+/// `OSVDB-73573;CVE-2011-2523`), en orden de aparición.
+fn extract_cves(codes: &str) -> Vec<String> {
+    codes
+        .split([';', ',', ' '])
+        .map(str::trim)
+        .filter(|token| is_cve(token))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn is_cve(token: &str) -> bool {
+    let Some(rest) = token
+        .strip_prefix("CVE-")
+        .or_else(|| token.strip_prefix("cve-"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let (Some(year), Some(number), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    year.len() == 4
+        && year.chars().all(|c| c.is_ascii_digit())
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{PortState, Protocol};
+
+    const SAMPLE_CSV: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/exploitdb_sample.csv"
+    );
+
+    fn port(service: &str, version: Option<&str>) -> PortFinding {
+        PortFinding {
+            port: 21,
+            protocol: Protocol::Tcp,
+            state: PortState::Open,
+            service: Some(service.to_owned()),
+            version: version.map(str::to_owned),
+            cpes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_vsftpd_234_backdoor_from_the_csv() {
+        let enricher = ExploitDbEnricher::from_csv_path(SAMPLE_CSV)
+            .await
+            .expect("carga el CSV fixture");
+
+        let findings = enricher
+            .enrich(&[port("ftp", Some("vsftpd 2.3.4"))])
+            .await
+            .expect("enrich ok");
+
+        let finding = findings
+            .iter()
+            .find(|f| f.id.as_deref() == Some("CVE-2011-2523"))
+            .expect("hallazgo con CVE-2011-2523");
+        assert_eq!(finding.source, VulnSource::ExploitDb);
+        assert_eq!(finding.severity, Severity::Unknown);
+        assert!(finding.nse_script.is_empty());
+        assert!(finding.description.contains("Exploit-DB"));
+        assert!(finding
+            .references
+            .iter()
+            .any(|r| r.starts_with("https://www.exploit-db.com/exploits/")));
+    }
+
+    #[tokio::test]
+    async fn returns_empty_for_a_service_without_known_exploit() {
+        let enricher = ExploitDbEnricher::from_csv_path(SAMPLE_CSV).await.unwrap();
+
+        let findings = enricher
+            .enrich(&[port("http", Some("nginx 1.25.3"))])
+            .await
+            .unwrap();
+
+        assert!(
+            findings.is_empty(),
+            "no debe haber falsos positivos: {findings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_minor_version_does_not_match() {
+        let enricher = ExploitDbEnricher::from_csv_path(SAMPLE_CSV).await.unwrap();
+
+        // El CSV fixture trae exploits de vsftpd 2.3.4, no de 2.9.x.
+        let findings = enricher
+            .enrich(&[port("ftp", Some("vsftpd 2.9.9"))])
+            .await
+            .unwrap();
+
+        assert!(
+            findings.is_empty(),
+            "match de versión errónea: {findings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_ports_without_a_detected_version() {
+        let enricher = ExploitDbEnricher::from_csv_path(SAMPLE_CSV).await.unwrap();
+
+        let findings = enricher.enrich(&[port("ftp", None)]).await.unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_csv_file_is_a_data_source_error() {
+        let err = ExploitDbEnricher::from_csv_path("/no/such/exploitdb.csv")
+            .await
+            .expect_err("un archivo inexistente debe fallar");
+
+        assert!(matches!(err, EnrichError::DataSource(_)));
+    }
+
+    #[test]
+    fn extract_cves_handles_semicolon_separated_codes() {
+        assert_eq!(
+            extract_cves("OSVDB-73573;CVE-2011-2523"),
+            vec!["CVE-2011-2523".to_owned()]
+        );
+        assert_eq!(
+            extract_cves("CVE-2011-2523"),
+            vec!["CVE-2011-2523".to_owned()]
+        );
+        assert_eq!(
+            extract_cves("OSVDB-45657;CVE-2008-4189;CVE-2008-1105"),
+            vec!["CVE-2008-4189".to_owned(), "CVE-2008-1105".to_owned()]
+        );
+        assert!(extract_cves("").is_empty());
+        assert!(extract_cves("OSVDB-1234").is_empty());
+    }
+
+    #[test]
+    fn version_prefix_only_accepts_numeric_major_minor() {
+        assert_eq!(version_prefix("2.3.4"), Some("2.3".to_owned()));
+        assert_eq!(version_prefix("1.4.49"), Some("1.4".to_owned()));
+        assert_eq!(version_prefix("9.9p1"), None);
+        assert_eq!(version_prefix("vsftpd"), None);
+    }
+
+    struct StubEnricher(Vec<VulnFinding>);
+
+    #[async_trait]
+    impl VulnEnricher for StubEnricher {
+        async fn enrich(&self, _ports: &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct FailingEnricher;
+
+    #[async_trait]
+    impl VulnEnricher for FailingEnricher {
+        async fn enrich(&self, _ports: &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError> {
+            Err(EnrichError::Backend("caído".to_owned()))
+        }
+    }
+
+    fn dummy_finding(id: &str) -> VulnFinding {
+        VulnFinding {
+            id: Some(id.to_owned()),
+            severity: Severity::Unknown,
+            description: id.to_owned(),
+            nse_script: String::new(),
+            source: VulnSource::ExploitDb,
+            references: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_concatenates_every_enricher() {
+        let composite = CompositeVulnEnricher::new(vec![
+            Arc::new(StubEnricher(vec![dummy_finding("CVE-1")])) as Arc<dyn VulnEnricher>,
+            Arc::new(StubEnricher(vec![
+                dummy_finding("CVE-2"),
+                dummy_finding("CVE-3"),
+            ])),
+        ]);
+
+        let out = composite.enrich(&[]).await.unwrap();
+
+        assert_eq!(out.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn composite_keeps_going_when_one_enricher_errors() {
+        let composite = CompositeVulnEnricher::new(vec![
+            Arc::new(FailingEnricher) as Arc<dyn VulnEnricher>,
+            Arc::new(StubEnricher(vec![dummy_finding("CVE-9")])),
+        ]);
+
+        let out = composite
+            .enrich(&[])
+            .await
+            .expect("el composite no propaga el error de un enricher");
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id.as_deref(), Some("CVE-9"));
+    }
+}

@@ -179,6 +179,26 @@
         "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no)"
       ],
       "status": "done"
+    },
+    {
+      "id": 13,
+      "name": "vuln_enrichment",
+      "title": "Enriquecimiento de vulnerabilidades desde ExploitDB (offline)",
+      "description": "Nueva etapa del pipeline, entre parser y repository: cruza los servicios+versiones de cada PortFinding contra el CSV de ExploitDB (files_exploits.csv, bundleado en la imagen) y añade VulnFindings con los exploits/CVEs conocidos. Detrás de un puerto hexagonal VulnEnricher para poder añadir después adaptadores de API (NVD, Vulners, ...) sin tocar el pipeline. El adaptador ExploitDB es lookup local: sin egress de red. Es detección pasiva, misma categoría que --script vuln (docs/security-scope.md). Decisión: no se ejecuta el CLI searchsploit (bash) como subproceso; se reimplementa la búsqueda sobre el CSV en Rust para mantener la imagen distroless y unificar todos los enrichers tras el mismo trait.",
+      "acceptance": [
+        "src/enrichment.rs define el trait VulnEnricher (async, dyn-compatible con async-trait): enrich(&self, ports: &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError>",
+        "ExploitDbEnricher implementa VulnEnricher: carga files_exploits.csv (ruta desde una env var de config, sin default hardcodeado), indexa en memoria y matchea por service+version de cada puerto; extrae los CVE de la columna codes",
+        "CompositeVulnEnricher combina varios VulnEnricher (ejecuta todos, concatena) — es el punto de extensión para las APIs futuras",
+        "El pipeline invoca el enricher entre parser::parse y repository::save; el enriquecimiento es best-effort: si falla, se loggea con tracing::warn! y el escaneo continúa con los hallazgos de nmap (no se traduce en ScanOutcome::Failed)",
+        "Los VulnFinding resultantes se deduplican por CVE contra los que ya trajo nmap",
+        "VulnFinding gana un campo source (VulnSource: NmapNse | ExploitDb | ...) y references: Vec<String>; el parser y todos los sitios que construyen VulnFinding se actualizan",
+        "El parser captura los elementos <cpe> de nmap en PortFinding.cpes: Vec<String> (habilita el futuro adaptador NVD por CPE)",
+        "El Dockerfile trae files_exploits.csv (pineado a un commit/tag de exploitdb) en la imagen distroless y fija su ruta con ENV; la imagen sigue sin bash/coreutils y sin el binario nmap",
+        "docs/architecture.md y docs/security-scope.md se actualizan: nueva capa enrichment, lookup local sin egress, detección pasiva",
+        "Tests unitarios del matcher (AND de tokens sobre el título, case-insensitive; match de versión; extracción de CVE de codes; sin falsos positivos obvios) con un CSV fixture pequeño en tests/fixtures/; el test e2e del pipeline verifica que aparecen hallazgos de enrichment",
+        "cargo build sin warnings; ./init.sh verde; clippy/fmt/doc limpios; sin regresión en features 1-12"
+      ],
+      "status": "done"
     }
   ]
 }

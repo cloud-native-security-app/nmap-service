@@ -26,7 +26,9 @@
 //!   `closed|filtered`) mapeado a [`PortState`]. `service` = atributo `name`
 //!   del `<service>`. `version` = `product` + `version` unidos por espacio, y
 //!   si hay `extrainfo` se añade entre paréntesis (como lo muestra `nmap`);
-//!   `None` si `nmap` no identificó nada.
+//!   `None` si `nmap` no identificó nada. `cpes` = el texto de cada hijo
+//!   `<cpe>` del `<service>` (`cpe:/a:openbsd:openssh:9.9`, ...); lista vacía si
+//!   no hay ninguno.
 //! - **`vulnerabilities`**: los `<script>` dentro de cada `<port>` y de
 //!   `<hostscript>`. Un script genera hallazgos si su estado NSE es
 //!   `VULNERABLE`/`LIKELY VULNERABLE`, o si menciona identificadores `CVE` y no
@@ -52,7 +54,9 @@ use std::net::IpAddr;
 use roxmltree::{Document, Node, ParsingOptions};
 use time::OffsetDateTime;
 
-use crate::domain::{PortFinding, PortState, Protocol, ScanResult, Severity, VulnFinding};
+use crate::domain::{
+    PortFinding, PortState, Protocol, ScanResult, Severity, VulnFinding, VulnSource,
+};
 
 /// Número máximo de caracteres que se conservan de la salida de un script NSE
 /// en [`VulnFinding::description`]. Las salidas de scripts agregadores como
@@ -275,6 +279,7 @@ fn parse_port(port: &Node) -> Result<PortFinding, ParseError> {
         .and_then(|s| s.attribute("name"))
         .map(str::to_owned);
     let version = service_node.and_then(|s| build_version(&s));
+    let cpes = service_node.map(|s| collect_cpes(&s)).unwrap_or_default();
 
     Ok(PortFinding {
         port: port_num,
@@ -282,7 +287,16 @@ fn parse_port(port: &Node) -> Result<PortFinding, ParseError> {
         state,
         service,
         version,
+        cpes,
     })
+}
+
+fn collect_cpes(service: &Node) -> Vec<String> {
+    children(service, "cpe")
+        .filter_map(|c| c.text())
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 fn parse_state(raw: &str) -> Option<PortState> {
@@ -401,6 +415,8 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
             severity,
             description,
             nse_script,
+            source: VulnSource::NmapNse,
+            references: Vec::new(),
         }]
     } else {
         cves.into_iter()
@@ -409,6 +425,8 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
                 severity,
                 description: description.clone(),
                 nse_script: nse_script.clone(),
+                source: VulnSource::NmapNse,
+                references: Vec::new(),
             })
             .collect()
     }
@@ -526,11 +544,13 @@ mod tests {
         assert_eq!(ssh.state, PortState::Open);
         assert_eq!(ssh.service.as_deref(), Some("ssh"));
         assert_eq!(ssh.version.as_deref(), Some("OpenSSH 9.9 (protocol 2.0)"));
+        assert_eq!(ssh.cpes, vec!["cpe:/a:openbsd:openssh:9.9".to_owned()]);
 
         let http = port(&result, 80);
         assert_eq!(http.state, PortState::Closed);
         assert_eq!(http.service.as_deref(), Some("http"));
         assert_eq!(http.version, None);
+        assert!(http.cpes.is_empty());
 
         let ssh_low = port(&result, 22);
         assert_eq!(ssh_low.state, PortState::Closed);
@@ -601,6 +621,16 @@ mod tests {
         assert_eq!(ftp.state, PortState::Open);
         assert_eq!(ftp.service.as_deref(), Some("ftp"));
         assert_eq!(ftp.version.as_deref(), Some("vsftpd 2.3.4"));
+        assert_eq!(ftp.cpes, vec!["cpe:/a:vsftpd:vsftpd:2.3.4".to_owned()]);
+
+        assert!(
+            result
+                .vulnerabilities
+                .iter()
+                .all(|v| v.source == VulnSource::NmapNse),
+            "los hallazgos del parser siempre son NmapNse: {:?}",
+            result.vulnerabilities
+        );
 
         let irc = port(&result, 6667);
         assert_eq!(irc.state, PortState::Open);

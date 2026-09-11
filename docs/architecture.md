@@ -61,6 +61,7 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
   | `ssh::RemoteExecutor` (`connect`)  | `ssh`         | `ssh::RusshExecutor`             |
   | `ssh::RemoteSession` (`run_command`) | `ssh`       | `ssh::SshSession`               |
   | `scanner::NmapScanner`             | `scanner`     | `scanner::NmapCliScanner`        |
+  | `enrichment::VulnEnricher`         | `enrichment`  | `enrichment::CompositeVulnEnricher` (con `enrichment::ExploitDbEnricher`) |
   | `repository::ScanResultRepository` | `repository`  | `repository::MongoRepository`   |
 
   El **composition root** —el único sitio que nombra los adaptadores
@@ -85,22 +86,37 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 4. **`scanner`** — orquesta la ejecución de `nmap` sobre una `SshSession` ya
    establecida y devuelve el XML crudo.
 5. **`parser`** — convierte el XML de `nmap` en `ScanResult`. Sin IO, testeable
-   con fixtures.
-6. **`repository`** — persistencia del `ScanResult` en MongoDB.
-7. **`messaging`** — `consumer` (recibe `ScanRequest` del Broker) y
+   con fixtures. Captura también los `<cpe>` de cada servicio en
+   `PortFinding.cpes`.
+6. **`enrichment` (`src/enrichment.rs`)** — etapa entre `parser` y `repository`:
+   cruza el `service`+`version` de cada `PortFinding` contra bases de
+   vulnerabilidades/exploits conocidos y añade `VulnFinding`s
+   (`source: VulnSource::ExploitDb`). Puerto `VulnEnricher` (dyn-compatible,
+   `async`). Adaptador actual: `ExploitDbEnricher`, un **lookup local sin egress
+   de red** sobre `files_exploits.csv` de Exploit-DB (bundleado en la imagen,
+   ver "Despliegue"); su matcher es deliberadamente conservador. `CompositeVulnEnricher`
+   combina varios enrichers y es el punto de extensión para adaptadores de API
+   futuros (NVD, Vulners, ...) sin tocar el pipeline. Es **best-effort**: un
+   fallo se registra con `tracing::warn!` y el escaneo continúa con los hallazgos
+   de `nmap` (nunca produce `ScanOutcome::Failed`). Los `VulnFinding` añadidos se
+   deduplican por CVE contra los que ya trajo `nmap`.
+7. **`repository`** — persistencia del `ScanResult` en MongoDB.
+8. **`messaging`** — `consumer` (recibe `ScanRequest` del Broker) y
    `publisher` (envía `ScanResult` o error al Broker), cada uno detrás de un
    trait para no acoplar el resto del servicio a la tecnología del broker.
-8. **`pipeline` (`src/pipeline.rs`)** — orquesta
-   `consumer -> ssh -> scanner -> parser -> repository -> publisher` en
-   `ScanPipeline`, construido a partir de los puertos inyectados
+9. **`pipeline` (`src/pipeline.rs`)** — orquesta
+   `consumer -> ssh -> scanner -> parser -> enrichment -> repository -> publisher`
+   en `ScanPipeline`, construido a partir de los puertos inyectados
    (`ServicePorts` + `PipelineConfig`). Un fallo de etapa se publica como
-   desenlace de error, nunca `panic`.
-9. **`wiring` (`src/wiring.rs`)** — composition root: construye los adaptadores
-   reales de cada puerto desde la `Config` y los agrupa en `ServicePorts`.
-10. **`lib` (`src/lib.rs`)** — declara `pub mod` para cada capa anterior y
+   desenlace de error, nunca `panic` (excepción: `enrichment` es best-effort y
+   no falla el escaneo).
+10. **`wiring` (`src/wiring.rs`)** — composition root: construye los adaptadores
+    reales de cada puerto desde la `Config` y los agrupa en `ServicePorts`. Si el
+    CSV de Exploit-DB no carga, el servicio no arranca (`WiringError::Enrichment`).
+11. **`lib` (`src/lib.rs`)** — declara `pub mod` para cada capa anterior y
     expone `pub async fn run(ports, config, source)` que arma el `ScanPipeline`
     y lo pone a consumir.
-11. **`main` (`src/main.rs`)** — envoltorio delgado: inicializa runtime tokio,
+12. **`main` (`src/main.rs`)** — envoltorio delgado: inicializa runtime tokio,
     tracing y config, llama a `wiring::service_ports_from_config` y a
     `lib::run(...)`. Sin lógica de negocio propia.
 
@@ -120,6 +136,10 @@ Broker  ──(ScanRequest)──▶  messaging::consumer
                                    │
                                    ▼
                         parser::parse(xml)  →  ScanResult
+                                   │
+                                   ▼
+           enrichment::VulnEnricher::enrich(&ports)  (best-effort, offline)
+                    →  + VulnFinding{source: exploit_db}, dedup por CVE
                                    │
                         ┌──────────┴──────────┐
                         ▼                     ▼
@@ -144,14 +164,21 @@ Broker  ──(ScanRequest)──▶  messaging::consumer
   `containerization`):
   - **Stage builder** (`rust:1.98-bookworm`): compila `ms-nmap` en release, con
     una capa previa que cachea la compilación de dependencias.
-  - **Stage runtime** (`gcr.io/distroless/cc-debian12:nonroot`): contiene
-    **solo** el binario `ms-nmap` y los certificados CA del sistema (TLS a
-    MongoDB y al Broker vía `rustls`). Corre como usuario no-root (`nonroot`,
-    uid 65532).
-- La imagen final **no incluye**: la toolchain de Rust, el código fuente, ni el
-  binario `nmap`. `nmap` se ejecuta en la máquina objetivo vía SSH (ver "SSH al
-  objetivo, no escaneo local"), no en el contenedor de `ms-nmap`. Tampoco lleva
-  `openssh-client`: `russh` es Rust puro.
+  - **Stage exploitdb**: descarga `files_exploits.csv` de Exploit-DB, pineado a
+    un commit concreto del repo `gitlab.com/exploit-database/exploitdb` (no
+    `latest`/`main`). Sólo el CSV, no el CLI `searchsploit` (feature
+    `vuln_enrichment`).
+  - **Stage runtime** (`gcr.io/distroless/cc-debian12:nonroot`): contiene el
+    binario `ms-nmap`, los certificados CA del sistema (TLS a MongoDB y al Broker
+    vía `rustls`) y `files_exploits.csv` en `/opt/exploitdb/` (dato de sólo
+    lectura para `enrichment`; la ruta se fija con `ENV MS_NMAP_EXPLOITDB_CSV`).
+    Corre como usuario no-root (`nonroot`, uid 65532).
+- La imagen final **no incluye**: la toolchain de Rust, el código fuente, shell
+  ni coreutils, el CLI `searchsploit`, ni el binario `nmap`. `nmap` se ejecuta en
+  la máquina objetivo vía SSH (ver "SSH al objetivo, no escaneo local"), no en el
+  contenedor de `ms-nmap`. Tampoco lleva `openssh-client`: `russh` es Rust puro.
+  El enriquecimiento de vulnerabilidades es un lookup en memoria sobre el CSV
+  bundleado: **sin egress de red**.
 - Toda la configuración se inyecta por variables de entorno (ver `config` y
   `README.md`). Las imágenes base se fijan por tag concreto y por digest
   `@sha256:...` (nunca `latest`).

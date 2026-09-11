@@ -782,3 +782,104 @@ después (83 tras añadir un test unitario sin Docker).
 - Commit pendiente (lo gestiona el leader): `Dockerfile`, `.dockerignore`,
   `README.md`, `docs/architecture.md`, `feature_list.json`, `progress/*.md`.
 - Con esta feature, las 12 del `feature_list.json` quedan en `done`.
+
+---
+
+## 2026-09-10 — Feature 13: vuln_enrichment
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó sin cambios requeridos, ver
+  `progress/review_vuln_enrichment.md`)
+
+### Qué se hizo
+
+- **`src/domain.rs`**: nuevo enum `VulnSource` (`NmapNse`/`ExploitDb`,
+  `#[serde(rename_all = "snake_case")]`). `VulnFinding` gana `source: VulnSource`
+  (`#[serde(default = ...)]` → `NmapNse` para documentos previos a la feature) y
+  `references: Vec<String>` (`#[serde(default)]`). `PortFinding` gana
+  `cpes: Vec<String>` (`#[serde(default)]`). `sample_result()` y tests
+  actualizados; nuevo test de deserialización con defaults para documentos
+  pre-`vuln_enrichment`.
+- **`src/parser.rs`**: `collect_cpes()` recoge los `<cpe>` hijos de `<service>`
+  en `PortFinding.cpes`. Los `VulnFinding` de scripts NSE llevan
+  `source: VulnSource::NmapNse`, `references: vec![]`. Asserts nuevos de `cpes`
+  en los fixtures `open_ports_service_version.xml` y `vuln_findings.xml`.
+- **`src/enrichment.rs`** (nuevo módulo, `pub mod enrichment;` en `lib.rs`):
+  - `trait VulnEnricher` (`#[async_trait]`, dyn-compatible):
+    `enrich(&self, &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError>`.
+  - `enum EnrichError` (`thiserror`): `DataSource(String)`, `Backend(String)`.
+  - `struct ExploitDbEnricher`: `from_csv_path(&str)` (async, carga vía
+    `tokio::task::spawn_blocking` + crate `csv`) indexa `files_exploits.csv` en
+    memoria. Matcher deliberadamente conservador: sólo puertos con versión
+    detectada; query = tokens de `"<service> <version>"`; match = ≥2 tokens y
+    todos como substring case-insensitive del título, más comprobación de que
+    el `mayor.menor` de cualquier token numérico de versión aparece en el
+    título. `id` = primer CVE de `codes`, `source: ExploitDb`, referencia a
+    `exploit-db.com/exploits/<edb_id>`.
+  - `struct CompositeVulnEnricher`: ejecuta todos los enrichers y concatena; un
+    `Err` de uno se loggea (`tracing::warn!`) y no aborta a los demás.
+  - 9 unit tests (match real vsftpd 2.3.4 → `CVE-2011-2523`, sin match, versión
+    menor errónea, puerto sin versión, CSV inexistente → `DataSource`,
+    extracción de CVE con `;`, `version_prefix`, composite concatena, composite
+    tolera `Err`).
+- **`src/config.rs`**: nueva env var requerida `MS_NMAP_EXPLOITDB_CSV`
+  (`EXPLOITDB_CSV_VAR`), campo `Config::exploitdb_csv: String`, mismo patrón que
+  el resto (ausente/vacía → `ConfigError::MissingVar`). 2 tests nuevos.
+- **`src/pipeline.rs`**: `ServicePorts.enricher: Arc<dyn VulnEnricher>`.
+  `run_stages` invoca `enricher.enrich(&result.ports)` entre `parser::parse` y
+  `repo.save`; un `Err` se loggea con `tracing::warn!` y se continúa con
+  `Vec::new()` (**best-effort**, nunca `ScanOutcome::Failed`).
+  `merge_enrichment_findings` deduplica por CVE (`id`) contra los hallazgos ya
+  presentes (incluida deduplicación intra-`extra`); sin `id`, deduplica por
+  `description`. 2 tests unitarios del merge + doble `StubEnricher`.
+- **`src/wiring.rs`**: `WiringError::Enrichment(#[from] EnrichError)`. Construye
+  `ExploitDbEnricher::from_csv_path(&config.exploitdb_csv)` envuelto en
+  `CompositeVulnEnricher`; si el CSV no carga, el servicio no arranca.
+- **`Cargo.toml`**: `+ csv = "1"` (parser CSV Rust puro, sin FFI/egress).
+- **`Dockerfile`**: nuevo stage `exploitdb` (reusa la base `rust:1.98-bookworm`
+  ya pineada) que descarga `files_exploits.csv` de un **commit fijo** de
+  `gitlab.com/exploit-database/exploitdb` vía `ADD --chmod=0644` (sin
+  curl/bash). `COPY --from=exploitdb` a la imagen distroless final +
+  `ENV MS_NMAP_EXPLOITDB_CSV=/opt/exploitdb/files_exploits.csv`. Imagen sigue
+  sin shell/coreutils/`searchsploit`/`nmap`.
+- **Docs**: `README.md` (env var + nota "offline"), `docs/architecture.md`
+  (nueva capa `enrichment` entre `parser` y `repository`, puerto en la tabla
+  hexagonal, diagrama de flujo, sección Despliegue), `docs/security-scope.md`
+  (enriquecimiento ExploitDB = lookup local sin egress, detección pasiva igual
+  categoría que `--script vuln`; nota sobre adaptadores de API futuros).
+- **Tests/fixtures**: `tests/fixtures/exploitdb_sample.csv` — 20 filas
+  **reales** extraídas por EDB-ID de `/usr/share/exploitdb/files_exploits.csv`
+  (procedencia documentada en `tests/fixtures/README.md`, incluye `vsftpd 2.3.4`
+  → `CVE-2011-2523` y `UnrealIRCd 3.2.8.1` → `CVE-2010-2075`). `tests/scan_pipeline.rs`
+  actualizado: `build_pipeline` recibe un `Arc<dyn VulnEnricher>` real (cargado
+  del fixture); el e2e con Docker verifica que el `ScanResult` publicado incluye
+  un `VulnFinding` con `source: ExploitDb` (aportado por el puerto 6667 /
+  `UnrealIRCd`, cuyo CVE no coincide con el que ya trae nmap y por tanto
+  sobrevive al dedup) y que `CVE-2011-2523` (que sí trae nmap) no se duplica.
+  `src/messaging/publisher.rs` y `tests/repository.rs` actualizados a los campos
+  nuevos de `PortFinding`/`VulnFinding`.
+
+### Revisión
+
+- Ronda 1: **APROBADO** sin cambios requeridos (`docker build` OK, imagen
+  ~67.5 MB sin bash/nmap, matcher conservador verificado, sin egress, 3
+  corridas de `./init.sh` estables).
+- Detalle: `progress/impl_vuln_enrichment.md`, `progress/review_vuln_enrichment.md`.
+
+### Verificación
+
+- `./init.sh` verde y estable: 4 corridas del implementer + 3 del reviewer + 1
+  de cierre (exit 0, 0 `[FAIL]`), incluye `cargo test -- --ignored` con
+  contenedores reales sshd + `mongo:7`.
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` limpios.
+- `docker build` OK; imagen final 67.5 MB, sin shell/coreutils/`nmap`/`searchsploit`.
+- Sin `unwrap`/`expect`/`panic!` fuera de tests. Adaptador ExploitDB sin egress
+  de red. Sin regresión en features 1-12.
+- Commit pendiente (lo gestiona el leader): `Cargo.toml`, `Cargo.lock`,
+  `Dockerfile`, `README.md`, `docs/architecture.md`, `docs/security-scope.md`,
+  `src/{lib,domain,parser,config,pipeline,wiring,enrichment}.rs`,
+  `src/messaging/publisher.rs`, `tests/{scan_pipeline,repository}.rs`,
+  `tests/fixtures/{exploitdb_sample.csv,README.md}`, `feature_list.json`,
+  `progress/*.md`.
+- Con esta feature, las 13 del `feature_list.json` quedan en `done`.

@@ -39,6 +39,14 @@ pub const SSH_CONNECT_TIMEOUT_VAR: &str = "MS_NMAP_SSH_CONNECT_TIMEOUT_SECS";
 /// remoto sobre la sesión SSH, expresado en segundos enteros.
 pub const SSH_COMMAND_TIMEOUT_VAR: &str = "MS_NMAP_SSH_COMMAND_TIMEOUT_SECS";
 
+/// Nombre de la variable de entorno con la ruta al CSV de Exploit-DB
+/// (`files_exploits.csv`) que usa [`crate::enrichment::ExploitDbEnricher`].
+///
+/// No tiene valor por defecto: el enriquecimiento offline es una capacidad
+/// obligatoria del servicio y el CSV se bundlea en la imagen (el `Dockerfile`
+/// fija esta variable con `ENV`).
+pub const EXPLOITDB_CSV_VAR: &str = "MS_NMAP_EXPLOITDB_CSV";
+
 /// Errores posibles al construir la [`Config`] del servicio.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -82,6 +90,9 @@ pub struct Config {
     pub ssh_connect_timeout: Duration,
     /// Timeout para la ejecución de un comando remoto sobre la sesión SSH.
     pub ssh_command_timeout: Duration,
+    /// Ruta al CSV de Exploit-DB (`files_exploits.csv`) para el enriquecimiento
+    /// offline de vulnerabilidades.
+    pub exploitdb_csv: String,
 }
 
 impl Config {
@@ -92,7 +103,8 @@ impl Config {
     /// - [`ConfigError::MissingVar`] si falta (o está vacía) una variable
     ///   requerida: [`MONGO_URI_VAR`], [`MONGO_DB_VAR`], [`SSH_PORT_VAR`],
     ///   [`BROKER_ENDPOINT_VAR`], [`BROKER_CREDENTIAL_VAR`],
-    ///   [`SSH_CONNECT_TIMEOUT_VAR`] o [`SSH_COMMAND_TIMEOUT_VAR`].
+    ///   [`SSH_CONNECT_TIMEOUT_VAR`], [`SSH_COMMAND_TIMEOUT_VAR`] o
+    ///   [`EXPLOITDB_CSV_VAR`].
     /// - [`ConfigError::InvalidValue`] si un timeout está presente pero no es
     ///   un entero de segundos positivo, o si [`SSH_PORT_VAR`] no es un entero
     ///   en el rango `1..=65535`.
@@ -117,6 +129,7 @@ impl Config {
             parse_timeout(SSH_CONNECT_TIMEOUT_VAR, lookup(SSH_CONNECT_TIMEOUT_VAR))?;
         let ssh_command_timeout =
             parse_timeout(SSH_COMMAND_TIMEOUT_VAR, lookup(SSH_COMMAND_TIMEOUT_VAR))?;
+        let exploitdb_csv = required(EXPLOITDB_CSV_VAR, lookup(EXPLOITDB_CSV_VAR))?;
 
         Ok(Self {
             mongo_uri,
@@ -126,6 +139,7 @@ impl Config {
             broker_credential: SecretString::from(broker_credential),
             ssh_connect_timeout,
             ssh_command_timeout,
+            exploitdb_csv,
         })
     }
 }
@@ -202,6 +216,7 @@ mod tests {
             (BROKER_CREDENTIAL_VAR, TEST_BROKER_CREDENTIAL),
             (SSH_CONNECT_TIMEOUT_VAR, "7"),
             (SSH_COMMAND_TIMEOUT_VAR, "120"),
+            (EXPLOITDB_CSV_VAR, "/opt/exploitdb/files_exploits.csv"),
         ])
     }
 
@@ -223,6 +238,27 @@ mod tests {
         );
         assert_eq!(config.ssh_connect_timeout, Duration::from_secs(7));
         assert_eq!(config.ssh_command_timeout, Duration::from_secs(120));
+        assert_eq!(config.exploitdb_csv, "/opt/exploitdb/files_exploits.csv");
+    }
+
+    #[test]
+    fn missing_exploitdb_csv_var_yields_typed_missing_var_error() {
+        let mut vars = valid_vars();
+        vars.remove(EXPLOITDB_CSV_VAR);
+
+        let err = config_from(&vars).expect_err("sin EXPLOITDB_CSV debe fallar");
+
+        assert!(matches!(err, ConfigError::MissingVar(EXPLOITDB_CSV_VAR)));
+    }
+
+    #[test]
+    fn empty_exploitdb_csv_var_is_treated_as_missing() {
+        let mut vars = valid_vars();
+        vars.insert(EXPLOITDB_CSV_VAR, "   ");
+
+        let err = config_from(&vars).expect_err("EXPLOITDB_CSV vacía debe fallar");
+
+        assert!(matches!(err, ConfigError::MissingVar(EXPLOITDB_CSV_VAR)));
     }
 
     #[test]

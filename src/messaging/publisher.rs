@@ -301,7 +301,7 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
-    use crate::domain::{PortFinding, PortState, Protocol, Severity, VulnFinding};
+    use crate::domain::{PortFinding, PortState, Protocol, Severity, VulnFinding, VulnSource};
 
     fn sample_result() -> ScanResult {
         ScanResult {
@@ -313,6 +313,7 @@ mod tests {
                     state: PortState::Open,
                     service: Some("ssh".to_owned()),
                     version: Some("OpenSSH 9.6p1".to_owned()),
+                    cpes: vec!["cpe:/a:openbsd:openssh:9.6p1".to_owned()],
                 },
                 PortFinding {
                     port: 80,
@@ -320,6 +321,7 @@ mod tests {
                     state: PortState::Filtered,
                     service: Some("http".to_owned()),
                     version: None,
+                    cpes: Vec::new(),
                 },
             ],
             vulnerabilities: vec![VulnFinding {
@@ -327,6 +329,8 @@ mod tests {
                 severity: Severity::High,
                 description: "ssh-agent PKCS#11 arbitrary code execution".to_owned(),
                 nse_script: "ssh-vuln-cve2023-38408".to_owned(),
+                source: VulnSource::NmapNse,
+                references: Vec::new(),
             }],
             scanned_at: datetime!(2026-08-27 12:30:00 UTC),
         }
