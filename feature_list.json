@@ -222,6 +222,44 @@
         "cargo build sin warnings; ./init.sh verde (2-3 corridas); clippy/fmt/doc limpios; sin regresión en features 1-13"
       ],
       "status": "done"
+    },
+    {
+      "id": 15,
+      "name": "scan_started_event",
+      "title": "Publicar ScanOutcome::started al comenzar el pipeline",
+      "description": "El repo broker (docs/architecture.md, contracts/) ya define el contrato y la ruta (routing key scan.outcome.started, consumida solo por el Gateway, nunca por ms-analisis) para un tercer estado de ScanOutcome que hoy ms-nmap no emite. Sin esta feature, RF-07 (estado PENDIENTE/EN_PROGRESO/COMPLETADO/FALLIDO) y RF-08 (notificación en tiempo real al frontend vía Gateway) no tienen forma de saber que un escaneo empezó a procesarse, solo su desenlace final. No depende de que exista ya un adaptador real de broker: se publica igual a través del ScanResultSink inyectado (hoy el stub en memoria; mañana el adaptador RabbitMQ real).",
+      "acceptance": [
+        "messaging::publisher::ScanOutcome gana la variante Started { correlation_id: CorrelationId } (serde internamente tageada por status: \"started\", sin campos result ni reason) y su constructor ScanOutcome::started(correlation_id)",
+        "El status_label() (o equivalente) devuelve \"started\" para esta variante; outcome_log_fields (o el helper de logging equivalente) la maneja sin panic y sin volcar más que correlation_id + status (igual contrato de no-fuga que Completed/Failed)",
+        "ScanPipeline::process_one publica un ScanOutcome::started(correlation_id) a través del ScanResultSink inyectado ANTES de ejecutar ssh::connect/scanner::run_scan (es decir, antes de tocar el objetivo), y luego sigue con el flujo existente hasta publicar el desenlace terminal (Completed o Failed)",
+        "Publicar el evento started es best-effort: si sink.publish falla, se loggea con tracing::warn! (correlation_id, error, sin credenciales) y el pipeline continúa con run_stages igualmente — nunca aborta el escaneo por esto",
+        "Se publica un único evento started por invocación de process_one",
+        "Test de round-trip serde: ScanOutcome::started(...) serializa exactamente a {\"status\":\"started\",\"correlation_id\":\"...\"} sin campos extra, y deserializa de vuelta; los round-trip existentes de Completed/Failed siguen verdes (regresión)",
+        "Test unitario: usando InMemoryScanResultSink, una llamada a process_one registra exactamente 2 desenlaces en orden — Started primero, luego Completed o Failed — ambos con el mismo correlation_id",
+        "tests/scan_pipeline.rs (e2e, #[ignore = \"requiere Docker\"]) se actualiza para verificar que el primer desenlace publicado es Started antes del terminal, sin debilitar los asserts existentes del resultado final",
+        "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en features 1-14"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 16,
+      "name": "scan_cancellation",
+      "title": "Consumir ScanCancellation y abortar un escaneo en curso",
+      "description": "El repo broker ya define el canal y el contrato (exchange scan.cancellations, cola ms-nmap.scan-cancellations, mensaje {correlation_id, requested_by}) para que el Gateway pida cancelar un escaneo activo (RF-14). ms-nmap hoy no tiene ningún mecanismo de cancelación: ScanPipeline::run despacha cada solicitud a una tarea concurrente sin forma de detenerla a mitad de camino. Esta feature añade el puerto de consumo (mismo patrón hexagonal que ScanRequestSource, con su stub en memoria) y la mecánica de cancelación cooperativa dentro del pipeline, sin depender de que exista ya un adaptador real de broker. El desenlace de un escaneo cancelado se publica como ScanOutcome::failed (el contrato de broker no tiene un cuarto estado 'cancelled' todavía; no se inventa uno aquí sin acordarlo primero con ese repo).",
+      "acceptance": [
+        "domain::ScanCancellation { correlation_id: CorrelationId, requested_by: String } con Serialize/Deserialize coincidiendo exactamente con contracts/scan-cancellation.schema.json de broker (mismos nombres de campo, sin campos extra)",
+        "messaging::consumer (o un submódulo) define el trait ScanCancellationSource (#[async_trait], Send + Sync, dyn-compatible): async fn next_cancellation(&self) -> Result<Option<ScanCancellation>, ConsumeError>, mismo contrato de errores (mensajes malformados se descartan sin ser fatales, fallo de transporte sí lo es) que ScanRequestSource",
+        "InMemoryScanCancellationSource: stub en memoria para desarrollo y tests, mismo patrón que InMemoryScanRequestSource (from_requests/from_raw_messages equivalentes)",
+        "ScanPipeline::run acepta un ScanCancellationSource además de la fuente de solicitudes, y corre un segundo bucle concurrente (mismo JoinSet/tokio::spawn que el de solicitudes) que, al recibir una cancelación, aborta SOLO la tarea en curso cuyo correlation_id coincide -si existe-; una cancelación para un correlation_id desconocido o ya terminado es un no-op loggeado, no un error",
+        "Mecanismo de cancelación cooperativa: cada tarea en vuelo se registra (p. ej. en un registro Arc<Mutex<HashMap<CorrelationId, CancellationToken>>> con tokio_util::sync::CancellationToken) al arrancar process_one y se desregistra al terminar (éxito, fallo o cancelación) de forma atómica, para que una cancelación tardía sobre una tarea ya finalizada sea un no-op seguro, no una condición de carrera",
+        "Un escaneo cancelado mientras corren sus etapas (conexión SSH, ejecución de nmap, parseo, enriquecimiento, persistencia) detiene el trabajo en el primer punto de espera async posible (vía tokio::select! contra el CancellationToken alrededor de run_stages) y publica ScanOutcome::failed(correlation_id, \"escaneo cancelado por solicitud explícita\") -o un mensaje equivalente que dé constancia clara de que fue una cancelación, no un fallo técnico- en vez del flujo normal",
+        "Ningún dato de la solicitud cancelada (credenciales, IP) se filtra en el mensaje de cancelación publicado ni en los logs de esta feature",
+        "Cargo.toml: añade tokio-util (feature sync, para CancellationToken) si no está ya disponible transitivamente; se justifica en el informe",
+        "Tests unitarios (sin Docker): registrar y cancelar una tarea simulada mediante el registro de tokens; cancelar un correlation_id desconocido es un no-op sin panic; desregistro correcto tras finalización normal evita que una cancelación tardía afecte una tarea ya completada",
+        "Test de integración (#[ignore = \"requiere Docker\"], reutilizando el patrón de tests/scan_pipeline.rs con contenedor sshd real y un comando lento en el stub): arranca un escaneo, publica su cancelación mientras sigue en curso, y verifica que el pipeline lo detiene antes de completarlo y publica el ScanOutcome::failed de cancelación en vez del resultado normal",
+        "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en features 1-15"
+      ],
+      "status": "pending"
     }
   ]
 }
