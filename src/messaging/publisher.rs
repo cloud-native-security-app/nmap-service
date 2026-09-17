@@ -7,9 +7,13 @@
 //! trait [`ScanResultSink`] y nunca de un cliente de broker concreto. Este
 //! módulo aporta además:
 //!
-//! - [`ScanOutcome`]: unifica los dos desenlaces posibles del pipeline — éxito
-//!   ([`ScanOutcome::Completed`]) y fallo ([`ScanOutcome::Failed`]) — en un solo
-//!   tipo serializable. Se publican **ambos** (ver `docs/architecture.md`).
+//! - [`ScanOutcome`]: unifica los desenlaces posibles del pipeline — el arranque
+//!   ([`ScanOutcome::Started`]), publicado antes de tocar el objetivo, y el
+//!   desenlace terminal, éxito ([`ScanOutcome::Completed`]) o fallo
+//!   ([`ScanOutcome::Failed`]) — en un solo tipo serializable. `Started` la
+//!   consume sólo el Gateway (routing key `scan.outcome.started` en el broker),
+//!   nunca `ms-analisis`, que sigue esperando únicamente el desenlace terminal
+//!   (ver `docs/architecture.md`).
 //! - [`encode_outcome`]: serializa un [`ScanOutcome`] al cuerpo de mensaje
 //!   canónico (JSON) que consumirá `ms-analisis`.
 //! - [`InMemoryScanResultSink`]: implementación de [`ScanResultSink`] para
@@ -22,7 +26,13 @@
 //! # Formato del mensaje
 //!
 //! [`ScanOutcome`] usa una representación *internally tagged* con la clave
-//! `status`. `ms-analisis` distingue los dos casos por ese campo:
+//! `status`. El Gateway y `ms-analisis` distinguen los casos por ese campo
+//! (`ms-analisis` sólo consume `completed`/`failed`, nunca `started`):
+//!
+//! ```json
+//! { "status": "started",
+//!   "correlation_id": "corr-42" }
+//! ```
 //!
 //! ```json
 //! { "status": "completed",
@@ -61,15 +71,26 @@ use crate::domain::{CorrelationId, ScanResult};
 
 /// Desenlace de un escaneo, listo para publicarse hacia el Broker.
 ///
-/// El pipeline termina siempre en uno de estos dos casos y **ambos** se
-/// publican: `ms-analisis` necesita saber tanto que un escaneo terminó con
-/// resultado como que falló y por qué.
+/// El pipeline publica [`ScanOutcome::Started`] al arrancar (antes de tocar el
+/// objetivo) y siempre termina en uno de los dos desenlaces terminales,
+/// [`ScanOutcome::Completed`] o [`ScanOutcome::Failed`]: `ms-analisis` necesita
+/// saber tanto que un escaneo terminó con resultado como que falló y por qué,
+/// mientras que `Started` la consume sólo el Gateway (RF-07/RF-08, ver
+/// `docs/architecture.md`).
 ///
-/// Se serializa *internally tagged* con la clave `status` (`"completed"` /
-/// `"failed"`); ver el formato de mensaje en la documentación del módulo.
+/// Se serializa *internally tagged* con la clave `status` (`"started"` /
+/// `"completed"` / `"failed"`); ver el formato de mensaje en la documentación
+/// del módulo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ScanOutcome {
+    /// El pipeline empezó a procesar la solicitud (antes de `ssh::connect` /
+    /// `scanner::run_scan`). No lleva `result` ni `reason`: sólo avisa de que el
+    /// escaneo pasó de PENDIENTE a EN_PROGRESO.
+    Started {
+        /// Identificador de correlación de la solicitud original.
+        correlation_id: CorrelationId,
+    },
     /// El escaneo terminó y produjo un [`ScanResult`].
     Completed {
         /// Identificador de correlación de la solicitud original. Se incluye
@@ -91,6 +112,13 @@ pub enum ScanOutcome {
 }
 
 impl ScanOutcome {
+    /// Construye el evento de arranque a partir del `correlation_id` de la
+    /// solicitud. Se publica antes de tocar el objetivo (ver
+    /// `ScanPipeline::process_one`).
+    pub fn started(correlation_id: CorrelationId) -> Self {
+        Self::Started { correlation_id }
+    }
+
     /// Construye el desenlace de éxito a partir del `correlation_id` de la
     /// solicitud y el [`ScanResult`] producido.
     pub fn completed(correlation_id: CorrelationId, result: ScanResult) -> Self {
@@ -113,16 +141,17 @@ impl ScanOutcome {
     /// de la variante.
     pub fn correlation_id(&self) -> &CorrelationId {
         match self {
-            Self::Completed { correlation_id, .. } | Self::Failed { correlation_id, .. } => {
-                correlation_id
-            }
+            Self::Started { correlation_id }
+            | Self::Completed { correlation_id, .. }
+            | Self::Failed { correlation_id, .. } => correlation_id,
         }
     }
 
-    /// Devuelve la etiqueta de estado (`"completed"` / `"failed"`) que aparece en
-    /// el campo `status` del mensaje.
+    /// Devuelve la etiqueta de estado (`"started"` / `"completed"` /
+    /// `"failed"`) que aparece en el campo `status` del mensaje.
     pub fn status_label(&self) -> &'static str {
         match self {
+            Self::Started { .. } => "started",
             Self::Completed { .. } => "completed",
             Self::Failed { .. } => "failed",
         }
@@ -209,6 +238,11 @@ struct OutcomeLogFields<'a> {
 /// caché de interés tiene una carrera conocida al correr tests en paralelo).
 fn outcome_log_fields(outcome: &ScanOutcome) -> OutcomeLogFields<'_> {
     match outcome {
+        ScanOutcome::Started { correlation_id } => OutcomeLogFields {
+            correlation_id,
+            status: "started",
+            counts: None,
+        },
         ScanOutcome::Completed {
             correlation_id,
             result,
@@ -337,6 +371,20 @@ mod tests {
     }
 
     #[test]
+    fn started_outcome_serializes_to_exact_message_shape_with_no_extra_fields() {
+        let outcome = ScanOutcome::started(CorrelationId::from("corr-42"));
+
+        let json = serde_json::to_value(&outcome).expect("serializa a JSON");
+
+        assert_eq!(
+            json,
+            serde_json::json!({ "status": "started", "correlation_id": "corr-42" }),
+            "Started no debe llevar result ni reason: {json}"
+        );
+        assert_eq!(outcome.status_label(), "started");
+    }
+
+    #[test]
     fn completed_outcome_serializes_to_expected_message_shape() {
         let outcome = ScanOutcome::completed(CorrelationId::from("corr-42"), sample_result());
 
@@ -383,6 +431,7 @@ mod tests {
     #[test]
     fn outcome_json_round_trip_preserves_every_field() {
         for outcome in [
+            ScanOutcome::started(CorrelationId::from("corr-0")),
             ScanOutcome::completed(CorrelationId::from("corr-1"), sample_result()),
             ScanOutcome::failed(CorrelationId::from("corr-2"), "Mongo: conexión rechazada"),
         ] {
@@ -407,7 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn correlation_id_accessor_works_for_both_variants() {
+    fn correlation_id_accessor_works_for_all_variants() {
+        assert_eq!(
+            ScanOutcome::started(CorrelationId::from("s"))
+                .correlation_id()
+                .as_str(),
+            "s"
+        );
         assert_eq!(
             ScanOutcome::completed(CorrelationId::from("a"), sample_result())
                 .correlation_id()
@@ -497,7 +552,18 @@ mod tests {
     }
 
     #[test]
-    fn log_outcome_published_does_not_panic_for_either_variant() {
+    fn log_fields_for_started_expose_only_correlation_id_and_status() {
+        let outcome = ScanOutcome::started(CorrelationId::from("corr-1"));
+        let fields = outcome_log_fields(&outcome);
+
+        assert_eq!(fields.correlation_id.as_str(), "corr-1");
+        assert_eq!(fields.status, "started");
+        assert_eq!(fields.counts, None);
+    }
+
+    #[test]
+    fn log_outcome_published_does_not_panic_for_any_variant() {
+        log_outcome_published(&ScanOutcome::started(CorrelationId::from("c")));
         log_outcome_published(&ScanOutcome::completed(
             CorrelationId::from("c"),
             sample_result(),

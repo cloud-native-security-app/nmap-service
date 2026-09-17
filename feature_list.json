@@ -239,7 +239,7 @@
         "tests/scan_pipeline.rs (e2e, #[ignore = \"requiere Docker\"]) se actualiza para verificar que el primer desenlace publicado es Started antes del terminal, sin debilitar los asserts existentes del resultado final",
         "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en features 1-14"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 16,

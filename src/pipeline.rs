@@ -3,12 +3,15 @@
 //! (ver `docs/architecture.md`, §"Flujo de datos").
 //!
 //! [`ScanPipeline::process_one`] ejecuta **una** solicitud por todas las etapas.
-//! Un fallo en cualquiera de ellas (SSH, `nmap`, parseo, Mongo) **no** se
-//! propaga ni provoca un `panic`: se convierte en un [`ScanOutcome::Failed`]
-//! publicado hacia el Broker (§"Manejo de errores"). [`ScanPipeline::run`]
-//! consume solicitudes de un [`ScanRequestSource`] y
-//! despacha varias de forma concurrente con `tokio::spawn`; no hay llamadas
-//! bloqueantes (`russh` y `mongodb` son nativamente async).
+//! Antes de la primera (`ssh::connect`) publica un [`ScanOutcome::Started`]
+//! best-effort, para que el Gateway sepa que la solicitud pasó a EN_PROGRESO
+//! (feature `scan_started_event`). Un fallo en cualquiera de las etapas
+//! siguientes (SSH, `nmap`, parseo, Mongo) **no** se propaga ni provoca un
+//! `panic`: se convierte en un [`ScanOutcome::Failed`] publicado hacia el
+//! Broker (§"Manejo de errores"). [`ScanPipeline::run`] consume solicitudes de
+//! un [`ScanRequestSource`] y despacha varias de forma concurrente con
+//! `tokio::spawn`; no hay llamadas bloqueantes (`russh` y `mongodb` son
+//! nativamente async).
 //!
 //! # Seguridad
 //!
@@ -116,10 +119,17 @@ impl ScanPipeline {
     /// Procesa **una** solicitud por todas las etapas del pipeline y publica el
     /// desenlace (éxito o fallo) hacia el Broker.
     ///
+    /// Antes de tocar el objetivo (`ssh::connect`/`scanner::run_scan`) publica
+    /// exactamente un [`ScanOutcome::Started`], para que el Gateway sepa que la
+    /// solicitud pasó de PENDIENTE a EN_PROGRESO (RF-07/RF-08). Esa publicación
+    /// es best-effort: si `sink.publish` falla, se registra con
+    /// `tracing::warn!` (sin credenciales) y el pipeline sigue igual con las
+    /// etapas del escaneo — nunca se aborta por esto.
+    ///
     /// Nunca propaga un error ni hace `panic`: cualquier fallo de etapa se
     /// publica como [`ScanOutcome::Failed`] con el `correlation_id` de la
-    /// solicitud. Si la propia publicación falla, se registra con
-    /// `tracing::error!` y se termina (sin reintentos).
+    /// solicitud. Si la propia publicación del desenlace terminal falla, se
+    /// registra con `tracing::error!` y se termina (sin reintentos).
     pub async fn process_one(&self, request: ScanRequest) {
         let correlation_id = request.correlation_id.clone();
         tracing::info!(
@@ -127,6 +137,18 @@ impl ScanPipeline {
             target_ip = %request.ip,
             "pipeline de escaneo iniciado"
         );
+
+        if let Err(err) = self
+            .sink
+            .publish(&ScanOutcome::started(correlation_id.clone()))
+            .await
+        {
+            tracing::warn!(
+                correlation_id = %correlation_id,
+                error = %err,
+                "no se pudo publicar el evento de arranque del escaneo; se continúa igual"
+            );
+        }
 
         let outcome = match self.run_stages(&request).await {
             Ok(result) => ScanOutcome::completed(correlation_id.clone(), result),
@@ -583,9 +605,21 @@ mod tests {
 
         pipeline.process_one(test_request("corr-ssh-fail")).await;
 
+        // Exactamente 2 desenlaces por invocación: Started primero, luego el
+        // terminal (Failed en este caso), ambos con el mismo correlation_id.
         let published = sink.published();
-        assert_eq!(published.len(), 1, "debe publicarse un único desenlace");
+        assert_eq!(
+            published.len(),
+            2,
+            "debe publicarse el evento started y el desenlace terminal"
+        );
         match &published[0] {
+            ScanOutcome::Started { correlation_id } => {
+                assert_eq!(correlation_id.as_str(), "corr-ssh-fail");
+            }
+            other => panic!("se esperaba Started primero, se obtuvo {other:?}"),
+        }
+        match &published[1] {
             ScanOutcome::Failed {
                 correlation_id,
                 reason,
@@ -599,5 +633,78 @@ mod tests {
             }
             other => panic!("se esperaba Failed, se obtuvo {other:?}"),
         }
+    }
+
+    /// [`ScanResultSink`] cuyas primeras `fail_first_n` llamadas a `publish`
+    /// fallan con [`PublishError::Transport`]; el resto se delega a un
+    /// [`InMemoryScanResultSink`] interno. Simula que publicar el evento
+    /// `started` falla, para comprobar el contrato best-effort de
+    /// `process_one`.
+    struct FlakySink {
+        fail_first_n: Mutex<usize>,
+        inner: InMemoryScanResultSink,
+    }
+
+    impl FlakySink {
+        fn failing_once() -> Self {
+            Self {
+                fail_first_n: Mutex::new(1),
+                inner: InMemoryScanResultSink::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScanResultSink for FlakySink {
+        async fn publish(
+            &self,
+            outcome: &ScanOutcome,
+        ) -> Result<(), crate::messaging::publisher::PublishError> {
+            let should_fail = {
+                let mut remaining = self.fail_first_n.lock().expect("lock");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
+                return Err(crate::messaging::publisher::PublishError::Transport(
+                    "fallo simulado de transporte".to_owned(),
+                ));
+            }
+            self.inner.publish(outcome).await
+        }
+    }
+
+    #[tokio::test]
+    async fn started_publish_failure_is_best_effort_and_does_not_abort_the_scan() {
+        let sink = Arc::new(FlakySink::failing_once());
+        let ports = ServicePorts {
+            executor: Arc::new(FailingExecutor),
+            scanner: Arc::new(UnusedScanner),
+            repository: Arc::new(UnusedRepository),
+            enricher: Arc::new(StubEnricher(Vec::new())),
+            host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+            sink: sink.clone(),
+        };
+        let pipeline = ScanPipeline::new(ports, test_config());
+
+        pipeline
+            .process_one(test_request("corr-started-flaky"))
+            .await;
+
+        // La publicación de `started` falló (silenciosamente, sólo warn!) pero
+        // el pipeline siguió con `run_stages` y publicó igual el desenlace
+        // terminal.
+        let published = sink.inner.published();
+        assert_eq!(
+            published.len(),
+            1,
+            "started falló al publicar; sólo debe quedar registrado el terminal"
+        );
+        assert!(matches!(published[0], ScanOutcome::Failed { .. }));
+        assert_eq!(published[0].correlation_id().as_str(), "corr-started-flaky");
     }
 }

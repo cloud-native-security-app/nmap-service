@@ -987,3 +987,93 @@ y caché persistente en Mongo con TTL.
   `src/enrichment/{mod,exploitdb,nvd}.rs` (nuevos), `tests/repository.rs`,
   `feature_list.json`, `progress/*.md`.
 - Con esta feature, las 14 del `feature_list.json` quedan en `done`.
+
+---
+
+## 2026-09-17 — Feature 15: scan_started_event
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó sin cambios requeridos, ver
+  `progress/review.md`)
+
+### Qué se hizo
+
+- **`src/messaging/publisher.rs`**: nueva variante `ScanOutcome::Started {
+  correlation_id: CorrelationId }` dentro del mismo enum *internally tagged*
+  (`#[serde(tag = "status", rename_all = "snake_case")]`) que `Completed`/
+  `Failed`; serializa exactamente a `{"status":"started","correlation_id":"..."}`
+  sin `result` ni `reason`. Constructor `ScanOutcome::started(correlation_id)`.
+  `status_label()`/`correlation_id()`/`outcome_log_fields` (helper puro de
+  logging) cubren la variante sin exponer más que `correlation_id`+`status`
+  (mismo contrato de no-fuga que las otras dos). Doc del módulo actualizada:
+  `Started` la consume sólo el Gateway (routing key `scan.outcome.started`),
+  nunca `ms-analisis`.
+- **`src/pipeline.rs`**: `ScanPipeline::process_one` publica
+  `ScanOutcome::started(correlation_id)` a través del `ScanResultSink`
+  inyectado **antes** de `run_stages` (SSH/nmap/parser/enrichment/repository).
+  Publicación best-effort: si `sink.publish` falla, se loggea con
+  `tracing::warn!` (correlation_id + error, sin credenciales) y el pipeline
+  sigue igual — nunca se aborta el escaneo por esto. Exactamente una
+  publicación `started` por invocación (sin bucles ni reintentos).
+- Sin dependencias nuevas en `Cargo.toml`.
+
+### Tests
+
+- `src/messaging/publisher.rs`: `started_outcome_serializes_to_exact_message_shape_with_no_extra_fields`
+  (JSON exacto sin campos extra); `outcome_json_round_trip_preserves_every_field`
+  ampliado a las 3 variantes (regresión de `Completed`/`Failed` sigue verde);
+  `correlation_id_accessor_works_for_all_variants`;
+  `log_fields_for_started_expose_only_correlation_id_and_status`;
+  `log_outcome_published_does_not_panic_for_any_variant`.
+- `src/pipeline.rs` (unit, sin Docker): `ssh_stage_failure_is_published_as_failed_outcome_without_docker`
+  actualizado — 2 desenlaces en orden Started→Failed, mismo `correlation_id`,
+  sin filtrar la credencial; nuevo `started_publish_failure_is_best_effort_and_does_not_abort_the_scan`
+  con un `FlakySink` que falla sólo la publicación de `started` y verifica que
+  el pipeline sigue y publica igual el desenlace terminal.
+- `tests/scan_pipeline.rs` (e2e, `#[ignore = "requiere Docker"]`): las 3
+  pruebas existentes (éxito, fallo, concurrencia) se actualizaron sin debilitar
+  ningún assert previo del resultado final, verificando que el primer
+  desenlace de cada `correlation_id` es `Started` antes del terminal (éxito: 2
+  eventos; fallo: 2 eventos; concurrencia con 3 solicitudes: 6 eventos = 3
+  `Started` + 3 `Completed`, con `Started` precediendo a su terminal por cada
+  `correlation_id`).
+
+### Revisión
+
+- Ronda 1: **APROBADO** sin cambios requeridos. El reviewer verificó los 9
+  criterios de `acceptance` contra el diff real, corrió `./init.sh` 3 veces de
+  forma independiente (fmt/clippy/118 unit/Docker/doc, todo verde), y grepeó
+  `unwrap()/expect()/panic!()/println!/dbg!` en los archivos tocados
+  confirmando que sólo aparecen dentro de `mod tests`.
+- Detalle: `progress/impl_scan_started_event.md`, `progress/review.md`.
+
+### Sobre el flake de `enrichment::nvd::tests`
+
+- Durante la sesión se observó una falla intermitente de 2 tests de
+  `enrichment::nvd::tests` al correr la suite completa en paralelo. Tanto el
+  implementer como el reviewer confirmaron **independientemente** (con `git
+  stash` contra el commit base `96f0288`, sin ningún cambio de esta feature)
+  que el flake **ya existía antes** de la feature 15 y no la toca (feature 15
+  no modifica ningún archivo de `enrichment/`). Aislado (`cargo test --lib
+  enrichment::nvd`) pasa consistentemente; sólo aparece bajo presión de CPU con
+  la suite completa, probablemente en el rate limiter de `NvdApiEnricher`
+  (feature 14). No bloqueó esta revisión. **Queda pendiente como hallazgo de
+  mantenimiento** para una sesión futura (no se abrió como feature nueva en
+  este cierre).
+
+### Verificación
+
+- `./init.sh` verde y estable: 4 corridas del implementer + 3 del reviewer +
+  1 de cierre (exit 0, 0 `[FAIL]`), incluye `cargo test -- --ignored` con
+  contenedores reales `sshd` + `mongo:7` (los 3 e2e de `tests/scan_pipeline.rs`
+  actualizados).
+- `cargo test`: 118 unitarios verdes (baseline 115 → +3: 5 nuevos/renombrados
+  en `publisher.rs` netos de las variantes ampliadas, 1 nuevo en `pipeline.rs`,
+  compensados por tests reescritos en el mismo archivo). `cargo clippy
+  --all-targets -- -D warnings`, `cargo fmt --check`, `RUSTDOCFLAGS="-D
+  warnings" cargo doc --no-deps` limpios.
+- Sin `unwrap`/`expect`/`panic!` fuera de tests. Sin regresión en features
+  1-14. No se tocó nada de la feature 16 (`scan_cancellation`).
+- Commit pendiente (lo gestiona el leader): `src/messaging/publisher.rs`,
+  `src/pipeline.rs`, `tests/scan_pipeline.rs`, `feature_list.json`,
+  `progress/*.md`.

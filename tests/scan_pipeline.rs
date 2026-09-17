@@ -246,11 +246,24 @@ async fn valid_request_flows_through_pipeline_and_is_published_and_persisted() {
 
     pipeline.run(source).await;
 
+    // feature scan_started_event: el primer desenlace publicado es Started,
+    // antes de tocar el objetivo, con el mismo correlation_id.
+    let published = sink.published();
+    assert_eq!(
+        published.len(),
+        2,
+        "debe publicarse el evento started y el desenlace terminal"
+    );
+    match &published[0] {
+        ScanOutcome::Started { correlation_id } => {
+            assert_eq!(correlation_id.as_str(), "corr-e2e-ok");
+        }
+        other => panic!("se esperaba Started primero, se obtuvo {other:?}"),
+    }
+
     // criterio 1: exactamente un Completed, con el correlation_id y el
     // ScanResult que se deduce del XML del stub.
-    let published = sink.published();
-    assert_eq!(published.len(), 1, "debe publicarse un único desenlace");
-    let result = match &published[0] {
+    let result = match &published[1] {
         ScanOutcome::Completed {
             correlation_id,
             result,
@@ -366,9 +379,20 @@ async fn stage_failure_is_published_as_failed_outcome_without_crashing() {
 
     pipeline.run(source).await;
 
+    // feature scan_started_event: Started primero, luego el Failed terminal.
     let published = sink.published();
-    assert_eq!(published.len(), 1, "debe publicarse un único desenlace");
+    assert_eq!(
+        published.len(),
+        2,
+        "debe publicarse el evento started y el desenlace terminal"
+    );
     match &published[0] {
+        ScanOutcome::Started { correlation_id } => {
+            assert_eq!(correlation_id.as_str(), "corr-e2e-fail");
+        }
+        other => panic!("se esperaba Started primero, se obtuvo {other:?}"),
+    }
+    match &published[1] {
         ScanOutcome::Failed {
             correlation_id,
             reason,
@@ -431,21 +455,65 @@ async fn multiple_requests_are_processed_concurrently() {
 
     pipeline.run(source).await;
 
-    // criterio 4: 3 desenlaces, todos con su correlation_id, sin panic.
+    // feature scan_started_event: cada solicitud publica su Started antes del
+    // terminal -> 3 Started + 3 Completed = 6 desenlaces en total.
     let published = sink.published();
-    assert_eq!(published.len(), 3, "deben publicarse 3 desenlaces");
-    let mut seen: Vec<String> = published
+    assert_eq!(
+        published.len(),
+        6,
+        "deben publicarse 6 desenlaces (started + terminal por cada una de las 3 solicitudes)"
+    );
+
+    let started: Vec<&ScanOutcome> = published
+        .iter()
+        .filter(|o| matches!(o, ScanOutcome::Started { .. }))
+        .collect();
+    let terminal: Vec<&ScanOutcome> = published
+        .iter()
+        .filter(|o| !matches!(o, ScanOutcome::Started { .. }))
+        .collect();
+    assert_eq!(started.len(), 3, "debe haber un Started por solicitud");
+
+    // criterio 4: 3 desenlaces terminales, todos con su correlation_id, sin panic.
+    assert_eq!(
+        terminal.len(),
+        3,
+        "deben publicarse 3 desenlaces terminales"
+    );
+    let mut seen: Vec<String> = terminal
         .iter()
         .map(|o| o.correlation_id().to_string())
         .collect();
     seen.sort();
     assert_eq!(seen, vec!["corr-c1", "corr-c2", "corr-c3"]);
     assert!(
-        published
+        terminal
             .iter()
             .all(|o| matches!(o, ScanOutcome::Completed { .. })),
-        "las 3 solicitudes deben completarse: {published:?}"
+        "las 3 solicitudes deben completarse: {terminal:?}"
     );
+
+    // Cada correlation_id debe tener su Started antes que su desenlace
+    // terminal en el orden global de publicación (el pipeline garantiza el
+    // orden por tarea; con 3 tareas concurrentes el entrelazado entre tareas
+    // es libre, pero el par started->terminal de una misma tarea nunca se
+    // invierte).
+    for id in ["corr-c1", "corr-c2", "corr-c3"] {
+        let started_idx = published
+            .iter()
+            .position(|o| matches!(o, ScanOutcome::Started { correlation_id } if correlation_id.as_str() == id))
+            .unwrap_or_else(|| panic!("falta Started para {id}"));
+        let terminal_idx = published
+            .iter()
+            .position(|o| {
+                !matches!(o, ScanOutcome::Started { .. }) && o.correlation_id().as_str() == id
+            })
+            .unwrap_or_else(|| panic!("falta el desenlace terminal para {id}"));
+        assert!(
+            started_idx < terminal_idx,
+            "{id}: Started (idx {started_idx}) debe preceder al terminal (idx {terminal_idx})"
+        );
+    }
 
     for id in ids {
         assert!(
