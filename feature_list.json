@@ -259,7 +259,7 @@
         "Test de integración (#[ignore = \"requiere Docker\"], reutilizando el patrón de tests/scan_pipeline.rs con contenedor sshd real y un comando lento en el stub): arranca un escaneo, publica su cancelación mientras sigue en curso, y verifica que el pipeline lo detiene antes de completarlo y publica el ScanOutcome::failed de cancelación en vez del resultado normal",
         "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en features 1-15"
       ],
-      "status": "pending"
+      "status": "done"
     }
   ]
 }

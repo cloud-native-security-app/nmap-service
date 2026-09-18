@@ -27,6 +27,14 @@ roxmltree = "0.21"
 mongodb = "3"
 async-trait = "0.1"
 csv = "1"
+# `tokio_util::sync::CancellationToken` para la cancelación cooperativa de un
+# escaneo en curso (feature `scan_cancellation`). Ya llega transitivamente vía
+# mongodb/russh/reqwest (ver Cargo.lock), pero Cargo exige declarar como
+# dependencia directa cualquier crate usado desde `src/`. El módulo `sync`
+# (que incluye `CancellationToken`) no está detrás de ningún feature flag de
+# `tokio-util` (a diferencia de `codec`/`net`/`rt`/`time`), así que no hace
+# falta activar ninguno: las features por defecto (vacías) ya alcanzan.
+tokio-util = "0.7"
 # Cliente HTTP para el adaptador `enrichment::nvd::NvdApiEnricher` (API NVD
 # 2.0). `default-features = false` + `rustls-tls` evita arrastrar OpenSSL/
 # `native-tls`: mismo TLS que ya usa `mongodb` en este crate.

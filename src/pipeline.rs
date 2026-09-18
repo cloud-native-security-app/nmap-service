@@ -13,26 +13,98 @@
 //! `tokio::spawn`; no hay llamadas bloqueantes (`russh` y `mongodb` son
 //! nativamente async).
 //!
+//! # Cancelación (feature `scan_cancellation`)
+//!
+//! [`ScanPipeline::run`] también consume un [`ScanCancellationSource`] en un
+//! segundo bucle concurrente (mismo `JoinSet`). Cada tarea en vuelo se
+//! registra en un registro interno de tokens por su `correlation_id` al
+//! arrancar [`ScanPipeline::process_one`] y se desregistra al terminar, para que una
+//! cancelación tardía sobre una tarea ya finalizada sea un no-op seguro. Una
+//! cancelación que llega mientras la tarea corre interrumpe `run_stages` en su
+//! próximo punto de espera async (vía `tokio::select!`) y publica
+//! [`ScanOutcome::Failed`] con un motivo que deja constancia explícita de que
+//! fue una cancelación, no un fallo técnico.
+//!
 //! # Seguridad
 //!
 //! El `reason` de un desenlace de fallo es `err.to_string()` de la etapa que
 //! falló. Los `Display` de `SshError`, `ScanError`, `ParseError` y `RepoError`
 //! ya redactan cualquier credencial, y el logging de este módulo sólo emite
 //! `correlation_id`, IP objetivo y estado — nunca `ssh_credentials_ref` (ver
-//! `docs/security-scope.md`).
+//! `docs/security-scope.md`). [`ScanCancellation`] no lleva IP ni credenciales
+//! del escaneo original.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
-use crate::domain::{ScanRequest, ScanResult, VulnFinding};
+use crate::domain::{CorrelationId, ScanCancellation, ScanRequest, ScanResult, VulnFinding};
 use crate::enrichment::VulnEnricher;
-use crate::messaging::consumer::{ConsumeError, ScanRequestSource};
+use crate::messaging::consumer::{ConsumeError, ScanCancellationSource, ScanRequestSource};
 use crate::messaging::publisher::{ScanOutcome, ScanResultSink};
 use crate::parser;
 use crate::repository::ScanResultRepository;
 use crate::scanner::{NmapScanner, ScanOptions};
 use crate::ssh::{HostKeyStore, RemoteExecutor, SshTimeouts};
+
+/// Motivo publicado en [`ScanOutcome::Failed`] cuando un escaneo se detuvo por
+/// una cancelación explícita (en vez de un fallo técnico de alguna etapa).
+const CANCELLATION_REASON: &str = "escaneo cancelado por solicitud explícita";
+
+/// Registro de [`CancellationToken`] por `correlation_id` de las tareas de
+/// escaneo en vuelo.
+///
+/// [`ScanPipeline::process_one`] registra un token al arrancar y lo
+/// desregistra al terminar (éxito, fallo o cancelación). Ambas operaciones
+/// toman el mismo `Mutex`, así que una cancelación tardía sobre una tarea ya
+/// desregistrada nunca encuentra el token: es un no-op seguro, no una
+/// condición de carrera.
+#[derive(Clone, Default)]
+struct CancellationRegistry {
+    tokens: Arc<Mutex<HashMap<CorrelationId, CancellationToken>>>,
+}
+
+impl CancellationRegistry {
+    /// Registra una nueva tarea y devuelve su token de cancelación.
+    fn register(&self, correlation_id: CorrelationId) -> CancellationToken {
+        let token = CancellationToken::new();
+        let mut guard = match self.tokens.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.insert(correlation_id, token.clone());
+        token
+    }
+
+    /// Retira el registro de una tarea que ya terminó (éxito, fallo o
+    /// cancelación).
+    fn unregister(&self, correlation_id: &CorrelationId) {
+        let mut guard = match self.tokens.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.remove(correlation_id);
+    }
+
+    /// Cancela la tarea con `correlation_id`, si sigue registrada. Devuelve
+    /// `true` si se encontró y canceló, `false` si el `correlation_id` es
+    /// desconocido o ya se desregistró (no-op seguro, nunca un error).
+    fn cancel(&self, correlation_id: &CorrelationId) -> bool {
+        let guard = match self.tokens.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.get(correlation_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 /// Adaptadores de los puertos hexagonales que necesita el pipeline, ya
 /// construidos (inyección de dependencias).
@@ -94,6 +166,7 @@ pub struct ScanPipeline {
     host_key_store: Arc<dyn HostKeyStore>,
     sink: Arc<dyn ScanResultSink>,
     config: PipelineConfig,
+    cancellations: CancellationRegistry,
 }
 
 impl ScanPipeline {
@@ -113,6 +186,7 @@ impl ScanPipeline {
             host_key_store: ports.host_key_store,
             sink: ports.sink,
             config,
+            cancellations: CancellationRegistry::default(),
         }
     }
 
@@ -130,6 +204,19 @@ impl ScanPipeline {
     /// publica como [`ScanOutcome::Failed`] con el `correlation_id` de la
     /// solicitud. Si la propia publicación del desenlace terminal falla, se
     /// registra con `tracing::error!` y se termina (sin reintentos).
+    ///
+    /// Registra un [`CancellationToken`] bajo el `correlation_id` de la
+    /// solicitud **al arrancar**, antes de publicar
+    /// [`ScanOutcome::Started`] (no después): así una cancelación que llegue
+    /// mientras esa publicación todavía está en curso encuentra el token ya
+    /// registrado y puede cancelar la tarea, en vez de descartarse como un
+    /// `correlation_id` desconocido. Lo desregistra siempre al terminar
+    /// (éxito, fallo o cancelación), para que una cancelación tardía sobre
+    /// esta tarea ya finalizada sea un no-op seguro. Si llega una cancelación
+    /// mientras las etapas siguen en curso, `tokio::select!` interrumpe el
+    /// trabajo en el próximo punto de espera async y se publica
+    /// [`ScanOutcome::Failed`] con un motivo que da constancia explícita de
+    /// la cancelación, en vez del desenlace normal.
     pub async fn process_one(&self, request: ScanRequest) {
         let correlation_id = request.correlation_id.clone();
         tracing::info!(
@@ -137,6 +224,8 @@ impl ScanPipeline {
             target_ip = %request.ip,
             "pipeline de escaneo iniciado"
         );
+
+        let token = self.cancellations.register(correlation_id.clone());
 
         if let Err(err) = self
             .sink
@@ -150,17 +239,28 @@ impl ScanPipeline {
             );
         }
 
-        let outcome = match self.run_stages(&request).await {
-            Ok(result) => ScanOutcome::completed(correlation_id.clone(), result),
-            Err(reason) => {
+        let outcome = tokio::select! {
+            result = self.run_stages(&request) => match result {
+                Ok(result) => ScanOutcome::completed(correlation_id.clone(), result),
+                Err(reason) => {
+                    tracing::warn!(
+                        correlation_id = %correlation_id,
+                        reason = %reason,
+                        "una etapa del pipeline falló; se publicará un desenlace de error"
+                    );
+                    ScanOutcome::failed(correlation_id.clone(), reason)
+                }
+            },
+            () = token.cancelled() => {
                 tracing::warn!(
                     correlation_id = %correlation_id,
-                    reason = %reason,
-                    "una etapa del pipeline falló; se publicará un desenlace de error"
+                    "escaneo cancelado por solicitud explícita; se detiene antes de completarse"
                 );
-                ScanOutcome::failed(correlation_id.clone(), reason)
+                ScanOutcome::failed(correlation_id.clone(), CANCELLATION_REASON)
             }
         };
+
+        self.cancellations.unregister(&correlation_id);
 
         let status = outcome.status_label();
         match self.sink.publish(&outcome).await {
@@ -233,9 +333,12 @@ impl ScanPipeline {
     }
 
     /// Consume solicitudes de `source` y las procesa de forma concurrente
-    /// (`tokio::spawn` por solicitud, con el pipeline clonado).
+    /// (`tokio::spawn` por solicitud, con el pipeline clonado), mientras un
+    /// segundo bucle -en el mismo `JoinSet`- consume cancelaciones de
+    /// `cancellations` y aborta la tarea en curso cuyo `correlation_id`
+    /// coincide, si existe.
     ///
-    /// El bucle termina cuando:
+    /// El bucle de solicitudes termina cuando:
     ///
     /// - la fuente devuelve `Ok(None)` (cierre ordenado), o
     /// - la fuente devuelve `Err(ConsumeError::Transport(_))`: sin transporte no
@@ -243,13 +346,29 @@ impl ScanPipeline {
     ///   adaptador de broker concreto (aún sin decidir, ver
     ///   `docs/architecture.md`), no de este bucle.
     ///
-    /// Un `Err(ConsumeError::MalformedPayload | InvalidSchema)` se registra con
-    /// `tracing::warn!` y **no** interrumpe el consumo (contrato de
-    /// [`ScanRequestSource`]).
+    /// El bucle de cancelaciones termina con el mismo criterio, aplicado a
+    /// `cancellations`. Una cancelación para un `correlation_id` desconocido o
+    /// ya finalizado es un no-op loggeado, nunca un error.
     ///
-    /// Antes de retornar, espera a que terminen las tareas de escaneo en vuelo.
-    pub async fn run(&self, source: Arc<dyn ScanRequestSource>) {
+    /// Un `Err(ConsumeError::MalformedPayload | InvalidSchema)` en cualquiera de
+    /// las dos fuentes se registra con `tracing::warn!` y **no** interrumpe su
+    /// consumo (contrato de [`ScanRequestSource`]/[`ScanCancellationSource`]).
+    ///
+    /// Antes de retornar, espera a que terminen ambos bucles y todas las tareas
+    /// de escaneo en vuelo.
+    pub async fn run(
+        &self,
+        source: Arc<dyn ScanRequestSource>,
+        cancellations: Arc<dyn ScanCancellationSource>,
+    ) {
         let mut tasks: JoinSet<()> = JoinSet::new();
+
+        let pipeline_for_cancellations = self.clone();
+        tasks.spawn(async move {
+            while let Some(cancellation) = next_valid_cancellation(cancellations.as_ref()).await {
+                pipeline_for_cancellations.apply_cancellation(&cancellation);
+            }
+        });
 
         while let Some(request) = next_valid_request(source.as_ref()).await {
             let pipeline = self.clone();
@@ -260,6 +379,25 @@ impl ScanPipeline {
             if let Err(err) = joined {
                 tracing::error!(error = %err, "una tarea de escaneo no terminó limpiamente");
             }
+        }
+    }
+
+    /// Aplica una [`ScanCancellation`] recibida: cancela la tarea en curso con
+    /// el mismo `correlation_id`, si existe. Un `correlation_id` desconocido o
+    /// ya finalizado es un no-op, sólo se registra con `tracing::info!`.
+    fn apply_cancellation(&self, cancellation: &ScanCancellation) {
+        if self.cancellations.cancel(&cancellation.correlation_id) {
+            tracing::info!(
+                correlation_id = %cancellation.correlation_id,
+                requested_by = %cancellation.requested_by,
+                "cancelación aplicada a un escaneo en curso"
+            );
+        } else {
+            tracing::info!(
+                correlation_id = %cancellation.correlation_id,
+                requested_by = %cancellation.requested_by,
+                "cancelación recibida para un escaneo desconocido o ya finalizado; no-op"
+            );
         }
     }
 }
@@ -282,6 +420,32 @@ async fn next_valid_request(source: &dyn ScanRequestSource) -> Option<ScanReques
                 tracing::error!(
                     error = %err,
                     "fallo de transporte con el Broker; se detiene el consumo"
+                );
+                return None;
+            }
+        }
+    }
+}
+
+/// Bloquea hasta obtener la siguiente cancelación válida de `source`, o `None`
+/// si la fuente se cerró (`Ok(None)`) o sufrió un fallo de transporte
+/// ([`ConsumeError::Transport`]).
+///
+/// Los mensajes malformados o con esquema inválido se descartan con
+/// `tracing::warn!` y no interrumpen el consumo (mismo contrato que
+/// [`next_valid_request`]).
+async fn next_valid_cancellation(source: &dyn ScanCancellationSource) -> Option<ScanCancellation> {
+    loop {
+        match source.next_cancellation().await {
+            Ok(Some(cancellation)) => return Some(cancellation),
+            Ok(None) => return None,
+            Err(err @ (ConsumeError::MalformedPayload(_) | ConsumeError::InvalidSchema(_))) => {
+                tracing::warn!(error = %err, "cancelación del Broker descartada; se continúa");
+            }
+            Err(err @ ConsumeError::Transport(_)) => {
+                tracing::error!(
+                    error = %err,
+                    "fallo de transporte con el Broker; se detiene el consumo de cancelaciones"
                 );
                 return None;
             }
@@ -322,11 +486,15 @@ mod tests {
     use std::time::Duration;
 
     use secrecy::SecretString;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::domain::{CorrelationId, PortFinding, Severity, SshCredentialsRef, VulnSource};
     use crate::enrichment::EnrichError;
-    use crate::messaging::consumer::{InMemoryScanRequestSource, IncomingScanRequest};
+    use crate::messaging::consumer::{
+        InMemoryScanCancellationSource, InMemoryScanRequestSource, IncomingScanRequest,
+        ScanCancellationSource,
+    };
     use crate::messaging::publisher::InMemoryScanResultSink;
     use crate::parser::ParseError;
     use crate::repository::{RepoError, ScanId};
@@ -396,6 +564,68 @@ mod tests {
             "un fallo de transporte detiene el consumo en la primera vuelta"
         );
         // No consumió las 3: paró en la primera.
+        assert_eq!(*source.remaining.lock().unwrap(), 2);
+    }
+
+    fn cancellation_json(correlation_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+                "correlation_id": "{correlation_id}",
+                "requested_by": "analyst@example.test"
+            }}"#
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn next_valid_cancellation_skips_poison_messages_and_ends_on_none() {
+        let source = InMemoryScanCancellationSource::from_raw_messages([
+            cancellation_json("corr-1"),
+            b"{ not json".to_vec(),
+            cancellation_json("corr-2"),
+        ]);
+
+        let first = next_valid_cancellation(&source)
+            .await
+            .expect("primera válida");
+        assert_eq!(first.correlation_id.as_str(), "corr-1");
+
+        let second = next_valid_cancellation(&source)
+            .await
+            .expect("segunda válida");
+        assert_eq!(second.correlation_id.as_str(), "corr-2");
+
+        assert!(next_valid_cancellation(&source).await.is_none());
+    }
+
+    struct TransportFailingCancellationSource {
+        remaining: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ScanCancellationSource for TransportFailingCancellationSource {
+        async fn next_cancellation(&self) -> Result<Option<ScanCancellation>, ConsumeError> {
+            let mut remaining = self.remaining.lock().expect("lock");
+            if *remaining == 0 {
+                return Ok(None);
+            }
+            *remaining -= 1;
+            Err(ConsumeError::Transport(
+                "conexión con el Broker caída".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn next_valid_cancellation_stops_on_transport_error() {
+        let source = TransportFailingCancellationSource {
+            remaining: Mutex::new(3),
+        };
+
+        assert!(
+            next_valid_cancellation(&source).await.is_none(),
+            "un fallo de transporte detiene el consumo en la primera vuelta"
+        );
         assert_eq!(*source.remaining.lock().unwrap(), 2);
     }
 
@@ -706,5 +936,288 @@ mod tests {
         );
         assert!(matches!(published[0], ScanOutcome::Failed { .. }));
         assert_eq!(published[0].correlation_id().as_str(), "corr-started-flaky");
+    }
+
+    // --- feature `scan_cancellation`: registro de tokens sin Docker ---
+
+    #[test]
+    fn cancellation_registry_cancel_after_register_marks_the_token_cancelled() {
+        let registry = CancellationRegistry::default();
+        let id = CorrelationId::from("corr-cancel-1");
+        let token = registry.register(id.clone());
+
+        assert!(!token.is_cancelled());
+        assert!(registry.cancel(&id), "debe encontrar el token registrado");
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_registry_cancel_unknown_id_is_a_safe_noop() {
+        let registry = CancellationRegistry::default();
+
+        assert!(!registry.cancel(&CorrelationId::from("corr-unknown")));
+    }
+
+    #[test]
+    fn cancellation_registry_unregister_prevents_late_cancellation_from_finding_the_token() {
+        let registry = CancellationRegistry::default();
+        let id = CorrelationId::from("corr-finished");
+        let token = registry.register(id.clone());
+
+        registry.unregister(&id);
+
+        assert!(
+            !registry.cancel(&id),
+            "una cancelación tardía sobre una tarea ya finalizada debe ser un no-op"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "el token de una tarea ya finalizada nunca debe marcarse cancelado por una \
+             cancelación tardía"
+        );
+    }
+
+    /// Adaptador falso de [`RemoteExecutor`] que avisa (`started`) en cuanto
+    /// entra a `connect` y luego se queda esperando indefinidamente. Permite
+    /// que un test cancele `process_one` con certeza de que la tarea ya se
+    /// registró y está detenida en su primer punto de espera async, sin
+    /// depender de `sleep`s arbitrarios.
+    struct SlowExecutor {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExecutor for SlowExecutor {
+        async fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            _user: &str,
+            _credentials: &SshCredentialsRef,
+            _store: &Arc<dyn HostKeyStore>,
+            _timeouts: SshTimeouts,
+        ) -> Result<Box<dyn RemoteSession>, SshError> {
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("esta rama nunca se alcanza: el test cancela antes de que resuelva")
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_mid_flight_stops_process_one_and_publishes_cancellation_failed_outcome() {
+        let started = Arc::new(Notify::new());
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let ports = ServicePorts {
+            executor: Arc::new(SlowExecutor {
+                started: started.clone(),
+            }),
+            scanner: Arc::new(UnusedScanner),
+            repository: Arc::new(UnusedRepository),
+            enricher: Arc::new(StubEnricher(Vec::new())),
+            host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+            sink: sink.clone(),
+        };
+        let pipeline = ScanPipeline::new(ports, test_config());
+        let correlation_id = CorrelationId::from("corr-cancel-mid-flight");
+
+        let pipeline_for_task = pipeline.clone();
+        let request = test_request(correlation_id.as_str());
+        let handle = tokio::spawn(async move { pipeline_for_task.process_one(request).await });
+
+        // Espera a que la tarea entre a `run_stages` (registrada en el
+        // registro de cancelación) antes de cancelarla.
+        started.notified().await;
+        assert!(
+            pipeline.cancellations.cancel(&correlation_id),
+            "la tarea debe estar registrada en cuanto el executor avisó `started`"
+        );
+
+        handle
+            .await
+            .expect("process_one no debe entrar en panic al cancelarse");
+
+        let published = sink.published();
+        assert_eq!(
+            published.len(),
+            2,
+            "debe publicarse el evento started y el desenlace de cancelación"
+        );
+        match &published[1] {
+            ScanOutcome::Failed {
+                correlation_id: id,
+                reason,
+            } => {
+                assert_eq!(id, &correlation_id);
+                assert_eq!(reason, CANCELLATION_REASON);
+            }
+            other => panic!("se esperaba Failed por cancelación, se obtuvo {other:?}"),
+        }
+    }
+
+    /// [`ScanResultSink`] cuya publicación del evento `Started` se queda
+    /// esperando (`entered_publish.notify_one()` + espera indefinida) hasta
+    /// que el test la libere. Permite comprobar que el registro de
+    /// cancelación ocurre ANTES de publicar `Started`, no después: un test
+    /// puede cancelar la tarea mientras esa publicación sigue en curso y
+    /// comprobar que el token ya está registrado (no se trata como un
+    /// `correlation_id` desconocido).
+    struct SlowStartedSink {
+        entered_publish: Arc<Notify>,
+        release: Arc<Notify>,
+        inner: InMemoryScanResultSink,
+    }
+
+    #[async_trait::async_trait]
+    impl ScanResultSink for SlowStartedSink {
+        async fn publish(
+            &self,
+            outcome: &ScanOutcome,
+        ) -> Result<(), crate::messaging::publisher::PublishError> {
+            if matches!(outcome, ScanOutcome::Started { .. }) {
+                self.entered_publish.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.publish(outcome).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_started_publish_is_in_flight_finds_the_token_and_cancels() {
+        let entered_publish = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let sink = Arc::new(SlowStartedSink {
+            entered_publish: entered_publish.clone(),
+            release: release.clone(),
+            inner: InMemoryScanResultSink::new(),
+        });
+        // El executor nunca resuelve por sí mismo: así, si el token NO
+        // estuviera registrado a tiempo (regresión del bug corregido), la
+        // tarea seguiría corriendo indefinidamente en vez de cancelarse, y
+        // `handle.await` de abajo colgaría el test en vez de pasar
+        // silenciosamente.
+        let ports = ServicePorts {
+            executor: Arc::new(SlowExecutor {
+                started: Arc::new(Notify::new()),
+            }),
+            scanner: Arc::new(UnusedScanner),
+            repository: Arc::new(UnusedRepository),
+            enricher: Arc::new(StubEnricher(Vec::new())),
+            host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+            sink: sink.clone(),
+        };
+        let pipeline = ScanPipeline::new(ports, test_config());
+        let correlation_id = CorrelationId::from("corr-cancel-during-started-publish");
+
+        let pipeline_for_task = pipeline.clone();
+        let request = test_request(correlation_id.as_str());
+        let handle = tokio::spawn(async move { pipeline_for_task.process_one(request).await });
+
+        // La publicación de `Started` está en curso (bloqueada en
+        // `release.notified()`): en este punto el token YA debe estar
+        // registrado, porque el registro ocurre antes de publicar.
+        entered_publish.notified().await;
+        assert!(
+            pipeline.cancellations.cancel(&correlation_id),
+            "el token debe estar registrado mientras sink.publish(Started) sigue en curso, \
+             no sólo después de que termine"
+        );
+        // Libera la publicación de `Started`; `process_one` sigue con
+        // `tokio::select!`, donde el token ya cancelado gana de inmediato
+        // (el `SlowExecutor` nunca resuelve por sí mismo).
+        release.notify_one();
+
+        handle
+            .await
+            .expect("process_one no debe entrar en panic al cancelarse");
+
+        let published = sink.inner.published();
+        assert_eq!(
+            published.len(),
+            2,
+            "debe publicarse el evento started y el desenlace de cancelación"
+        );
+        match &published[1] {
+            ScanOutcome::Failed {
+                correlation_id: id,
+                reason,
+            } => {
+                assert_eq!(id, &correlation_id);
+                assert_eq!(reason, CANCELLATION_REASON);
+            }
+            other => panic!("se esperaba Failed por cancelación, se obtuvo {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_process_one_finished_is_a_safe_noop() {
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let ports = ServicePorts {
+            executor: Arc::new(FailingExecutor),
+            scanner: Arc::new(UnusedScanner),
+            repository: Arc::new(UnusedRepository),
+            enricher: Arc::new(StubEnricher(Vec::new())),
+            host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+            sink: sink.clone(),
+        };
+        let pipeline = ScanPipeline::new(ports, test_config());
+        let correlation_id = CorrelationId::from("corr-cancel-late");
+
+        pipeline
+            .process_one(test_request(correlation_id.as_str()))
+            .await;
+
+        assert!(
+            !pipeline.cancellations.cancel(&correlation_id),
+            "una cancelación tardía sobre una tarea ya finalizada debe ser un no-op"
+        );
+
+        // El desenlace sigue siendo el fallo normal de la etapa SSH -la
+        // cancelación llegó después de terminar, así que no debe alterar nada.
+        let published = sink.published();
+        match &published[1] {
+            ScanOutcome::Failed { reason, .. } => {
+                assert_eq!(reason, &SshError::AuthFailed.to_string())
+            }
+            other => panic!("se esperaba Failed, se obtuvo {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_consumes_both_sources_and_a_cancellation_for_an_unknown_id_is_harmless() {
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let ports = ServicePorts {
+            executor: Arc::new(FailingExecutor),
+            scanner: Arc::new(UnusedScanner),
+            repository: Arc::new(UnusedRepository),
+            enricher: Arc::new(StubEnricher(Vec::new())),
+            host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+            sink: sink.clone(),
+        };
+        let pipeline = ScanPipeline::new(ports, test_config());
+
+        let source = Arc::new(InMemoryScanRequestSource::from_requests([test_request(
+            "corr-run-with-cancellations",
+        )]));
+        let cancellations: Arc<dyn ScanCancellationSource> =
+            Arc::new(InMemoryScanCancellationSource::from_cancellations([
+                ScanCancellation {
+                    correlation_id: CorrelationId::from("corr-unknown"),
+                    requested_by: "analyst@example.test".to_owned(),
+                },
+            ]));
+
+        pipeline.run(source, cancellations).await;
+
+        let published = sink.published();
+        assert_eq!(
+            published.len(),
+            2,
+            "la solicitud se procesó igual (started + terminal) y la cancelación \
+             desconocida no afectó nada"
+        );
+        assert_eq!(
+            published[1].correlation_id().as_str(),
+            "corr-run-with-cancellations"
+        );
     }
 }

@@ -21,7 +21,9 @@ pub mod scanner;
 pub mod ssh;
 pub mod wiring;
 
-use crate::messaging::consumer::ScanRequestSource;
+use crate::messaging::consumer::{
+    InMemoryScanCancellationSource, ScanCancellationSource, ScanRequestSource,
+};
 use crate::pipeline::ScanPipeline;
 
 pub use crate::pipeline::{PipelineConfig, ServicePorts};
@@ -32,9 +34,15 @@ pub use crate::pipeline::{PipelineConfig, ServicePorts};
 /// Construye el [`ScanPipeline`] a partir de `ports` y `config` y:
 ///
 /// - si `source` es `Some`, consume solicitudes de esa
-///   [`ScanRequestSource`] llamando a [`ScanPipeline::run`] hasta que se cierre;
-/// - si es `None`, deja constancia con `tracing::warn!` y retorna. Hoy es el
-///   caso normal: la tecnología concreta de cola de mensajes aún no está
+///   [`ScanRequestSource`] llamando a [`ScanPipeline::run`] hasta que se cierre.
+///   `cancellations` viaja junto a `source`: si es `Some`, el pipeline también
+///   consume esa [`ScanCancellationSource`] en su segundo bucle concurrente
+///   (feature `scan_cancellation`); si es `None`, se usa una fuente en memoria
+///   vacía ([`InMemoryScanCancellationSource::default`]) que no cancela nada,
+///   para no exigirle un adaptador real al único llamador (`src/main.rs`)
+///   mientras la tecnología de broker no esté decidida;
+/// - si `source` es `None`, deja constancia con `tracing::warn!` y retorna. Hoy
+///   es el caso normal: la tecnología concreta de cola de mensajes aún no está
 ///   decidida (ver `docs/architecture.md`), así que todavía no existe un
 ///   adaptador real de `ScanRequestSource`. El `sink` de `ports` es igualmente
 ///   el stub en memoria hasta que exista el adaptador de broker.
@@ -44,11 +52,16 @@ pub async fn run(
     ports: ServicePorts,
     config: PipelineConfig,
     source: Option<Arc<dyn ScanRequestSource>>,
+    cancellations: Option<Arc<dyn ScanCancellationSource>>,
 ) {
     let pipeline = ScanPipeline::new(ports, config);
 
     match source {
-        Some(source) => pipeline.run(source).await,
+        Some(source) => {
+            let cancellations: Arc<dyn ScanCancellationSource> = cancellations
+                .unwrap_or_else(|| Arc::new(InMemoryScanCancellationSource::default()));
+            pipeline.run(source, cancellations).await;
+        }
         None => tracing::warn!(
             "ms-nmap arrancó: configuración validada y MongoDB accesible. El adaptador de \
              broker (ScanRequestSource real) aún no existe; el pipeline no consumirá \

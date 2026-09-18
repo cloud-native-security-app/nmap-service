@@ -1,46 +1,52 @@
-# Review — feature 15 (scan_started_event)
+# Review — feature 16 (scan_cancellation)
 
 **Veredicto:** APPROVED
 
-## Verificación realizada
+## Verificación del fix (ronda 2)
 
-- Leídos `docs/architecture.md`, `docs/conventions.md`, `docs/security-scope.md`, `CHECKPOINTS.md`.
-- Revisado el diff real (`git diff`) de `src/messaging/publisher.rs`, `src/pipeline.rs`, `tests/scan_pipeline.rs`, `feature_list.json`, `progress/current.md` contra los 9 criterios de `acceptance` de la feature 15 en `feature_list.json`.
-- `./init.sh` ejecutado **3 veces** con los cambios sin commitear (Docker disponible): las 3 corridas terminaron con exit code 0 (`fmt`, `clippy -D warnings`, 118 tests unitarios, tests de integración con `testcontainers` incluidos los 3 e2e de `tests/scan_pipeline.rs`, `cargo doc --no-deps`).
-- Investigado el flake reportado en `enrichment::nvd::tests` (ver sección dedicada abajo).
-- `grep` de `unwrap()/expect()/panic!()/println!/dbg!` en los archivos modificados: todas las ocurrencias están dentro de `mod tests` (`src/pipeline.rs` desde línea 319, `src/messaging/publisher.rs` desde línea 334) — nada fuera de test sin justificar.
+`src/pipeline.rs::process_one`: `let token = self.cancellations.register(correlation_id.clone());`
+ahora está en la línea 228, **antes** de `self.sink.publish(&ScanOutcome::started(...)).await`
+(líneas 230-234). El registro ocurre efectivamente "al arrancar `process_one`", cumpliendo el
+criterio de aceptación 5 al pie de la letra.
 
-## Cumplimiento del acceptance de la feature 15
+- **Desregistro sigue atómico y único.** `self.cancellations.unregister(&correlation_id);` (línea
+  263) ocurre exactamente una vez, después de que el `tokio::select!` (líneas 242-261) resuelve por
+  cualquiera de sus dos ramas (éxito/fallo de `run_stages`, o cancelación vía `token.cancelled()`).
+  No hay ningún `return`/`?`/`panic!` entre el registro (línea 228) y el desregistro (línea 263): el
+  flujo de `process_one` es completamente lineal, así que mover el registro más arriba no introduce
+  una ventana nueva en la que el token pueda quedar huérfano por un retorno temprano. El único riesgo
+  residual (que un panic dentro de `run_stages` deje el token sin desregistrar) ya existía antes del
+  fix — el orden del registro no lo afecta ni lo agrava, y no es un unwrap/panic fuera de tests
+  (`docs/conventions.md`) introducido por este cambio.
+- **El nuevo test cubre la ventana correcta.** `cancellation_while_started_publish_is_in_flight_finds_the_token_and_cancels`
+  (`src/pipeline.rs` líneas 1084-1149) usa `SlowStartedSink`, cuyo `publish` se bloquea en
+  `release.notified().await` únicamente para `ScanOutcome::Started` (líneas 1070-1082). El test
+  espera `entered_publish.notified()` (línea 1118, señal emitida *dentro* de esa publicación, no
+  después) y sólo entonces llama a `pipeline.cancellations.cancel(&correlation_id)`, aseverando que
+  devuelve `true` (línea 1119-1123) — es decir, exactamente la ventana "cancelación llega mientras
+  `sink.publish(Started)` sigue en curso", no una cancelación posterior. El `executor` es
+  `SlowExecutor`, que nunca resuelve por sí mismo (`std::future::pending`), así que si el fix se
+  revirtiera (registro después del publish) el `cancel()` de la línea 1119 devolvería `false` y el
+  `assert!` fallaría de inmediato (no un colgado silencioso, lo cual es aún mejor que sólo colgar).
+  Verificado: `cargo test` (8 corridas aisladas de este test con `--exact`) da `ok` las 8 veces —
+  sin señales de flakiness en el `Notify`/`select!`.
+- El resto de `process_one` (rama de éxito/fallo de `run_stages`, rama de cancelación, publicación
+  del desenlace terminal, logging) no cambió respecto a la ronda 1 ya aprobada.
 
-1. `ScanOutcome::Started { correlation_id }` con tag `status: "started"`, sin `result`/`reason`, y `ScanOutcome::started(...)` — verificado en `src/messaging/publisher.rs:96-101,115-118` y test `started_outcome_serializes_to_exact_message_shape_with_no_extra_fields`. OK.
-2. `status_label()` devuelve `"started"`; `outcome_log_fields` maneja la variante sin panic y sin exponer más que `correlation_id`+`status` (`counts: None`) — test `log_fields_for_started_expose_only_correlation_id_and_status`. OK.
-3. `ScanPipeline::process_one` publica `started` **antes** de `run_stages` (que engloba ssh/scanner/parser/enrichment/repository) — `src/pipeline.rs:139-149`, y luego continúa hasta el desenlace terminal. OK.
-4. Publicación best-effort: en fallo del sink, `tracing::warn!` con `correlation_id`+`error` (sin credenciales) y continúa — `src/pipeline.rs:143-148`, cubierto por `started_publish_failure_is_best_effort_and_does_not_abort_the_scan` con `FlakySink`. OK.
-5. Exactamente un evento `started` por invocación (una sola llamada, sin bucle) — confirmado leyendo `process_one`; los tests de concurrencia (`multiple_requests_are_processed_concurrently`) confirman 3 `Started` para 3 solicitudes. OK.
-6. Round-trip serde exacto (`{"status":"started","correlation_id":"..."}`) y regresión de `Completed`/`Failed` — tests `started_outcome_serializes_to_exact_message_shape_with_no_extra_fields` y `outcome_json_round_trip_preserves_every_field` (incluye las 3 variantes). OK.
-7. Test unitario con `InMemoryScanResultSink`: 2 desenlaces en orden Started→terminal, mismo `correlation_id` — `ssh_stage_failure_is_published_as_failed_outcome_without_docker` actualizado. OK.
-8. `tests/scan_pipeline.rs` (e2e, `#[ignore]`) actualizado sin debilitar asserts previos: las 3 pruebas verifican Started antes del terminal (éxito 2 eventos, fallo 2 eventos, concurrencia 6 eventos con Started precediendo a su terminal por `correlation_id`). OK.
-9. `./init.sh` en verde (3 corridas) — ver arriba. OK.
+## Checkpoints
 
-Todos los archivos tocados (`publisher.rs`, `pipeline.rs`, `tests/scan_pipeline.rs`) tienen su test correspondiente actualizado o nuevo. No hay violaciones de capas: `pipeline` sigue usando sólo el puerto `ScanResultSink` inyectado, `messaging` no se acopla a ninguna tecnología concreta de broker, y no se tocó `ssh`/`scanner`/`repository`/`enrichment` ni ninguna lógica de credenciales — consistente con `docs/architecture.md` y `docs/security-scope.md`. Nombres y estructura siguen `docs/conventions.md` (snake_case, tests descriptivos, imports agrupados, thiserror ya existente sin cambios).
+- C1: [x] `AGENTS.md`, `init.sh`, `feature_list.json`, `progress/current.md`, los 4 docs existen; `./init.sh` corrido 2 veces completas (con Docker), exit 0 ambas.
+- C2: [x] Solo la feature 16 en `in_progress` (`feature_list.json`: 15 `done` + 1 `in_progress`, confirmado por script). `progress/current.md` describe la sesión activa y el próximo paso, sin basura de sesiones previas.
+- C3: [x] `src/pipeline.rs` respeta la arquitectura hexagonal (el registro/desregistro vive en `CancellationRegistry`, privado a `pipeline`, sin fugas a otras capas); `src/domain.rs`/`src/messaging/consumer.rs` siguen el mismo patrón que `ScanRequest`/`ScanRequestSource` ya aprobado en la ronda 1. Sin `unwrap()`/`panic!()`/`println!`/`dbg!` fuera de tests. `cargo clippy --all-targets -- -D warnings` y `cargo fmt --check` limpios (parte de las 2 corridas de `./init.sh`). `cargo doc --no-deps` sin errores/warnings.
+- C4: [x] `cargo test` (135 unitarios, incluido el nuevo test de la ventana de carrera) y `cargo test -- --ignored` (con Docker/testcontainers, incluido el e2e `cancellation_received_mid_scan_stops_it_and_publishes_failed_outcome` en `tests/scan_pipeline.rs`) verdes en las 2 corridas completas de `./init.sh` que ejecuté, más 8 corridas aisladas adicionales del test de la ventana de carrera (todas `ok`, sin flake). Sin señales del flake conocido de `enrichment::nvd::tests`: los 5 tests de `nvd_cache_*` en `tests/repository.rs` (integración con Mongo real) y los tests unitarios de `src/enrichment/nvd.rs` (parte de los 135 de `cargo test`) pasaron en ambas corridas.
+- C5: [x] Sin archivos sospechosos (`*.tmp`, etc.); solo los `progress/*.md` esperados sin trackear (`impl_scan_cancellation.md`, `research_domain_and_ports.md`, `research_pipeline_concurrency.md`). `progress/current.md` refleja el estado real (feature 16 en `in_progress`, pendiente de este veredicto para que el líder la marque `done`).
 
-## Sobre el flake reportado en `enrichment::nvd::tests`
+## Confirmación de no regresión
 
-Verificación independiente, sin confiar en el reporte del implementer:
-
-- Con los cambios de la feature 15 aplicados, corrí `cargo test --lib` 3 veces seguidas: la corrida 3 falló intermitentemente en `enrichment::nvd::tests::cache_hit_avoids_a_second_http_call` y `enrichment::nvd::tests::unreachable_server_yields_ok_with_no_findings_never_panics`.
-- Hice `git stash` para volver exactamente al commit base `96f0288` (sin ningún cambio de la feature 15) y corrí `cargo test --lib` 5 veces seguidas: la corrida 3 falló con **los mismos dos tests exactos** (`cache_hit_avoids_a_second_http_call`, `unreachable_server_yields_ok_with_no_findings_never_panics`).
-- Conclusión: el flake es preexistente y no lo introduce ni lo agrava la feature 15. La feature 15 no toca `src/enrichment/nvd.rs` ni ningún archivo de `enrichment/`. Coincide con lo declarado por el implementer en `progress/impl_scan_started_event.md` y `progress/current.md`.
-- No bloquea esta feature. Recomiendo que el leader registre este flake como su propio hallazgo/feature de mantenimiento (p. ej. estabilizar el rate limiter de `NvdApiEnricher` en tests bajo carga de CPU), tal como ya sugiere la nota dejada en `progress/current.md`. Las 3 corridas de `./init.sh` que usé para este veredicto (que corren la suite completa vía `cargo test` normal, no en aislamiento repetido) terminaron las 3 en verde, por lo que el requisito duro de "`init.sh` en verde" se cumple para esta sesión.
-
-## Checkpoints (`CHECKPOINTS.md`)
-
-- C1: [x] — Existen los 4 archivos base y los 4 docs; `./init.sh` terminó con exit code 0 en las 3 corridas realizadas.
-- C2: [x] — Una sola feature (`15`) en `in_progress`; `progress/current.md` describe la sesión activa sin basura de sesiones anteriores; no hay ninguna feature marcada `done` sin tests (la 15 sigue `in_progress`, correctamente, a la espera de este veredicto).
-- C3: [x] — `src/` sólo contiene los módulos previstos (`messaging`, `pipeline` modificados, sin módulos nuevos); no hay `unwrap()/panic!()/println!/dbg!` fuera de tests sin justificar en los archivos tocados; `cargo doc --no-deps` generó sin errores en las 3 corridas.
-- C4: [x] — Tests de integración e2e actualizados (`tests/scan_pipeline.rs`, `#[ignore = "requiere Docker"]`) corriendo contra `testcontainers` real; `cargo test` mostró 118 tests unitarios + los de integración, todos verdes en las 3 corridas de `./init.sh`; `cargo clippy --all-targets -- -D warnings` sin advertencias.
-- C5: [x] — No hay archivos sin trackear sospechosos aparte de `progress/impl_scan_started_event.md` (documentación del implementer, esperada); `progress/current.md` refleja correctamente el estado (feature 15, pendiente de veredicto, no marcada `done` prematuramente).
+- `git diff -- src/domain.rs src/lib.rs src/main.rs src/messaging/consumer.rs Cargo.toml tests/scan_pipeline.rs` muestra únicamente cambios **aditivos** (nuevo tipo `ScanCancellation`, nuevo trait/adaptador `ScanCancellationSource`/`InMemoryScanCancellationSource`, nuevo parámetro `cancellations` en `run()`, dependencia `tokio-util` justificada): nada de lo ya aprobado en la ronda 1 para estos archivos cambió de forma incompatible.
+- La feature 15 (`scan_started_event`, comiteada en `6a4ba12`) no fue tocada más allá de lo estrictamente necesario para pasar `cancellations` como parámetro adicional a `run()`; la publicación de `ScanOutcome::started` y su contrato best-effort siguen intactos (tests `ssh_stage_failure_is_published_as_failed_outcome_without_docker`, `started_publish_failure_is_best_effort_and_does_not_abort_the_scan`, ambos verdes).
+- Acceptance completo de la feature 16 (`feature_list.json` id 16) verificado punto por punto: dominio, puerto/adaptador, segundo bucle en el mismo `JoinSet`, registro/desregistro atómico corregido, `tokio::select!` con motivo explícito de cancelación, sin fuga de credenciales/IP, `Cargo.toml` justificado, tests unitarios sin Docker, test de integración con Docker, `./init.sh` en verde sin regresión en features 1-15.
 
 ## Cambios requeridos
 
-Ninguno. La feature 15 cumple los 9 criterios de aceptación, respeta arquitectura y convenciones, tiene tests unitarios y e2e correspondientes, y `./init.sh` corre en verde de forma reproducible. El flake de `enrichment::nvd` es preexistente (confirmado independientemente contra el commit base) y queda fuera del alcance de esta feature; se recomienda abrirlo como hallazgo/feature separada, no como bloqueo de esta revisión.
+Ninguno.

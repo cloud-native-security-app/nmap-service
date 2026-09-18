@@ -1077,3 +1077,106 @@ y caché persistente en Mongo con TTL.
 - Commit pendiente (lo gestiona el leader): `src/messaging/publisher.rs`,
   `src/pipeline.rs`, `tests/scan_pipeline.rs`, `feature_list.json`,
   `progress/*.md`.
+
+---
+
+## 2026-09-17 — Feature 16: scan_cancellation
+
+- **Agente:** leader (2 explorers + implementer) + reviewer
+- **Estado final:** `done` (reviewer aprobó en ronda 2 tras corregir una
+  condición de carrera, ver `progress/review.md`)
+
+### Qué se hizo
+
+- `domain::ScanCancellation { correlation_id: CorrelationId, requested_by: String }`
+  (`src/domain.rs`), `Serialize`/`Deserialize` sin `rename`/`rename_all` (mismo
+  naming default de serde que `ScanRequest`). Test de round-trip que verifica
+  la forma exacta del JSON (sin campos extra).
+- `src/messaging/consumer.rs`: `parse_scan_cancellation` (mismo patrón en dos
+  etapas que `parse_scan_request`; sin credencial que redactar, a diferencia de
+  `ScanRequest`), `log_cancellation_received` (sólo `correlation_id` +
+  `requested_by`), trait `ScanCancellationSource` (`#[async_trait]`,
+  `Send + Sync`, dyn-compatible, reutiliza `ConsumeError` tal cual — mismo
+  contrato fatal/no-fatal que `ScanRequestSource`) e
+  `InMemoryScanCancellationSource` (mismo patrón que
+  `InMemoryScanRequestSource`, con `#[derive(Default)]` para una fuente vacía).
+- `src/pipeline.rs`:
+  - `CancellationRegistry` (privado): `Arc<Mutex<HashMap<CorrelationId, CancellationToken>>>`
+    con `register`/`unregister`/`cancel`; registro y desregistro comparten el
+    mismo `Mutex`, así que una cancelación tardía sobre una tarea ya
+    desregistrada nunca encuentra el token (no-op seguro, no condición de
+    carrera).
+  - `ScanPipeline` gana el campo `cancellations: CancellationRegistry`.
+    `process_one` registra el token **al arrancar** (ver "Fix ronda 2" abajo),
+    envuelve `run_stages` en `tokio::select!` contra `token.cancelled()`, y
+    desregistra siempre al terminar (éxito, fallo o cancelación). La rama de
+    cancelación publica `ScanOutcome::failed(correlation_id, "escaneo
+    cancelado por solicitud explícita")`.
+  - `ScanPipeline::run` gana el parámetro `cancellations: Arc<dyn ScanCancellationSource>`;
+    el segundo bucle corre en el **mismo `JoinSet`** que las tareas de
+    solicitudes, vía el helper `next_valid_cancellation` (copia exacta del
+    patrón de `next_valid_request`) y `apply_cancellation` (loggea "aplicada"
+    o "no-op", nunca un error).
+- `src/lib.rs`/`src/main.rs`: `run()` gana `cancellations: Option<Arc<dyn ScanCancellationSource>>`;
+  si es `None` (caso actual, sin adaptador de broker real) se usa
+  `InMemoryScanCancellationSource::default()` internamente.
+- `tests/scan_pipeline.rs`: los 3 call-sites existentes de `pipeline.run(source)`
+  pasan ahora también una fuente de cancelaciones vacía. Nuevo test e2e
+  `#[ignore = "requiere Docker"]` `cancellation_received_mid_scan_stops_it_and_publishes_failed_outcome`
+  con stub `slow_fake_nmap(20)` (duerme 20s) + `DelayedCancellationSource`
+  (duerme 3s antes de entregar la cancelación): verifica que el pipeline
+  termina en <15s, publica `Started` y luego `Failed` con "cancel" en el
+  motivo, y que el `ScanResult` no queda persistido en Mongo.
+- `Cargo.toml`: `tokio-util = "0.7"` como dependencia directa. **Corrección
+  respecto al research inicial**: `tokio-util` 0.7.19 no tiene ningún feature
+  llamado `sync` (sus features son `codec`/`compat`/`io`/`io-util`/`join-map`/`net`/`rt`/`time`/`full`);
+  el módulo `tokio_util::sync` (con `CancellationToken`) no está detrás de
+  ningún `#[cfg(feature = ...)]` — se compila siempre. Corregido a
+  `tokio-util = "0.7"` sin features extra.
+
+### Fix ronda 2 (CHANGES_REQUESTED -> corregido)
+
+El reviewer detectó una condición de carrera real: `process_one` registraba el
+`CancellationToken` **después** de `self.sink.publish(&ScanOutcome::started(...)).await`,
+no "al arrancar" como exige literalmente el criterio de aceptación 5. Una
+cancelación que llegara mientras esa publicación seguía en curso no encontraba
+el token todavía registrado y se descartaba como `correlation_id` desconocido,
+aunque la tarea sí estaba en vuelo. Corregido moviendo el registro **antes**
+de `sink.publish(started)` (el desregistro no cambió). Se añadió el test
+`pipeline::tests::cancellation_while_started_publish_is_in_flight_finds_the_token_and_cancels`
+(doble `SlowStartedSink` que bloquea la publicación de `Started` con
+`tokio::sync::Notify` para poder cancelar mientras está en curso y comprobar
+que el token ya se encuentra).
+
+### Revisión
+
+- Ronda 1: `CHANGES_REQUESTED` por la condición de carrera arriba descrita.
+- Ronda 2: **APROBADO**. Checkpoints C1-C5 todos `[x]`; confirmación explícita
+  de que los cambios en `src/domain.rs`/`src/lib.rs`/`src/main.rs`/`src/messaging/consumer.rs`/`Cargo.toml`/`tests/scan_pipeline.rs`
+  ya aprobados en ronda 1 no cambiaron de forma incompatible, y que la feature
+  15 (`scan_started_event`) sigue intacta.
+- Detalle: `progress/impl_scan_cancellation.md`, `progress/review.md`.
+  Investigación previa: `progress/research_pipeline_concurrency.md`,
+  `progress/research_domain_and_ports.md`.
+
+### Verificación
+
+- `./init.sh` verde y estable: 3 corridas del implementer tras la
+  implementación inicial + 3 más tras el fix de la ronda 2 + 2 del reviewer
+  (exit 0, 0 `[FAIL]`), incluye `cargo test -- --ignored` con contenedores
+  reales `sshd` + `mongo:7` (incluido el nuevo e2e de cancelación).
+- `cargo test`: 135 unitarios verdes. `cargo clippy --all-targets -- -D
+  warnings`, `cargo fmt --check`, `cargo doc --no-deps` (y con
+  `--document-private-items`) limpios.
+- Sin `unwrap`/`expect`/`panic!` fuera de tests. Sin regresión en features
+  1-15. Sin señales del flake preexistente de `enrichment::nvd::tests`
+  (feature 14, ajeno a esta feature) en ninguna corrida.
+- No se añadió un cuarto estado `Cancelled` a `ScanOutcome`: la cancelación se
+  publica como `ScanOutcome::Failed` con un motivo explícito, tal como exige
+  el acceptance (el contrato de broker no tiene ese cuarto estado todavía).
+- No se modificó `docs/architecture.md` ni `docs/security-scope.md`: el
+  acceptance de esta feature no lo pedía.
+- Commit pendiente (lo gestiona el leader): `src/domain.rs`,
+  `src/messaging/consumer.rs`, `src/pipeline.rs`, `src/lib.rs`, `src/main.rs`,
+  `Cargo.toml`, `tests/scan_pipeline.rs`, `feature_list.json`,
+  `progress/*.md`.

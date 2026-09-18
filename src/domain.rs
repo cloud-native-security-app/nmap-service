@@ -1,4 +1,5 @@
-//! Tipos puros del dominio de escaneo: [`ScanRequest`] (solicitud entrante) y
+//! Tipos puros del dominio de escaneo: [`ScanRequest`] (solicitud entrante),
+//! [`ScanCancellation`] (solicitud de cancelación de un escaneo en curso) y
 //! [`ScanResult`] con sus [`PortFinding`] y [`VulnFinding`]. No hacen IO.
 //!
 //! Todos los tipos implementan `serde::Serialize`/`Deserialize` para poder
@@ -152,6 +153,23 @@ pub struct ScanRequest {
     /// Identidad del principal (usuario final) que originó la solicitud aguas
     /// arriba. Solo para trazabilidad/auditoría; la autorización sobre el
     /// objetivo se asume ya verificada por el Gateway/`ms-usuarios`.
+    pub requested_by: String,
+}
+
+/// Solicitud de cancelación de un escaneo en curso, recibida desde el Broker
+/// (exchange `scan.cancellations`, cola `ms-nmap.scan-cancellations`, RF-14).
+///
+/// `ms-nmap` la usa para abortar cooperativamente la tarea en vuelo con el
+/// mismo `correlation_id`, si sigue en curso (ver
+/// [`crate::pipeline::ScanPipeline::run`]). No lleva ningún dato sensible ni
+/// del objetivo original (IP, credenciales): sólo el identificador de
+/// correlación y quién pidió la cancelación, para trazabilidad.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanCancellation {
+    /// Identificador de correlación del escaneo que se quiere cancelar.
+    pub correlation_id: CorrelationId,
+    /// Identidad del principal que solicitó la cancelación (Gateway /
+    /// `ms-usuarios`). Sólo para trazabilidad/auditoría.
     pub requested_by: String,
 }
 
@@ -470,6 +488,28 @@ mod tests {
             serde_json::to_string(&VulnSource::Nvd).expect("serializa"),
             "\"nvd\""
         );
+    }
+
+    #[test]
+    fn scan_cancellation_json_round_trip_preserves_every_field() {
+        let original = ScanCancellation {
+            correlation_id: CorrelationId::from("corr-cancel-1"),
+            requested_by: "analyst@example.test".to_owned(),
+        };
+
+        let json = serde_json::to_value(&original).expect("serializa a JSON");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "correlation_id": "corr-cancel-1",
+                "requested_by": "analyst@example.test"
+            }),
+            "ScanCancellation no debe llevar campos extra: {json}"
+        );
+
+        let restored: ScanCancellation =
+            serde_json::from_value(json).expect("deserializa desde JSON");
+        assert_eq!(restored, original);
     }
 
     #[test]

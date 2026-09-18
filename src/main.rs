@@ -39,5 +39,5 @@ async fn main() {
         scan_options: ScanOptions::default(),
     };
 
-    run(ports, pipeline_config, None).await;
+    run(ports, pipeline_config, None, None).await;
 }

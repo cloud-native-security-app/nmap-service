@@ -19,9 +19,13 @@ use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
 };
 
-use nmap_service::domain::{CorrelationId, PortState, ScanRequest, SshCredentialsRef, VulnSource};
+use nmap_service::domain::{
+    CorrelationId, PortState, ScanCancellation, ScanRequest, SshCredentialsRef, VulnSource,
+};
 use nmap_service::enrichment::{CompositeVulnEnricher, ExploitDbEnricher, VulnEnricher};
-use nmap_service::messaging::consumer::InMemoryScanRequestSource;
+use nmap_service::messaging::consumer::{
+    ConsumeError, InMemoryScanCancellationSource, InMemoryScanRequestSource, ScanCancellationSource,
+};
 use nmap_service::messaging::publisher::{InMemoryScanResultSink, ScanOutcome, ScanResultSink};
 use nmap_service::parser;
 use nmap_service::pipeline::{PipelineConfig, ScanPipeline, ServicePorts};
@@ -52,6 +56,40 @@ const STUB_XML: &str = include_str!("fixtures/vuln_findings.xml");
 /// código 0.
 fn fake_nmap() -> Vec<u8> {
     format!("#!/bin/sh\ncat <<'NMAP_STUB_EOF'\n{STUB_XML}\nNMAP_STUB_EOF\n").into_bytes()
+}
+
+/// Stub de `nmap` deliberadamente lento: duerme `delay_secs` antes de volcar
+/// `STUB_XML`, para poder cancelar el escaneo mientras la etapa `scanner`
+/// sigue en curso (feature `scan_cancellation`).
+fn slow_fake_nmap(delay_secs: u64) -> Vec<u8> {
+    format!("#!/bin/sh\nsleep {delay_secs}\ncat <<'NMAP_STUB_EOF'\n{STUB_XML}\nNMAP_STUB_EOF\n")
+        .into_bytes()
+}
+
+/// [`ScanCancellationSource`] de prueba que retrasa cada entrega de `delay`,
+/// para poder publicar una cancelación después de que el escaneo objetivo ya
+/// empezó (y quedó registrado en el pipeline) pero mucho antes de que el stub
+/// lento de `nmap` termine su propio `sleep`.
+struct DelayedCancellationSource {
+    delay: Duration,
+    inner: InMemoryScanCancellationSource,
+}
+
+impl DelayedCancellationSource {
+    fn new(delay: Duration, cancellations: impl IntoIterator<Item = ScanCancellation>) -> Self {
+        Self {
+            delay,
+            inner: InMemoryScanCancellationSource::from_cancellations(cancellations),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ScanCancellationSource for DelayedCancellationSource {
+    async fn next_cancellation(&self) -> Result<Option<ScanCancellation>, ConsumeError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.next_cancellation().await
+    }
 }
 
 fn timeouts() -> SshTimeouts {
@@ -243,8 +281,10 @@ async fn valid_request_flows_through_pipeline_and_is_published_and_persisted() {
         ip,
         "corr-e2e-ok",
     )]));
+    let cancellations: Arc<dyn ScanCancellationSource> =
+        Arc::new(InMemoryScanCancellationSource::default());
 
-    pipeline.run(source).await;
+    pipeline.run(source, cancellations).await;
 
     // feature scan_started_event: el primer desenlace publicado es Started,
     // antes de tocar el objetivo, con el mismo correlation_id.
@@ -376,8 +416,10 @@ async fn stage_failure_is_published_as_failed_outcome_without_crashing() {
         ip,
         "corr-e2e-fail",
     )]));
+    let cancellations: Arc<dyn ScanCancellationSource> =
+        Arc::new(InMemoryScanCancellationSource::default());
 
-    pipeline.run(source).await;
+    pipeline.run(source, cancellations).await;
 
     // feature scan_started_event: Started primero, luego el Failed terminal.
     let published = sink.published();
@@ -452,8 +494,10 @@ async fn multiple_requests_are_processed_concurrently() {
     let source = Arc::new(InMemoryScanRequestSource::from_requests(
         ids.into_iter().map(|id| scan_request(ip, id)),
     ));
+    let cancellations: Arc<dyn ScanCancellationSource> =
+        Arc::new(InMemoryScanCancellationSource::default());
 
-    pipeline.run(source).await;
+    pipeline.run(source, cancellations).await;
 
     // feature scan_started_event: cada solicitud publica su Started antes del
     // terminal -> 3 Started + 3 Completed = 6 desenlaces en total.
@@ -524,4 +568,80 @@ async fn multiple_requests_are_processed_concurrently() {
             "{id} debe estar persistido"
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn cancellation_received_mid_scan_stops_it_and_publishes_failed_outcome() {
+    // El stub de nmap duerme 20s: mucho más que el tiempo que tardará en
+    // llegar la cancelación (3s), así que si el pipeline no la respetara el
+    // test tardaría >20s y el ScanResult quedaría persistido -ninguna de las
+    // dos cosas debe ocurrir.
+    let target = start_target(&[(NMAP_PATH, slow_fake_nmap(20))]).await;
+    let mongo = start_mongo().await;
+    let (ip, port) = sshd_endpoint(&target).await;
+
+    let repo = MongoRepository::connect(&mongo_uri(&mongo).await, TEST_DB)
+        .await
+        .expect("debe conectar con el contenedor mongo");
+    let sink: Arc<InMemoryScanResultSink> = Arc::new(InMemoryScanResultSink::new());
+    let pipeline = build_pipeline(&repo, &sink, sample_enricher().await, port);
+
+    let correlation_id = "corr-e2e-cancel";
+    let source = Arc::new(InMemoryScanRequestSource::from_requests([scan_request(
+        ip,
+        correlation_id,
+    )]));
+    let cancellations: Arc<dyn ScanCancellationSource> = Arc::new(DelayedCancellationSource::new(
+        Duration::from_secs(3),
+        [ScanCancellation {
+            correlation_id: CorrelationId::from(correlation_id),
+            requested_by: "analyst@example.test".to_owned(),
+        }],
+    ));
+
+    let started_at = std::time::Instant::now();
+    pipeline.run(source, cancellations).await;
+
+    assert!(
+        started_at.elapsed() < Duration::from_secs(15),
+        "el pipeline debió detenerse por la cancelación mucho antes de que el stub lento \
+         de nmap (sleep 20) terminara: tardó {:?}",
+        started_at.elapsed()
+    );
+
+    // feature scan_started_event: Started primero, luego el Failed de
+    // cancelación en vez de un Completed.
+    let published = sink.published();
+    assert_eq!(
+        published.len(),
+        2,
+        "debe publicarse el evento started y el desenlace de cancelación"
+    );
+    match &published[0] {
+        ScanOutcome::Started { correlation_id: id } => assert_eq!(id.as_str(), correlation_id),
+        other => panic!("se esperaba Started primero, se obtuvo {other:?}"),
+    }
+    match &published[1] {
+        ScanOutcome::Failed {
+            correlation_id: id,
+            reason,
+        } => {
+            assert_eq!(id.as_str(), correlation_id);
+            assert!(
+                reason.to_lowercase().contains("cancel"),
+                "el motivo debe dar constancia explícita de la cancelación, no de un fallo \
+                 técnico: {reason}"
+            );
+        }
+        other => panic!("se esperaba Failed (cancelación), se obtuvo {other:?}"),
+    }
+
+    assert!(
+        repo.find_by_correlation_id(&CorrelationId::from(correlation_id))
+            .await
+            .expect("consulta a mongo")
+            .is_none(),
+        "un escaneo cancelado no debe dejar ScanResult persistido en Mongo"
+    );
 }

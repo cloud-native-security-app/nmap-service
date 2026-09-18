@@ -15,17 +15,21 @@
 //!   mientras el broker real no esté decidido.
 //! - [`log_request_received`]: traza de recepción identificada por
 //!   `correlation_id`.
+//! - [`ScanCancellationSource`] / [`InMemoryScanCancellationSource`] (feature
+//!   `scan_cancellation`): mismo patrón que lo anterior, pero para solicitudes
+//!   de cancelación (`ScanCancellation`) de un escaneo ya en curso.
 //!
 //! # Seguridad
 //!
 //! `ScanRequest` transporta `ssh_credentials_ref`. Ni el logging de este módulo
 //! ni los mensajes de [`ConsumeError`] incluyen el cuerpo crudo del mensaje ni
-//! el valor de la credencial (ver `docs/security-scope.md`).
+//! el valor de la credencial (ver `docs/security-scope.md`). `ScanCancellation`
+//! no transporta ningún dato sensible ni del objetivo original.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::domain::ScanRequest;
+use crate::domain::{ScanCancellation, ScanRequest};
 
 /// Motivo por el que no se pudo obtener o interpretar una solicitud del Broker.
 ///
@@ -126,6 +130,42 @@ pub fn log_request_received(request: &ScanRequest) {
         target_ip = %request.ip,
         has_sudo = request.has_sudo,
         "solicitud de escaneo recibida del Broker"
+    );
+}
+
+/// Deserializa el cuerpo crudo de un mensaje del Broker a una
+/// [`ScanCancellation`].
+///
+/// Mismo contrato en dos etapas que [`parse_scan_request`]: `raw` -> JSON, si
+/// falla -> [`ConsumeError::MalformedPayload`]; JSON -> [`ScanCancellation`], si
+/// falla (campo ausente o tipo incorrecto) -> [`ConsumeError::InvalidSchema`].
+/// Nunca hace `panic`/`unwrap`. A diferencia de [`parse_scan_request`], no hay
+/// ninguna credencial que redactar del mensaje de error: [`ScanCancellation`]
+/// no transporta datos sensibles.
+pub fn parse_scan_cancellation(raw: &[u8]) -> Result<ScanCancellation, ConsumeError> {
+    let payload: serde_json::Value = serde_json::from_slice(raw)
+        .map_err(|err| ConsumeError::MalformedPayload(err.to_string()))?;
+
+    serde_json::from_value::<ScanCancellation>(payload)
+        .map_err(|err| ConsumeError::InvalidSchema(err.to_string()))
+}
+
+/// Registra en `tracing` (nivel `INFO`) la recepción de una solicitud de
+/// cancelación, identificándola por su `correlation_id`.
+///
+/// Los adaptadores concretos de [`ScanCancellationSource`] deben llamarla al
+/// entregar cada cancelación (la implementación de este módulo ya lo hace).
+///
+/// # Seguridad
+///
+/// [`ScanCancellation`] no lleva IP ni credenciales del escaneo original: sólo
+/// emite `correlation_id` y `requested_by`, y nunca el cuerpo crudo del
+/// mensaje.
+pub fn log_cancellation_received(cancellation: &ScanCancellation) {
+    tracing::info!(
+        correlation_id = %cancellation.correlation_id,
+        requested_by = %cancellation.requested_by,
+        "solicitud de cancelación recibida del Broker"
     );
 }
 
@@ -238,6 +278,104 @@ impl ScanRequestSource for InMemoryScanRequestSource {
             Some(Ok(request)) => {
                 log_request_received(&request);
                 Ok(Some(IncomingScanRequest::new(request)))
+            }
+        }
+    }
+}
+
+/// Fuente de solicitudes de cancelación entrantes, independiente de la
+/// tecnología concreta del broker.
+///
+/// Mismo patrón hexagonal que [`ScanRequestSource`]: un adaptador concreto
+/// (RabbitMQ, NATS, ...) implementará este trait; [`crate::pipeline::ScanPipeline::run`]
+/// consume cancelaciones a través de él sin conocer el transporte, en un
+/// segundo bucle concurrente al de solicitudes. Es dyn-compatible: se
+/// comparte como `Arc<dyn ScanCancellationSource>`.
+#[async_trait::async_trait]
+pub trait ScanCancellationSource: Send + Sync {
+    /// Devuelve la siguiente cancelación disponible.
+    ///
+    /// - `Ok(Some(_))`: se recibió y validó una cancelación.
+    /// - `Ok(None)`: la fuente se cerró de forma ordenada; no habrá más
+    ///   cancelaciones.
+    /// - `Err(ConsumeError::MalformedPayload | InvalidSchema)`: llegó un
+    ///   mensaje que no se pudo interpretar. El llamador debería descartarlo y
+    ///   seguir; **no** es fatal.
+    /// - `Err(ConsumeError::Transport)`: fallo de comunicación con el broker; el
+    ///   llamador decide si reintenta.
+    async fn next_cancellation(&self) -> Result<Option<ScanCancellation>, ConsumeError>;
+}
+
+/// Implementación de [`ScanCancellationSource`] respaldada por una cola en
+/// memoria.
+///
+/// Mismo patrón que [`InMemoryScanRequestSource`]: entrega en orden FIFO y,
+/// una vez agotada, devuelve `Ok(None)` de forma indefinida.
+///
+/// - [`from_cancellations`](Self::from_cancellations): entrega cancelaciones ya
+///   validadas.
+/// - [`from_raw_messages`](Self::from_raw_messages): aplica
+///   [`parse_scan_cancellation`] a cada cuerpo al construir; un mensaje
+///   inválido se entrega como `Err(ConsumeError)` en su turno y **no**
+///   interrumpe la entrega de los siguientes.
+///
+/// [`Default`] produce una fuente vacía: útil en el pipeline/tests que no
+/// necesitan cancelar nada, para satisfacer la firma de
+/// [`crate::pipeline::ScanPipeline::run`] sin tener que inventar un stub cada
+/// vez.
+#[derive(Default)]
+pub struct InMemoryScanCancellationSource {
+    queue: Mutex<VecDeque<Result<ScanCancellation, ConsumeError>>>,
+}
+
+impl InMemoryScanCancellationSource {
+    /// Crea una fuente que entregará las cancelaciones dadas, ya validadas, en
+    /// orden.
+    pub fn from_cancellations<I>(cancellations: I) -> Self
+    where
+        I: IntoIterator<Item = ScanCancellation>,
+    {
+        Self {
+            queue: Mutex::new(cancellations.into_iter().map(Ok).collect()),
+        }
+    }
+
+    /// Crea una fuente a partir de cuerpos de mensaje crudos. Cada uno se
+    /// parsea con [`parse_scan_cancellation`] al construir; el resultado
+    /// (éxito o [`ConsumeError`]) se entrega en su turno por
+    /// [`next_cancellation`](ScanCancellationSource::next_cancellation).
+    pub fn from_raw_messages<I>(messages: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: AsRef<[u8]>,
+    {
+        Self {
+            queue: Mutex::new(
+                messages
+                    .into_iter()
+                    .map(|raw| parse_scan_cancellation(raw.as_ref()))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn dequeue(&self) -> Option<Result<ScanCancellation, ConsumeError>> {
+        match self.queue.lock() {
+            Ok(mut guard) => guard.pop_front(),
+            Err(poisoned) => poisoned.into_inner().pop_front(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ScanCancellationSource for InMemoryScanCancellationSource {
+    async fn next_cancellation(&self) -> Result<Option<ScanCancellation>, ConsumeError> {
+        match self.dequeue() {
+            None => Ok(None),
+            Some(Err(err)) => Err(err),
+            Some(Ok(cancellation)) => {
+                log_cancellation_received(&cancellation);
+                Ok(Some(cancellation))
             }
         }
     }
@@ -406,6 +544,129 @@ mod tests {
             "un mensaje envenenado no debe interrumpir la entrega"
         );
         assert!(source.next_request().await.unwrap().is_none());
+    }
+
+    fn valid_cancellation_message(correlation_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+                "correlation_id": "{correlation_id}",
+                "requested_by": "analyst@example.test"
+            }}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn valid_cancellation_message_parses_into_scan_cancellation() {
+        let cancellation = parse_scan_cancellation(&valid_cancellation_message("corr-cancel-1"))
+            .expect("debe parsear");
+
+        assert_eq!(cancellation.correlation_id.as_str(), "corr-cancel-1");
+        assert_eq!(cancellation.requested_by, "analyst@example.test");
+    }
+
+    #[test]
+    fn syntactically_broken_cancellation_json_is_malformed_payload() {
+        let err =
+            parse_scan_cancellation(br#"{ "correlation_id": "#).expect_err("JSON roto debe fallar");
+
+        assert!(matches!(err, ConsumeError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn cancellation_missing_required_field_is_invalid_schema() {
+        let raw = br#"{ "correlation_id": "corr-1" }"#;
+
+        let err = parse_scan_cancellation(raw).expect_err("falta 'requested_by', debe fallar");
+
+        match err {
+            ConsumeError::InvalidSchema(detail) => {
+                assert!(detail.contains("requested_by"), "detalle: {detail}")
+            }
+            other => panic!("se esperaba InvalidSchema, se obtuvo {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_cancellation_source_delivers_in_order_then_none() {
+        let first = parse_scan_cancellation(&valid_cancellation_message("corr-c1")).unwrap();
+        let second = parse_scan_cancellation(&valid_cancellation_message("corr-c2")).unwrap();
+
+        let source = InMemoryScanCancellationSource::from_cancellations([first, second]);
+
+        assert_eq!(
+            source
+                .next_cancellation()
+                .await
+                .unwrap()
+                .unwrap()
+                .correlation_id
+                .as_str(),
+            "corr-c1"
+        );
+        assert_eq!(
+            source
+                .next_cancellation()
+                .await
+                .unwrap()
+                .unwrap()
+                .correlation_id
+                .as_str(),
+            "corr-c2"
+        );
+        assert!(source.next_cancellation().await.unwrap().is_none());
+        assert!(source.next_cancellation().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_cancellation_source_from_raw_yields_error_then_continues() {
+        let source = InMemoryScanCancellationSource::from_raw_messages([
+            valid_cancellation_message("corr-c1"),
+            b"{ roto".to_vec(),
+            valid_cancellation_message("corr-c2"),
+        ]);
+
+        assert!(source.next_cancellation().await.unwrap().is_some());
+
+        let err = source
+            .next_cancellation()
+            .await
+            .expect_err("el mensaje inválido se entrega como Err");
+        assert!(matches!(err, ConsumeError::MalformedPayload(_)));
+
+        assert!(
+            source.next_cancellation().await.unwrap().is_some(),
+            "un mensaje envenenado no debe interrumpir la entrega"
+        );
+        assert!(source.next_cancellation().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_cancellation_source_default_is_empty() {
+        let source = InMemoryScanCancellationSource::default();
+
+        assert!(source.next_cancellation().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn log_cancellation_received_records_correlation_id() {
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+
+        let cancellation = parse_scan_cancellation(&valid_cancellation_message("corr-cancel-42"))
+            .expect("debe parsear");
+        tracing::subscriber::with_default(subscriber, || {
+            log_cancellation_received(&cancellation);
+        });
+
+        let logged = buffer.contents();
+        assert!(
+            logged.contains("corr-cancel-42"),
+            "la traza debe llevar el correlation_id: {logged}"
+        );
     }
 
     #[derive(Clone, Default)]
