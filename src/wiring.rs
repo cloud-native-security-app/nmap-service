@@ -16,16 +16,12 @@
 //!   [`NvdApiEnricher`] (egress de red opt-in, ver `docs/security-scope.md`). Si
 //!   está deshabilitado, este módulo no construye `NvdApiEnricher` en absoluto:
 //!   no hay ninguna posibilidad de llamada de red hacia NVD.
-//!
-//! # Hueco pendiente: adaptador de broker
-//!
-//! La tecnología concreta de cola de mensajes aún no está decidida (ver
-//! `docs/architecture.md`). No existe todavía un adaptador real de
-//! [`ScanRequestSource`](crate::messaging::consumer::ScanRequestSource) ni de
-//! [`ScanResultSink`]: el `sink` que se cablea aquí es el stub en memoria
-//! ([`InMemoryScanResultSink`]) y `src/main.rs` llama a [`crate::run`] con
-//! `source == None`. Cuando exista el adaptador de broker se construirá en esta
-//! función y se pasará su `source` a [`crate::run`].
+//! - [`ScanRequestSource`] -> [`RabbitMqScanRequestSource`],
+//!   [`ScanCancellationSource`] -> [`RabbitMqScanCancellationSource`],
+//!   [`ScanResultSink`] -> [`RabbitMqScanResultSink`] (feature
+//!   `broker_adapter`): conecta contra el Broker con el almacén de
+//!   certificados nativo del proceso (sin CA custom — ver
+//!   `docs/security-scope.md` y `src/messaging/rabbitmq.rs`).
 
 use std::sync::Arc;
 
@@ -35,7 +31,11 @@ use crate::config::Config;
 use crate::enrichment::{
     CompositeVulnEnricher, EnrichError, ExploitDbEnricher, NvdApiEnricher, NvdCache, VulnEnricher,
 };
-use crate::messaging::publisher::{InMemoryScanResultSink, ScanResultSink};
+use crate::messaging::consumer::{ScanCancellationSource, ScanRequestSource};
+use crate::messaging::publisher::ScanResultSink;
+use crate::messaging::rabbitmq::{
+    BrokerError, RabbitMqScanCancellationSource, RabbitMqScanRequestSource, RabbitMqScanResultSink,
+};
 use crate::repository::{MongoRepository, RepoError, ScanResultRepository};
 use crate::scanner::{NmapCliScanner, NmapScanner};
 use crate::ssh::{HostKeyStore, RemoteExecutor, RusshExecutor};
@@ -61,6 +61,13 @@ pub enum WiringError {
     /// vez de `panic!`) por si esa invariante se rompiera en el futuro.
     #[error("configuración NVD inconsistente: {0}")]
     InvalidNvdConfig(String),
+
+    /// No se pudo conectar (o preparar el canal) contra el Broker por AMQPS
+    /// al inicializar alguno de los tres adaptadores de mensajería (feature
+    /// `broker_adapter`). Un Broker inaccesible al arrancar detiene el
+    /// proceso de forma limpia, mismo criterio que [`WiringError::Mongo`].
+    #[error("no se pudo inicializar la mensajería con el Broker: {0}")]
+    Broker(#[from] BrokerError),
 }
 
 /// Construye los [`ServicePorts`] con los adaptadores de producción a partir de
@@ -70,6 +77,12 @@ pub enum WiringError {
 /// conexión tanto el [`ScanResultRepository`] como el [`HostKeyStore`]
 /// persistente. El resto de adaptadores son unit-structs sin estado.
 ///
+/// También conecta contra el Broker (AMQPS, almacén de certificados nativo
+/// del proceso, sin CA custom) y devuelve, junto a los `ServicePorts`, los
+/// adaptadores reales de [`ScanRequestSource`]/[`ScanCancellationSource`]
+/// listos para pasarle a [`crate::run`] (feature `broker_adapter`; el `sink`
+/// real, [`RabbitMqScanResultSink`], ya viaja dentro de `ServicePorts`).
+///
 /// # Errores
 ///
 /// - [`WiringError::Mongo`] si no se puede establecer la conexión con MongoDB,
@@ -78,7 +91,19 @@ pub enum WiringError {
 /// - [`WiringError::InvalidNvdConfig`] si `config` llegó con
 ///   `nvd_enrichment_enabled=true` sin `nvd_cache_ttl` (no debería ocurrir:
 ///   ver [`crate::config::Config`]).
-pub async fn service_ports_from_config(config: &Config) -> Result<ServicePorts, WiringError> {
+/// - [`WiringError::Broker`] si no se pudo conectar (o preparar el canal)
+///   contra el Broker por AMQPS para cualquiera de los tres adaptadores de
+///   mensajería.
+pub async fn service_ports_from_config(
+    config: &Config,
+) -> Result<
+    (
+        ServicePorts,
+        Arc<dyn ScanRequestSource>,
+        Arc<dyn ScanCancellationSource>,
+    ),
+    WiringError,
+> {
     let repo = MongoRepository::connect(&config.mongo_uri, &config.mongo_db).await?;
 
     let host_key_store: Arc<dyn HostKeyStore> = Arc::new(repo.host_key_store());
@@ -117,17 +142,47 @@ pub async fn service_ports_from_config(config: &Config) -> Result<ServicePorts, 
     let enricher: Arc<dyn VulnEnricher> = Arc::new(CompositeVulnEnricher::new(enrichers));
     let repository: Arc<dyn ScanResultRepository> = Arc::new(repo);
 
-    // Sin adaptador real de broker todavía (ver el módulo): stub en memoria.
-    let sink: Arc<dyn ScanResultSink> = Arc::new(InMemoryScanResultSink::new());
+    // Broker: los tres adaptadores reales, cada uno con su propia conexión
+    // AMQPS/canal (mismo patrón que `gateway::broker`, ver
+    // `src/messaging/rabbitmq.rs`). Almacén de certificados nativo del
+    // proceso en producción (sin CA custom, ver `docs/security-scope.md`).
+    let source: Arc<dyn ScanRequestSource> = Arc::new(
+        RabbitMqScanRequestSource::connect(
+            &config.broker_endpoint,
+            &config.broker_credential,
+            &config.broker_vhost,
+        )
+        .await?,
+    );
+    let cancellations: Arc<dyn ScanCancellationSource> = Arc::new(
+        RabbitMqScanCancellationSource::connect(
+            &config.broker_endpoint,
+            &config.broker_credential,
+            &config.broker_vhost,
+        )
+        .await?,
+    );
+    let sink: Arc<dyn ScanResultSink> = Arc::new(
+        RabbitMqScanResultSink::connect(
+            &config.broker_endpoint,
+            &config.broker_credential,
+            &config.broker_vhost,
+        )
+        .await?,
+    );
 
-    Ok(ServicePorts {
-        executor,
-        scanner,
-        repository,
-        enricher,
-        host_key_store,
-        sink,
-    })
+    Ok((
+        ServicePorts {
+            executor,
+            scanner,
+            repository,
+            enricher,
+            host_key_store,
+            sink,
+        },
+        source,
+        cancellations,
+    ))
 }
 
 /// Copia el contenido de `secret` a un nuevo [`SecretString`].

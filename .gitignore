@@ -1,2 +1,8 @@
 /target
 *.tmp
+
+# Material TLS de laboratorio (mismo patrón que gateway/.gitignore): la CA
+# autofirmada y las claves del broker de tests se regeneran localmente y no se
+# versionan.
+*.pem
+*.key

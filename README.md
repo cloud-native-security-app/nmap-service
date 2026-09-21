@@ -57,8 +57,9 @@ habilitado):
 | `MS_NMAP_MONGO_URI` | URI de conexión a MongoDB (`db-nmap`), p. ej. `mongodb://host:27017` |
 | `MS_NMAP_MONGO_DB` | Nombre de la base de datos donde se persisten los resultados y el trust store SSH |
 | `MS_NMAP_SSH_PORT` | Puerto SSH del objetivo al que conectarse (p. ej. `22`) |
-| `MS_NMAP_BROKER_ENDPOINT` | Endpoint del Broker de mensajería del que se consumen solicitudes y al que se publican resultados |
-| `MS_NMAP_BROKER_CREDENTIAL` | Credencial/token de autenticación contra el Broker (secreto) |
+| `MS_NMAP_BROKER_ENDPOINT` | Endpoint del Broker de mensajería del que se consumen solicitudes/cancelaciones y al que se publican desenlaces. Forma esperada: `esquema://host:puerto` (p. ej. `amqps://broker.lab:5671`), **sin** usuario ni vhost — `ms-nmap` conecta siempre por AMQPS (el esquema recibido se ignora), fija el usuario RabbitMQ del servicio (`ms-nmap`) y añade `MS_NMAP_BROKER_CREDENTIAL` y `MS_NMAP_BROKER_VHOST` |
+| `MS_NMAP_BROKER_CREDENTIAL` | Contraseña del usuario RabbitMQ `ms-nmap` contra el Broker (secreto) |
+| `MS_NMAP_BROKER_VHOST` | Vhost de RabbitMQ al que conectarse (p. ej. `security-app`), definido en la topología del Broker |
 | `MS_NMAP_SSH_CONNECT_TIMEOUT_SECS` | Timeout en segundos para establecer la conexión SSH con el objetivo |
 | `MS_NMAP_SSH_COMMAND_TIMEOUT_SECS` | Timeout en segundos para la ejecución del comando `nmap` remoto |
 | `MS_NMAP_EXPLOITDB_CSV` | Ruta al CSV `files_exploits.csv` de Exploit-DB para el enriquecimiento offline de vulnerabilidades. En la imagen Docker ya viene fijada por `ENV` a `/opt/exploitdb/files_exploits.csv` (el CSV se bundlea en la build); sólo hay que definirla al ejecutar fuera del contenedor |
@@ -80,8 +81,9 @@ docker run --rm \
   -e MS_NMAP_MONGO_URI=mongodb://mongo:27017 \
   -e MS_NMAP_MONGO_DB=db-nmap \
   -e MS_NMAP_SSH_PORT=22 \
-  -e MS_NMAP_BROKER_ENDPOINT=nats://broker:4222 \
+  -e MS_NMAP_BROKER_ENDPOINT=amqps://broker.lab:5671 \
   -e MS_NMAP_BROKER_CREDENTIAL=*** \
+  -e MS_NMAP_BROKER_VHOST=security-app \
   -e MS_NMAP_SSH_CONNECT_TIMEOUT_SECS=10 \
   -e MS_NMAP_SSH_COMMAND_TIMEOUT_SECS=300 \
   -e MS_NMAP_NVD_ENRICHMENT_ENABLED=false \

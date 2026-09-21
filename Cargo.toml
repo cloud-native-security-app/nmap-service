@@ -39,6 +39,26 @@ tokio-util = "0.7"
 # 2.0). `default-features = false` + `rustls-tls` evita arrastrar OpenSSL/
 # `native-tls`: mismo TLS que ya usa `mongodb` en este crate.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Cliente AMQPS del adaptador real de broker (`src/messaging/rabbitmq.rs`,
+# feature `broker_adapter`). Mismas versiones que fija `gateway/Cargo.toml`
+# (mismo runtime tokio, mismo patrón ya investigado y verificado en
+# `gateway/progress/explore_lapin_publish.md`): `lapin` 2.x resuelve
+# `default-features = false, features = ["rustls"]` a
+# `rustls -> rustls-native-certs` (verificación TLS con el almacén de
+# certificados nativo del proceso en producción; los tests de integración
+# pasan además la CA de laboratorio vía `OwnedTLSConfig::cert_chain`).
+lapin = { version = "2", features = ["rustls"], default-features = false }
+# Adapta el executor/reactor de `lapin` al runtime `tokio` que ya usa el
+# resto de este servicio, en vez de dejar que use su propio pool de hilos
+# (`async-global-executor`) — ver `gateway/progress/explore_lapin_publish.md`
+# §3. Son dev-dependencies del propio `lapin` (solo en sus ejemplos/tests),
+# no algo que un consumidor arrastre transitivamente.
+tokio-executor-trait = "2"
+tokio-reactor-trait = "1"
+# `Consumer` de `lapin` es un `Stream<Item = Result<Delivery>>`; `.next()`
+# sobre él en `RabbitMqScanRequestSource`/`RabbitMqScanCancellationSource` es
+# código de producción (`src/messaging/rabbitmq.rs`), no solo de test.
+futures-util = "0.3"
 
 [dev-dependencies]
 testcontainers = "0.24"
@@ -46,3 +66,13 @@ time = { version = "0.3", features = ["macros"] }
 # Servidor HTTP mock local para testear `NvdApiEnricher` sin egress de red real
 # hacia `services.nvd.nist.gov` (ver `docs/security-scope.md`).
 wiremock = "0.6"
+# Instalación defensiva del backend criptográfico de `rustls` antes de la
+# primera conexión AMQPS en los tests de integración de `broker_adapter`
+# (gotcha de doble-proveedor `rustls` documentado en
+# `gateway/progress/explore_lapin_testcontainers.md` §4: si el binario de
+# test trae dos proveedores criptográficos compilados a la vez, la primera
+# conexión AMQPS se cuelga en vez de fallar). Verificado en `Cargo.lock` de
+# este repo tras añadir `lapin`: solo aparece `ring`, no `aws-lc-rs`, así que
+# hoy no debería reproducirse — se instala igual como medida defensiva
+# barata, mismo patrón que adoptó `gateway`.
+rustls = "0.23"

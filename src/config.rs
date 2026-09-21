@@ -31,6 +31,18 @@ pub const BROKER_ENDPOINT_VAR: &str = "MS_NMAP_BROKER_ENDPOINT";
 /// acceso al Broker. Su valor se trata como secreto (ver `docs/security-scope.md`).
 pub const BROKER_CREDENTIAL_VAR: &str = "MS_NMAP_BROKER_CREDENTIAL";
 
+/// Nombre de la variable de entorno con el vhost de RabbitMQ al que se conecta
+/// el servicio (p. ej. `security-app`, ver `broker/rabbitmq/definitions.json`
+/// en el repo hermano `broker`).
+///
+/// Añadida por la feature `broker_adapter`: [`BROKER_ENDPOINT_VAR`] no lo
+/// incluye (es solo `esquema://host:puerto`, sin vhost ni credenciales — ver
+/// [`Config::broker_endpoint`]), así que hace falta una variable propia para
+/// terminar de construir la URI AMQPS. Sin valor por defecto, como el resto de
+/// variables de despliegue de este módulo (nunca un vhost de producción
+/// hardcodeado en el código).
+pub const BROKER_VHOST_VAR: &str = "MS_NMAP_BROKER_VHOST";
+
 /// Nombre de la variable de entorno con el timeout de establecimiento de la
 /// conexión SSH, expresado en segundos enteros.
 pub const SSH_CONNECT_TIMEOUT_VAR: &str = "MS_NMAP_SSH_CONNECT_TIMEOUT_SECS";
@@ -106,9 +118,20 @@ pub struct Config {
     /// Puerto SSH del objetivo (`1..=65535`).
     pub ssh_port: u16,
     /// Endpoint del Broker (cola de mensajes) al que se conecta el servicio.
+    ///
+    /// Forma esperada: `esquema://host:puerto` (p. ej.
+    /// `amqps://broker.lab:5671`), sin userinfo ni vhost — el adaptador real
+    /// ([`crate::messaging::rabbitmq`], feature `broker_adapter`) ignora el
+    /// esquema recibido (siempre conecta por AMQPS, nunca AMQP en claro) y le
+    /// añade el usuario RabbitMQ fijo del servicio (`ms-nmap`, fijado por la
+    /// topología del Broker, no una credencial), [`Config::broker_credential`]
+    /// y [`Config::broker_vhost`].
     pub broker_endpoint: String,
     /// Credencial de acceso al Broker. Contenido redactado en `Debug`.
     pub broker_credential: SecretString,
+    /// Vhost de RabbitMQ al que se conecta el servicio. Ver
+    /// [`BROKER_VHOST_VAR`].
+    pub broker_vhost: String,
     /// Timeout para establecer la conexión SSH con el objetivo.
     pub ssh_connect_timeout: Duration,
     /// Timeout para la ejecución de un comando remoto sobre la sesión SSH.
@@ -137,10 +160,10 @@ impl Config {
     /// - [`ConfigError::MissingVar`] si falta (o está vacía) una variable
     ///   requerida: [`MONGO_URI_VAR`], [`MONGO_DB_VAR`], [`SSH_PORT_VAR`],
     ///   [`BROKER_ENDPOINT_VAR`], [`BROKER_CREDENTIAL_VAR`],
-    ///   [`SSH_CONNECT_TIMEOUT_VAR`], [`SSH_COMMAND_TIMEOUT_VAR`],
-    ///   [`EXPLOITDB_CSV_VAR`], [`NVD_ENRICHMENT_ENABLED_VAR`], o
-    ///   [`NVD_CACHE_TTL_VAR`] cuando [`NVD_ENRICHMENT_ENABLED_VAR`] es
-    ///   `"true"`.
+    ///   [`BROKER_VHOST_VAR`], [`SSH_CONNECT_TIMEOUT_VAR`],
+    ///   [`SSH_COMMAND_TIMEOUT_VAR`], [`EXPLOITDB_CSV_VAR`],
+    ///   [`NVD_ENRICHMENT_ENABLED_VAR`], o [`NVD_CACHE_TTL_VAR`] cuando
+    ///   [`NVD_ENRICHMENT_ENABLED_VAR`] es `"true"`.
     /// - [`ConfigError::InvalidValue`] si un timeout está presente pero no es
     ///   un entero de segundos positivo, si [`SSH_PORT_VAR`] no es un entero en
     ///   el rango `1..=65535`, o si [`NVD_ENRICHMENT_ENABLED_VAR`] no es
@@ -161,6 +184,7 @@ impl Config {
         let ssh_port = parse_port(SSH_PORT_VAR, lookup(SSH_PORT_VAR))?;
         let broker_endpoint = required(BROKER_ENDPOINT_VAR, lookup(BROKER_ENDPOINT_VAR))?;
         let broker_credential = required(BROKER_CREDENTIAL_VAR, lookup(BROKER_CREDENTIAL_VAR))?;
+        let broker_vhost = required(BROKER_VHOST_VAR, lookup(BROKER_VHOST_VAR))?;
 
         let ssh_connect_timeout =
             parse_timeout(SSH_CONNECT_TIMEOUT_VAR, lookup(SSH_CONNECT_TIMEOUT_VAR))?;
@@ -185,6 +209,7 @@ impl Config {
             ssh_port,
             broker_endpoint,
             broker_credential: SecretString::from(broker_credential),
+            broker_vhost,
             ssh_connect_timeout,
             ssh_command_timeout,
             exploitdb_csv,
@@ -288,6 +313,7 @@ mod tests {
             (SSH_PORT_VAR, "22"),
             (BROKER_ENDPOINT_VAR, "amqp://broker:5672"),
             (BROKER_CREDENTIAL_VAR, TEST_BROKER_CREDENTIAL),
+            (BROKER_VHOST_VAR, "security-app"),
             (SSH_CONNECT_TIMEOUT_VAR, "7"),
             (SSH_COMMAND_TIMEOUT_VAR, "120"),
             (EXPLOITDB_CSV_VAR, "/opt/exploitdb/files_exploits.csv"),
@@ -311,6 +337,7 @@ mod tests {
             config.broker_credential.expose_secret(),
             TEST_BROKER_CREDENTIAL
         );
+        assert_eq!(config.broker_vhost, "security-app");
         assert_eq!(config.ssh_connect_timeout, Duration::from_secs(7));
         assert_eq!(config.ssh_command_timeout, Duration::from_secs(120));
         assert_eq!(config.exploitdb_csv, "/opt/exploitdb/files_exploits.csv");
@@ -455,6 +482,26 @@ mod tests {
             err,
             ConfigError::MissingVar(BROKER_CREDENTIAL_VAR)
         ));
+    }
+
+    #[test]
+    fn missing_broker_vhost_var_yields_typed_missing_var_error() {
+        let mut vars = valid_vars();
+        vars.remove(BROKER_VHOST_VAR);
+
+        let err = config_from(&vars).expect_err("sin BROKER_VHOST debe fallar");
+
+        assert!(matches!(err, ConfigError::MissingVar(BROKER_VHOST_VAR)));
+    }
+
+    #[test]
+    fn empty_broker_vhost_var_is_treated_as_missing() {
+        let mut vars = valid_vars();
+        vars.insert(BROKER_VHOST_VAR, "   ");
+
+        let err = config_from(&vars).expect_err("vhost vacío debe fallar");
+
+        assert!(matches!(err, ConfigError::MissingVar(BROKER_VHOST_VAR)));
     }
 
     #[test]

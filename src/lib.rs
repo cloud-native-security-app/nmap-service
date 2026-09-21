@@ -37,15 +37,16 @@ pub use crate::pipeline::{PipelineConfig, ServicePorts};
 ///   [`ScanRequestSource`] llamando a [`ScanPipeline::run`] hasta que se cierre.
 ///   `cancellations` viaja junto a `source`: si es `Some`, el pipeline también
 ///   consume esa [`ScanCancellationSource`] en su segundo bucle concurrente
-///   (feature `scan_cancellation`); si es `None`, se usa una fuente en memoria
-///   vacía ([`InMemoryScanCancellationSource::default`]) que no cancela nada,
-///   para no exigirle un adaptador real al único llamador (`src/main.rs`)
-///   mientras la tecnología de broker no esté decidida;
-/// - si `source` es `None`, deja constancia con `tracing::warn!` y retorna. Hoy
-///   es el caso normal: la tecnología concreta de cola de mensajes aún no está
-///   decidida (ver `docs/architecture.md`), así que todavía no existe un
-///   adaptador real de `ScanRequestSource`. El `sink` de `ports` es igualmente
-///   el stub en memoria hasta que exista el adaptador de broker.
+///   (features `scan_cancellation` y `broker_adapter`); si es `None`, se usa
+///   una fuente en memoria vacía ([`InMemoryScanCancellationSource::default`])
+///   que no cancela nada, para no exigirle un adaptador real a los usos de la
+///   librería que no lo necesitan;
+/// - si `source` es `None`, deja constancia con `tracing::warn!` y retorna.
+///   `src/main.rs` siempre pasa `Some` en producción (el adaptador real es
+///   [`crate::messaging::rabbitmq::RabbitMqScanRequestSource`], feature
+///   `broker_adapter`); `None` sigue existiendo para tests/usos de la librería
+///   que no necesitan consumir del Broker (p. ej. un pipeline armado a mano
+///   con [`ScanPipeline::process_one`] directamente).
 ///
 /// Nunca hace `panic`.
 pub async fn run(

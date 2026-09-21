@@ -4,7 +4,12 @@
   "rules": {
     "one_feature_at_a_time": true,
     "require_tests_to_close": true,
-    "valid_status": ["pending", "in_progress", "done", "blocked"]
+    "valid_status": [
+      "pending",
+      "in_progress",
+      "done",
+      "blocked"
+    ]
   },
   "features": [
     {
@@ -258,6 +263,27 @@
         "Tests unitarios (sin Docker): registrar y cancelar una tarea simulada mediante el registro de tokens; cancelar un correlation_id desconocido es un no-op sin panic; desregistro correcto tras finalización normal evita que una cancelación tardía afecte una tarea ya completada",
         "Test de integración (#[ignore = \"requiere Docker\"], reutilizando el patrón de tests/scan_pipeline.rs con contenedor sshd real y un comando lento en el stub): arranca un escaneo, publica su cancelación mientras sigue en curso, y verifica que el pipeline lo detiene antes de completarlo y publica el ScanOutcome::failed de cancelación en vez del resultado normal",
         "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en features 1-15"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 17,
+      "name": "broker_adapter",
+      "title": "Adaptador real de RabbitMQ para los puertos de mensajería",
+      "description": "Todo el dominio y la orquestación de mensajería ya existen (features broker_consumer, broker_publisher, scan_started_event, scan_cancellation): ScanRequestSource, ScanCancellationSource y ScanResultSink son traits con stubs en memoria, pero no hay ningún adaptador que conecte de verdad a RabbitMQ -no hay lapin en Cargo.toml, y src/wiring.rs deja explícito el hueco-. broker/contracts/README.md y broker/rabbitmq/definitions.json (repo hermano) ya fijan el contrato exacto: exchange scan.requests (routing key scan.request) -> cola ms-nmap.scan-requests; exchange scan.cancellations (routing key scan.cancellation) -> cola ms-nmap.scan-cancellations; exchange scan.outcomes con routing keys scan.outcome.started/completed/failed (ms-nmap publica, no consume). gateway (repo hermano, src/broker.rs) ya resolvió el mismo problema (lapin + AMQPS + TLS de laboratorio vs producción) con el mismo runtime tokio: es la referencia a seguir, no un patrón nuevo a inventar -leer gateway/src/broker.rs, gateway/progress/explore_lapin_publish.md y gateway/progress/explore_lapin_testcontainers.md antes de diseñar-.",
+      "acceptance": [
+        "Cargo.toml añade lapin (version = \"2\", features = [\"rustls\"], default-features = false), tokio-executor-trait y tokio-reactor-trait (mismas versiones que gateway/Cargo.toml, para adaptar el executor/reactor de lapin al runtime tokio ya en uso), y rustls como dev-dependency si hace falta para el gotcha de doble-proveedor criptográfico en tests (ver progress/explore_lapin_testcontainers.md de gateway)",
+        "RabbitMqScanRequestSource implementa ScanRequestSource: consume de la cola ms-nmap.scan-requests (exchange scan.requests, routing key scan.request), parsea cada mensaje con parse_scan_request ya existente; un mensaje malformado se nack sin requeue (deja que la política de dead-lettering ya definida en broker/rabbitmq/definitions.json lo enrute a ms-nmap.scan-requests.dlq) y no es fatal para el consumo; un mensaje válido se ack solo tras encolarlo con éxito en el pipeline",
+        "RabbitMqScanCancellationSource implementa ScanCancellationSource: mismo patrón sobre la cola ms-nmap.scan-cancellations (exchange scan.cancellations, routing key scan.cancellation)",
+        "RabbitMqScanResultSink implementa ScanResultSink: publica en el exchange scan.outcomes con la routing key correspondiente al status de cada ScanOutcome (scan.outcome.started/completed/failed vía encode_outcome ya existente), con confirm_select activado (mismo patrón que gateway::BrokerPublisher) para no dar por publicado un mensaje que RabbitMQ no confirmó",
+        "Conexión AMQPS: en producción (wiring.rs) usa el almacén de certificados nativo del proceso (sin trust custom); en el test de integración se conecta con la CA de laboratorio del broker (broker/rabbitmq/tls/ca_certificate.pem, o el mecanismo de testcontainers que gateway ya usa) -mismo patrón exacto que gateway::broker::connect_with_tls_config, no una variante nueva-",
+        "src/config.rs: MS_NMAP_BROKER_ENDPOINT/MS_NMAP_BROKER_CREDENTIAL (ya existen desde config, feature 2) pasan de leerse-y-no-usarse a alimentar de verdad la conexión AMQPS de este adaptador; si hace falta una variable nueva (p. ej. vhost, si no viene ya en el endpoint), se añade siguiendo el mismo patrón sin default hardcodeado",
+        "src/wiring.rs construye RabbitMqScanRequestSource/RabbitMqScanCancellationSource/RabbitMqScanResultSink desde Config y los pasa a crate::run(...) en vez de None/None y del InMemoryScanResultSink; src/main.rs deja de pasar None para la fuente y la cancelación",
+        "Un fallo de conexión al arrancar (Broker inaccesible) se reporta con un WiringError tipado y el proceso termina limpio -mismo patrón que el fallo de conexión a Mongo ya existente-, nunca panic",
+        "Tests de integración (#[ignore = \"requiere Docker\"], testcontainers levantando un RabbitMQ efímero con la topología de broker/rabbitmq/definitions.json cargada -mismo patrón que gateway ya resolvió, reutilizar su enfoque-): publicar un ScanRequest real en scan.requests y verificar que RabbitMqScanRequestSource lo entrega; publicar en scan.cancellations y verificar que RabbitMqScanCancellationSource lo entrega; RabbitMqScanResultSink publica un ScanOutcome y un consumidor de prueba en scan.outcomes lo recibe con la routing key correcta según el status",
+        "Smoke test end-to-end opcional pero deseable: extender tests/scan_pipeline.rs (o uno nuevo) para que, con los 3 adaptadores reales sobre un RabbitMQ de test, un ScanRequest publicado externamente termine en un ScanOutcome publicado externamente -sin pasar por los stubs en memoria-",
+        "Ninguna credencial (contraseña AMQPS, ssh_credentials_ref) aparece en logs ni en mensajes de error de este adaptador",
+        "./init.sh en verde (2-3 corridas, sin flakiness); cargo clippy/fmt/doc limpios; sin regresión en features 1-16"
       ],
       "status": "done"
     }

@@ -19,11 +19,14 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 - **Se usa el binario `nmap` real**, no una reimplementación en Rust. La
   detección de vulnerabilidades se apoya en scripts NSE (`--script vuln`), no
   en una base de CVEs propia.
-- **Comunicación asíncrona vía cola de mensajes** con el Broker (tecnología
-  concreta — RabbitMQ/NATS/Kafka/Redis Streams — aún sin confirmar). Por eso
-  la capa de mensajería se aísla detrás de los traits `ScanRequestSource` y
-  `ScanResultSink`: el resto del servicio no debe conocer la tecnología
-  concreta del broker.
+- **Comunicación asíncrona vía cola de mensajes** con el Broker **RabbitMQ
+  sobre AMQPS** (contrato fijado en el repo hermano `broker`:
+  `subject/contracts/README.md` y `subject/rabbitmq/definitions.json`; la
+  tecnología ya está decidida desde la feature `broker_adapter`, no es una
+  decisión abierta). La capa de mensajería se aísla detrás de los traits
+  `ScanRequestSource`, `ScanCancellationSource` y `ScanResultSink`: el resto
+  del servicio no conoce la tecnología concreta del broker, sólo los
+  adaptadores reales de `messaging::rabbitmq` (y el `wiring`).
 - **Persistencia en MongoDB** (`db-nmap`) vía el driver oficial `mongodb`
   (async). Los resultados de escaneo son documentos de estructura variable
   (número de puertos/servicios/vulnerabilidades no es fijo), lo que encaja
@@ -55,8 +58,9 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 
   | Puerto (trait)                     | Módulo        | Adaptador de producción         |
   |------------------------------------|---------------|---------------------------------|
-  | `messaging::ScanRequestSource`     | `messaging`   | *(pendiente: broker sin decidir)* |
-  | `messaging::ScanResultSink`        | `messaging`   | *(pendiente; hoy `InMemoryScanResultSink`)* |
+  | `messaging::ScanRequestSource`     | `messaging`   | `messaging::rabbitmq::RabbitMqScanRequestSource` |
+  | `messaging::ScanCancellationSource` | `messaging`  | `messaging::rabbitmq::RabbitMqScanCancellationSource` |
+  | `messaging::ScanResultSink`        | `messaging`   | `messaging::rabbitmq::RabbitMqScanResultSink` |
   | `ssh::HostKeyStore`                | `ssh`         | `repository::MongoHostKeyStore`  |
   | `ssh::RemoteExecutor` (`connect`)  | `ssh`         | `ssh::RusshExecutor`             |
   | `ssh::RemoteSession` (`run_command`) | `ssh`       | `ssh::SshSession`               |
@@ -118,9 +122,17 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 7. **`repository`** — persistencia del `ScanResult` en MongoDB, del trust store
    TOFU (`MongoHostKeyStore`) y de la caché de NVD con TTL (`MongoNvdCache`,
    colección `nvd_cache`, índice `expireAfterSeconds` sobre `cached_at`).
-8. **`messaging`** — `consumer` (recibe `ScanRequest` del Broker) y
-   `publisher` (envía `ScanResult` o error al Broker), cada uno detrás de un
-   trait para no acoplar el resto del servicio a la tecnología del broker.
+8. **`messaging`** — `consumer` (recibe `ScanRequest` y `ScanCancellation` del
+   Broker) y `publisher` (envía `ScanOutcome`/`ScanResult` o error al Broker),
+   cada uno detrás de un trait para no acoplar el resto del servicio a la
+   tecnología del broker. El submódulo `rabbitmq` implementa los tres traits
+   con `lapin` sobre AMQPS (`RabbitMqScanRequestSource`,
+   `RabbitMqScanCancellationSource`, `RabbitMqScanResultSink`): TLS con el
+   almacén de certificados nativo del proceso en producción, `confirm_select`
+   en el canal del publicador (no se confirma un mensaje que el Broker no
+   aceptó), y sin declarar topología (las colas/exchanges los declara el
+   `broker`, ver "Qué NO hacer"). El patrón es el mismo que ya resolvió
+   `gateway::broker`.
 9. **`pipeline` (`src/pipeline.rs`)** — orquesta
    `consumer -> ssh -> scanner -> parser -> enrichment -> repository -> publisher`
    en `ScanPipeline`, construido a partir de los puertos inyectados
@@ -131,7 +143,13 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
     reales de cada puerto desde la `Config` y los agrupa en `ServicePorts`. Si el
     CSV de Exploit-DB no carga, el servicio no arranca (`WiringError::Enrichment`).
     `NvdApiEnricher` sólo se construye (y por tanto sólo existe la posibilidad de
-    egress hacia NVD) si `config.nvd_enrichment_enabled` es `true`.
+    egress hacia NVD) si `config.nvd_enrichment_enabled` es `true`. Conecta
+    también los tres adaptadores de broker contra el Broker por AMQPS (almacén
+    de certificados nativo del proceso, sin CA custom) y devuelve junto a los
+    `ServicePorts` los adaptadores reales de `ScanRequestSource` y
+    `ScanCancellationSource` para `lib::run`; un Broker inaccesible al arrancar
+    detiene el proceso de forma limpia con `WiringError::Broker` (mismo
+    criterio que `WiringError::Mongo`), nunca `panic`.
 11. **`lib` (`src/lib.rs`)** — declara `pub mod` para cada capa anterior y
     expone `pub async fn run(ports, config, source)` que arma el `ScanPipeline`
     y lo pone a consumir.

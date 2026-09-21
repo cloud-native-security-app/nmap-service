@@ -1180,3 +1180,53 @@ que el token ya se encuentra).
   `src/messaging/consumer.rs`, `src/pipeline.rs`, `src/lib.rs`, `src/main.rs`,
   `Cargo.toml`, `tests/scan_pipeline.rs`, `feature_list.json`,
   `progress/*.md`.
+
+---
+
+## 2026-09-20 — Feature 17: broker_adapter
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó, ver `progress/review.md`)
+
+### Qué se hizo
+
+- Adaptador real de RabbitMQ (AMQPS, `lapin` 2) para los tres puertos de
+  mensajería que solo tenían stubs en memoria, siguiendo el patrón ya resuelto
+  por `gateway/src/broker.rs`: `RabbitMqScanRequestSource`,
+  `RabbitMqScanCancellationSource`, `RabbitMqScanResultSink` (nuevos en
+  `src/messaging/rabbitmq.rs`), con `confirm_select` en el publicador,
+  nack-sin-requeue para mensajes malformados (dead-letter a la `.dlq` ya
+  aprovisionada), URI AMQPS forzada (nunca AMQP en claro), y TLS con trust
+  nativo en producción / CA de laboratorio en tests.
+- `src/config.rs`: nueva var requerida `MS_NMAP_BROKER_VHOST` (sin default);
+  documentada la forma de `broker_endpoint` (`esquema://host:puerto`).
+- `src/messaging/publisher.rs`: nueva `PublishError::NotAcknowledged`.
+- `src/wiring.rs`: construye los 3 adaptadores reales desde `Config`, nuevo
+  `WiringError::Broker` (arranque limpio si el Broker es inaccesible); ya no se
+  pasa `None/None` desde `src/main.rs`.
+- `rabbitmq/`: copia literal de la topología de `broker/rabbitmq/`
+  (`definitions.json`, `rabbitmq.conf`, `tls/*.pem`, sin `ca_key.pem`).
+- `tests/broker_adapter.rs`: 5 tests `#[ignore = "requiere Docker"]` sobre
+  RabbitMQ real + topología real, incluido el smoke e2e con los 3 adaptadores
+  reales + sshd + Mongo reales (sin stubs en memoria).
+- Docs in-repo actualizadas (`docs/architecture.md`, `README.md`) y raíz
+  (`docker-compose.yml`, `START.md` — no versionados).
+- Touch-up tras review del líder/reviewer: texto obsoleto en `src/lib.rs`
+  (doc-comment del branch `source == None` y `run()`).
+
+### Verificación
+
+- `./init.sh` verde en múltiples corridas (fmt `--check`, clippy
+  `--all-targets -- -D warnings`, 143 unitarios, todos los `#[ignore]` con
+  Docker — 5/5 broker_adapter, 11/11 repository, 4/4 scan_pipeline, 4/4
+  scanner, 5/5 ssh — y `cargo doc`).
+- Review estricto del `reviewer`: APPROVED, checkpoints C1-C5 `[x]`, sin
+  cambios requeridos (una observación no bloqueante ya resuelta).
+
+### Notas / seguimiento
+
+- Flakiness preexistente de la feature 14 (`enrichment::nvd`, wiremock
+  compartido bajo paralelismo) apareció una vez en la primera corrida; pasa en
+  aislamiento y no volvió a repetirse. No se tocó esa feature.
+- Detalle: `progress/impl_broker_adapter.md`, `progress/review.md`.
+- Commit pendiente (lo gestiona el leader).

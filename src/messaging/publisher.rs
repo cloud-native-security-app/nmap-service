@@ -175,6 +175,18 @@ pub enum PublishError {
     /// reintentando.
     #[error("no se pudo serializar el mensaje de resultado: {0}")]
     Serialization(String),
+
+    /// El Broker respondió explícitamente que **no** aceptó el mensaje (nack),
+    /// tras haberlo confirmado que el frame se envió correctamente. Distinta de
+    /// [`PublishError::Transport`]: aquí el envío en sí no falló, fue el propio
+    /// Broker quien rechazó el mensaje (feature `broker_adapter`,
+    /// [`crate::messaging::rabbitmq::RabbitMqScanResultSink`], que activa
+    /// `confirm_select` para poder distinguir ambos casos).
+    #[error("el Broker no confirmó (nack) la publicación en '{exchange}'")]
+    NotAcknowledged {
+        /// Exchange contra el que se publicó el mensaje rechazado.
+        exchange: &'static str,
+    },
 }
 
 /// Serializa un [`ScanOutcome`] al cuerpo de mensaje canónico (JSON UTF-8) que
