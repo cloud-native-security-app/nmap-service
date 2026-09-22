@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.98 scan initiated Thu Aug 27 23:33:02 2026 as: /usr/bin/nmap -v -p 22 -oX - 172.18.0.253 -->
+<nmaprun scanner="nmap" args="/usr/bin/nmap -v -p 22 -oX - 172.18.0.253" start="1787873582" startstr="Thu Aug 27 23:33:02 2026" version="7.98" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="1" services="22"/>
+<verbose level="1"/>
+<debugging level="0"/>
+<taskbegin task="ARP Ping Scan" time="1787873582"/>
+<taskend task="ARP Ping Scan" time="1787873583" extrainfo="1 total hosts"/>
+<host><status state="down" reason="no-response" reason_ttl="0"/>
+<address addr="172.18.0.253" addrtype="ipv4"/>
+</host>
+<runstats><finished time="1787873583" timestr="Thu Aug 27 23:33:03 2026" summary="Nmap done at Thu Aug 27 23:33:03 2026; 1 IP address (0 hosts up) scanned in 1.47 seconds" elapsed="1.47" exit="success"/><hosts up="0" down="1" total="1"/>
+</runstats>
+</nmaprun>

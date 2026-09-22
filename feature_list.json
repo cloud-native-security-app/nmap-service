@@ -4,7 +4,12 @@
   "rules": {
     "one_feature_at_a_time": true,
     "require_tests_to_close": true,
-    "valid_status": ["pending", "in_progress", "done", "blocked"]
+    "valid_status": [
+      "pending",
+      "in_progress",
+      "done",
+      "blocked"
+    ]
   },
   "features": [
     {
@@ -20,7 +25,7 @@
         "Cargo.toml incluye testcontainers como dev-dependency",
         "cargo build compila sin warnings"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 2,
@@ -32,7 +37,7 @@
         "Ningún valor de configuración queda hardcodeado en el código",
         "Test cubre: config válida se carga correctamente; falta una variable requerida produce un error tipado"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 3,
@@ -49,7 +54,7 @@
         "Todos los tipos derivan Serialize/Deserialize (serde) para persistir y publicar",
         "Test unitario cubre (de)serialización round-trip de ScanResult"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 4,
@@ -65,7 +70,7 @@
         "Las credenciales nunca se escriben en logs (tracing) ni en mensajes de error (ver docs/security-scope.md)",
         "Tests de integración levantan un contenedor Docker con sshd vía testcontainers (no un host real), marcados #[ignore = \"requiere Docker\"], y verifican: conexión exitosa, fallo de auth, comando remoto devuelve el stdout esperado, primera conexión guarda el fingerprint, segunda conexión con el mismo host lo acepta, host key distinta (simulando MITM) se rechaza con HostKeyMismatch"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 5,
@@ -80,7 +85,7 @@
         "Si se solicitó sudo pero la ejecución falla por privilegios insuficientes (p. ej. sudo -n pide password), se devuelve ScanError::InsufficientPrivileges distinguible de otros fallos",
         "Tests de integración usan el contenedor sshd de testcontainers (marcados #[ignore = \"requiere Docker\"]) con un stub que simula la salida de nmap (no requiere nmap real instalado en CI), cubriendo el caso con y sin sudo"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 6,
@@ -93,7 +98,7 @@
         "XML malformado o de una versión de nmap inesperada produce ParseError, nunca panics",
         "Tests unitarios usan al menos 3 fixtures de XML real en tests/fixtures/: host con puertos abiertos, host sin puertos abiertos, XML con hallazgos de vulnerabilidades"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 7,
@@ -108,7 +113,7 @@
         "Fallos de conexión a Mongo son un RepoError distinguible, no un panic",
         "Tests de integración corren contra el contenedor MongoDB oficial levantado vía testcontainers, marcados #[ignore = \"requiere Docker\"]: guardar y recuperar por id, guardar y recuperar por correlation_id, id inexistente devuelve None, guardar y recuperar un fingerprint conocido, nunca contra una base de producción"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 8,
@@ -121,7 +126,7 @@
         "Cada solicitud recibida se loggea con su correlation_id, sin credenciales en texto plano",
         "Tests unitarios cubren: mensaje válido se convierte en ScanRequest, mensaje inválido se rechaza"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 9,
@@ -133,7 +138,7 @@
         "Se publica tanto el caso de éxito (resultado) como el caso de fallo (motivo del error)",
         "Test unitario verifica que un ScanResult se serializa correctamente al formato de mensaje esperado"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 10,
@@ -146,7 +151,141 @@
         "Un fallo en cualquier etapa (SSH, nmap, parseo, Mongo) se traduce en un mensaje de error publicado hacia el Broker, no en un crash del proceso",
         "El proceso maneja múltiples solicitudes concurrentes sin bloquear el runtime (async/await correcto, sin llamadas bloqueantes fuera de spawn_blocking)"
       ],
-      "status": "pending"
+      "status": "done"
+    },
+    {
+      "id": 11,
+      "name": "hexagonal_ports",
+      "title": "Completar arquitectura hexagonal (puertos para ssh, scanner, repository)",
+      "description": "Extraer traits (puertos) para ssh, scanner y repository -hoy son funciones concretas-, completando el patrón hexagonal ya iniciado en messaging (ScanRequestSource/ScanResultSink) y ssh::HostKeyStore. Se hace después de que el pipeline end-to-end (feature scan_pipeline_wiring) esté probado y funcionando, para tener tests reales como red de seguridad antes de reordenar dependencias.",
+      "acceptance": [
+        "src/ssh.rs define un trait (p. ej. RemoteExecutor) con connect/run_command, implementado por el tipo concreto existente (SshSession o equivalente)",
+        "src/scanner.rs define un trait (p. ej. NmapScanner) con run_scan, implementado por la lógica concreta existente",
+        "src/repository.rs define un trait (p. ej. ScanResultRepository) con save/find_by_id/find_by_correlation_id, implementado por el tipo Mongo concreto existente",
+        "lib::run() recibe las implementaciones de estos puertos como parámetros (inyección de dependencias) en vez de llamar directo a los módulos concretos; la elección de la implementación real vive en el composition root (src/main.rs o un módulo de wiring dedicado)",
+        "Todos los tests existentes (unitarios y de integración, incluidos los marcados #[ignore = \"requiere Docker\"]) siguen pasando sin cambios de comportamiento -este refactor solo cambia cómo se inyectan las dependencias, no la lógica-",
+        "docs/architecture.md se actualiza para reflejar el patrón hexagonal completo (puertos y adaptadores) en vez del parcial actual"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 12,
+      "name": "containerization",
+      "title": "Imagen Docker de producción de ms-nmap",
+      "description": "Dockerfile multi-stage que compila el binario ms-nmap y produce una imagen final mínima para desplegar el servicio. Se implementa después de scan_pipeline_wiring (feature 10), cuando lib::run() ya orquesta el pipeline real. La imagen NO incluye el binario nmap: nmap se ejecuta en el objetivo vía SSH, no en el contenedor de ms-nmap (ver docs/architecture.md). testcontainers (tests) es independiente: levanta contenedores desechables de sshd/MongoDB para las pruebas y no empaqueta el servicio.",
+      "acceptance": [
+        "Existe Dockerfile multi-stage en la raíz: stage builder con la toolchain Rust que hace cargo build --release, stage final mínimo (distroless/cc o debian-slim) con solo el binario ms-nmap y certificados CA",
+        "La imagen final no contiene toolchain de compilación, código fuente, ni el binario nmap",
+        "El contenedor corre como usuario no-root",
+        "El binario lee toda su configuración de variables de entorno (ya cubierto por config, feature 2); se documentan en README o docs/ las env vars requeridas para docker run",
+        "Existe .dockerignore que excluye al menos target/, .git/, .claude/, progress/, docs/",
+        "Las imágenes base están fijadas por tag concreto (no latest), idealmente por digest",
+        "docker build completa sin error y docker run con las env vars requeridas arranca el proceso sin panic (verificación manual documentada)",
+        "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no)"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 13,
+      "name": "vuln_enrichment",
+      "title": "Enriquecimiento de vulnerabilidades desde ExploitDB (offline)",
+      "description": "Nueva etapa del pipeline, entre parser y repository: cruza los servicios+versiones de cada PortFinding contra el CSV de ExploitDB (files_exploits.csv, bundleado en la imagen) y añade VulnFindings con los exploits/CVEs conocidos. Detrás de un puerto hexagonal VulnEnricher para poder añadir después adaptadores de API (NVD, Vulners, ...) sin tocar el pipeline. El adaptador ExploitDB es lookup local: sin egress de red. Es detección pasiva, misma categoría que --script vuln (docs/security-scope.md). Decisión: no se ejecuta el CLI searchsploit (bash) como subproceso; se reimplementa la búsqueda sobre el CSV en Rust para mantener la imagen distroless y unificar todos los enrichers tras el mismo trait.",
+      "acceptance": [
+        "src/enrichment.rs define el trait VulnEnricher (async, dyn-compatible con async-trait): enrich(&self, ports: &[PortFinding]) -> Result<Vec<VulnFinding>, EnrichError>",
+        "ExploitDbEnricher implementa VulnEnricher: carga files_exploits.csv (ruta desde una env var de config, sin default hardcodeado), indexa en memoria y matchea por service+version de cada puerto; extrae los CVE de la columna codes",
+        "CompositeVulnEnricher combina varios VulnEnricher (ejecuta todos, concatena) — es el punto de extensión para las APIs futuras",
+        "El pipeline invoca el enricher entre parser::parse y repository::save; el enriquecimiento es best-effort: si falla, se loggea con tracing::warn! y el escaneo continúa con los hallazgos de nmap (no se traduce en ScanOutcome::Failed)",
+        "Los VulnFinding resultantes se deduplican por CVE contra los que ya trajo nmap",
+        "VulnFinding gana un campo source (VulnSource: NmapNse | ExploitDb | ...) y references: Vec<String>; el parser y todos los sitios que construyen VulnFinding se actualizan",
+        "El parser captura los elementos <cpe> de nmap en PortFinding.cpes: Vec<String> (habilita el futuro adaptador NVD por CPE)",
+        "El Dockerfile trae files_exploits.csv (pineado a un commit/tag de exploitdb) en la imagen distroless y fija su ruta con ENV; la imagen sigue sin bash/coreutils y sin el binario nmap",
+        "docs/architecture.md y docs/security-scope.md se actualizan: nueva capa enrichment, lookup local sin egress, detección pasiva",
+        "Tests unitarios del matcher (AND de tokens sobre el título, case-insensitive; match de versión; extracción de CVE de codes; sin falsos positivos obvios) con un CSV fixture pequeño en tests/fixtures/; el test e2e del pipeline verifica que aparecen hallazgos de enrichment",
+        "cargo build sin warnings; ./init.sh verde; clippy/fmt/doc limpios; sin regresión en features 1-12"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 14,
+      "name": "nvd_enrichment",
+      "title": "Enriquecimiento de vulnerabilidades desde la API NVD 2.0",
+      "description": "Segundo adaptador VulnEnricher (feature 13), esta vez online: consulta la API NVD 2.0 por CPE para cada servicio/versión detectado y añade los CVE con CVSS real. Egress de red opt-in (MS_NMAP_NVD_ENRICHMENT_ENABLED): si está deshabilitado (o ausente), wiring.rs no agrega el adaptador y no hay egress. Solo se envía el CPE del servicio a NVD, nunca la IP del objetivo, correlation_id ni credenciales. Incluye caché persistente en Mongo (TTL) para no re-consultar el mismo CPE entre escaneos, y rate limiting propio acorde a los límites de NVD.",
+      "acceptance": [
+        "src/enrichment.rs (o un submódulo) define NvdApiEnricher implementando VulnEnricher: recolecta los CPEs únicos de los PortFinding, convierte el CPE 2.2 que emite nmap (cpe:/a:vendor:product:version) al CPE 2.3 que exige NVD (cpe:2.3:a:vendor:product:version:*:*:*:*:*:*:*), y consulta https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName=<cpe23>",
+        "Cada CVE de la respuesta se mapea a un VulnFinding { id: cve.id, severity: mapeado desde CVSS v3.1/v3.0/v2 (el más reciente disponible; Unknown si no hay métricas), description, references: cve.references, source: VulnSource::Nvd }",
+        "MS_NMAP_NVD_ENRICHMENT_ENABLED es una variable de entorno requerida (true/false, sin default); si es false, wiring.rs NO agrega NvdApiEnricher al CompositeVulnEnricher y no hay ninguna llamada de red",
+        "MS_NMAP_NVD_API_KEY es una variable opcional (vacía o ausente = modo sin autenticar); si está presente se envía en el header apiKey y sube el rate limit permitido",
+        "MS_NMAP_NVD_CACHE_TTL_SECS es requerida SOLO si MS_NMAP_NVD_ENRICHMENT_ENABLED=true; no se exige ni se lee si está deshabilitado",
+        "Caché persistente en MongoDB (colección nueva, p. ej. nvd_cache, mismo patrón que host_keys en MongoRepository) con índice TTL (expireAfterSeconds) creado de forma idempotente; se consulta antes de llamar a la API y se escribe tras cada respuesta exitosa",
+        "Un trait NvdCache (get/put por CPE) desacopla la caché real de Mongo de una implementación en memoria para tests unitarios sin Docker",
+        "Dentro de un mismo ScanResult, un CPE repetido en varios puertos se consulta una sola vez (dedup antes de tocar caché/API)",
+        "Rate limiting propio: espacia las llamadas a NVD acorde a sus límites documentados (más lento sin API key, más rápido con key), sin añadir una dependencia de limitador externo",
+        "Un fallo de red/HTTP/parseo del adaptador NVD es EnrichError::Backend, se loggea con tracing::warn! y el escaneo sigue con los hallazgos de nmap/ExploitDB (best-effort, igual contrato que la feature 13); nunca panic",
+        "Los hallazgos de NVD se deduplican por CVE contra los que ya aportaron nmap NSE y ExploitDB",
+        "docs/security-scope.md documenta explícitamente: egress a services.nvd.nist.gov solo cuando está habilitado, solo se envía el CPE (nunca IP/correlation_id/credenciales), es detección pasiva (misma categoría que --script vuln y la feature 13)",
+        "Tests con wiremock (servidor HTTP mock local): conversión CPE 2.2->2.3, mapeo de severidad desde CVSS, parseo de la respuesta de NVD, caché hit/miss, dedup de CPEs repetidos, fallo de red -> Backend sin panic. Cero llamadas reales a NVD en los tests",
+        "cargo build sin warnings; ./init.sh verde (2-3 corridas); clippy/fmt/doc limpios; sin regresión en features 1-13"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 15,
+      "name": "scan_started_event",
+      "title": "Publicar ScanOutcome::started al comenzar el pipeline",
+      "description": "El repo broker (docs/architecture.md, contracts/) ya define el contrato y la ruta (routing key scan.outcome.started, consumida solo por el Gateway, nunca por ms-analisis) para un tercer estado de ScanOutcome que hoy ms-nmap no emite. Sin esta feature, RF-07 (estado PENDIENTE/EN_PROGRESO/COMPLETADO/FALLIDO) y RF-08 (notificación en tiempo real al frontend vía Gateway) no tienen forma de saber que un escaneo empezó a procesarse, solo su desenlace final. No depende de que exista ya un adaptador real de broker: se publica igual a través del ScanResultSink inyectado (hoy el stub en memoria; mañana el adaptador RabbitMQ real).",
+      "acceptance": [
+        "messaging::publisher::ScanOutcome gana la variante Started { correlation_id: CorrelationId } (serde internamente tageada por status: \"started\", sin campos result ni reason) y su constructor ScanOutcome::started(correlation_id)",
+        "El status_label() (o equivalente) devuelve \"started\" para esta variante; outcome_log_fields (o el helper de logging equivalente) la maneja sin panic y sin volcar más que correlation_id + status (igual contrato de no-fuga que Completed/Failed)",
+        "ScanPipeline::process_one publica un ScanOutcome::started(correlation_id) a través del ScanResultSink inyectado ANTES de ejecutar ssh::connect/scanner::run_scan (es decir, antes de tocar el objetivo), y luego sigue con el flujo existente hasta publicar el desenlace terminal (Completed o Failed)",
+        "Publicar el evento started es best-effort: si sink.publish falla, se loggea con tracing::warn! (correlation_id, error, sin credenciales) y el pipeline continúa con run_stages igualmente — nunca aborta el escaneo por esto",
+        "Se publica un único evento started por invocación de process_one",
+        "Test de round-trip serde: ScanOutcome::started(...) serializa exactamente a {\"status\":\"started\",\"correlation_id\":\"...\"} sin campos extra, y deserializa de vuelta; los round-trip existentes de Completed/Failed siguen verdes (regresión)",
+        "Test unitario: usando InMemoryScanResultSink, una llamada a process_one registra exactamente 2 desenlaces en orden — Started primero, luego Completed o Failed — ambos con el mismo correlation_id",
+        "tests/scan_pipeline.rs (e2e, #[ignore = \"requiere Docker\"]) se actualiza para verificar que el primer desenlace publicado es Started antes del terminal, sin debilitar los asserts existentes del resultado final",
+        "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en features 1-14"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 16,
+      "name": "scan_cancellation",
+      "title": "Consumir ScanCancellation y abortar un escaneo en curso",
+      "description": "El repo broker ya define el canal y el contrato (exchange scan.cancellations, cola ms-nmap.scan-cancellations, mensaje {correlation_id, requested_by}) para que el Gateway pida cancelar un escaneo activo (RF-14). ms-nmap hoy no tiene ningún mecanismo de cancelación: ScanPipeline::run despacha cada solicitud a una tarea concurrente sin forma de detenerla a mitad de camino. Esta feature añade el puerto de consumo (mismo patrón hexagonal que ScanRequestSource, con su stub en memoria) y la mecánica de cancelación cooperativa dentro del pipeline, sin depender de que exista ya un adaptador real de broker. El desenlace de un escaneo cancelado se publica como ScanOutcome::failed (el contrato de broker no tiene un cuarto estado 'cancelled' todavía; no se inventa uno aquí sin acordarlo primero con ese repo).",
+      "acceptance": [
+        "domain::ScanCancellation { correlation_id: CorrelationId, requested_by: String } con Serialize/Deserialize coincidiendo exactamente con contracts/scan-cancellation.schema.json de broker (mismos nombres de campo, sin campos extra)",
+        "messaging::consumer (o un submódulo) define el trait ScanCancellationSource (#[async_trait], Send + Sync, dyn-compatible): async fn next_cancellation(&self) -> Result<Option<ScanCancellation>, ConsumeError>, mismo contrato de errores (mensajes malformados se descartan sin ser fatales, fallo de transporte sí lo es) que ScanRequestSource",
+        "InMemoryScanCancellationSource: stub en memoria para desarrollo y tests, mismo patrón que InMemoryScanRequestSource (from_requests/from_raw_messages equivalentes)",
+        "ScanPipeline::run acepta un ScanCancellationSource además de la fuente de solicitudes, y corre un segundo bucle concurrente (mismo JoinSet/tokio::spawn que el de solicitudes) que, al recibir una cancelación, aborta SOLO la tarea en curso cuyo correlation_id coincide -si existe-; una cancelación para un correlation_id desconocido o ya terminado es un no-op loggeado, no un error",
+        "Mecanismo de cancelación cooperativa: cada tarea en vuelo se registra (p. ej. en un registro Arc<Mutex<HashMap<CorrelationId, CancellationToken>>> con tokio_util::sync::CancellationToken) al arrancar process_one y se desregistra al terminar (éxito, fallo o cancelación) de forma atómica, para que una cancelación tardía sobre una tarea ya finalizada sea un no-op seguro, no una condición de carrera",
+        "Un escaneo cancelado mientras corren sus etapas (conexión SSH, ejecución de nmap, parseo, enriquecimiento, persistencia) detiene el trabajo en el primer punto de espera async posible (vía tokio::select! contra el CancellationToken alrededor de run_stages) y publica ScanOutcome::failed(correlation_id, \"escaneo cancelado por solicitud explícita\") -o un mensaje equivalente que dé constancia clara de que fue una cancelación, no un fallo técnico- en vez del flujo normal",
+        "Ningún dato de la solicitud cancelada (credenciales, IP) se filtra en el mensaje de cancelación publicado ni en los logs de esta feature",
+        "Cargo.toml: añade tokio-util (feature sync, para CancellationToken) si no está ya disponible transitivamente; se justifica en el informe",
+        "Tests unitarios (sin Docker): registrar y cancelar una tarea simulada mediante el registro de tokens; cancelar un correlation_id desconocido es un no-op sin panic; desregistro correcto tras finalización normal evita que una cancelación tardía afecte una tarea ya completada",
+        "Test de integración (#[ignore = \"requiere Docker\"], reutilizando el patrón de tests/scan_pipeline.rs con contenedor sshd real y un comando lento en el stub): arranca un escaneo, publica su cancelación mientras sigue en curso, y verifica que el pipeline lo detiene antes de completarlo y publica el ScanOutcome::failed de cancelación en vez del resultado normal",
+        "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en features 1-15"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 17,
+      "name": "broker_adapter",
+      "title": "Adaptador real de RabbitMQ para los puertos de mensajería",
+      "description": "Todo el dominio y la orquestación de mensajería ya existen (features broker_consumer, broker_publisher, scan_started_event, scan_cancellation): ScanRequestSource, ScanCancellationSource y ScanResultSink son traits con stubs en memoria, pero no hay ningún adaptador que conecte de verdad a RabbitMQ -no hay lapin en Cargo.toml, y src/wiring.rs deja explícito el hueco-. broker/contracts/README.md y broker/rabbitmq/definitions.json (repo hermano) ya fijan el contrato exacto: exchange scan.requests (routing key scan.request) -> cola ms-nmap.scan-requests; exchange scan.cancellations (routing key scan.cancellation) -> cola ms-nmap.scan-cancellations; exchange scan.outcomes con routing keys scan.outcome.started/completed/failed (ms-nmap publica, no consume). gateway (repo hermano, src/broker.rs) ya resolvió el mismo problema (lapin + AMQPS + TLS de laboratorio vs producción) con el mismo runtime tokio: es la referencia a seguir, no un patrón nuevo a inventar -leer gateway/src/broker.rs, gateway/progress/explore_lapin_publish.md y gateway/progress/explore_lapin_testcontainers.md antes de diseñar-.",
+      "acceptance": [
+        "Cargo.toml añade lapin (version = \"2\", features = [\"rustls\"], default-features = false), tokio-executor-trait y tokio-reactor-trait (mismas versiones que gateway/Cargo.toml, para adaptar el executor/reactor de lapin al runtime tokio ya en uso), y rustls como dev-dependency si hace falta para el gotcha de doble-proveedor criptográfico en tests (ver progress/explore_lapin_testcontainers.md de gateway)",
+        "RabbitMqScanRequestSource implementa ScanRequestSource: consume de la cola ms-nmap.scan-requests (exchange scan.requests, routing key scan.request), parsea cada mensaje con parse_scan_request ya existente; un mensaje malformado se nack sin requeue (deja que la política de dead-lettering ya definida en broker/rabbitmq/definitions.json lo enrute a ms-nmap.scan-requests.dlq) y no es fatal para el consumo; un mensaje válido se ack solo tras encolarlo con éxito en el pipeline",
+        "RabbitMqScanCancellationSource implementa ScanCancellationSource: mismo patrón sobre la cola ms-nmap.scan-cancellations (exchange scan.cancellations, routing key scan.cancellation)",
+        "RabbitMqScanResultSink implementa ScanResultSink: publica en el exchange scan.outcomes con la routing key correspondiente al status de cada ScanOutcome (scan.outcome.started/completed/failed vía encode_outcome ya existente), con confirm_select activado (mismo patrón que gateway::BrokerPublisher) para no dar por publicado un mensaje que RabbitMQ no confirmó",
+        "Conexión AMQPS: en producción (wiring.rs) usa el almacén de certificados nativo del proceso (sin trust custom); en el test de integración se conecta con la CA de laboratorio del broker (broker/rabbitmq/tls/ca_certificate.pem, o el mecanismo de testcontainers que gateway ya usa) -mismo patrón exacto que gateway::broker::connect_with_tls_config, no una variante nueva-",
+        "src/config.rs: MS_NMAP_BROKER_ENDPOINT/MS_NMAP_BROKER_CREDENTIAL (ya existen desde config, feature 2) pasan de leerse-y-no-usarse a alimentar de verdad la conexión AMQPS de este adaptador; si hace falta una variable nueva (p. ej. vhost, si no viene ya en el endpoint), se añade siguiendo el mismo patrón sin default hardcodeado",
+        "src/wiring.rs construye RabbitMqScanRequestSource/RabbitMqScanCancellationSource/RabbitMqScanResultSink desde Config y los pasa a crate::run(...) en vez de None/None y del InMemoryScanResultSink; src/main.rs deja de pasar None para la fuente y la cancelación",
+        "Un fallo de conexión al arrancar (Broker inaccesible) se reporta con un WiringError tipado y el proceso termina limpio -mismo patrón que el fallo de conexión a Mongo ya existente-, nunca panic",
+        "Tests de integración (#[ignore = \"requiere Docker\"], testcontainers levantando un RabbitMQ efímero con la topología de broker/rabbitmq/definitions.json cargada -mismo patrón que gateway ya resolvió, reutilizar su enfoque-): publicar un ScanRequest real en scan.requests y verificar que RabbitMqScanRequestSource lo entrega; publicar en scan.cancellations y verificar que RabbitMqScanCancellationSource lo entrega; RabbitMqScanResultSink publica un ScanOutcome y un consumidor de prueba en scan.outcomes lo recibe con la routing key correcta según el status",
+        "Smoke test end-to-end opcional pero deseable: extender tests/scan_pipeline.rs (o uno nuevo) para que, con los 3 adaptadores reales sobre un RabbitMQ de test, un ScanRequest publicado externamente termine en un ScanOutcome publicado externamente -sin pasar por los stubs en memoria-",
+        "Ninguna credencial (contraseña AMQPS, ssh_credentials_ref) aparece en logs ni en mensajes de error de este adaptador",
+        "./init.sh en verde (2-3 corridas, sin flakiness); cargo clippy/fmt/doc limpios; sin regresión en features 1-16"
+      ],
+      "status": "done"
     }
   ]
 }
