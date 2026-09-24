@@ -80,10 +80,12 @@ COPY --from=exploitdb /opt/exploitdb/files_exploits.csv /opt/exploitdb/files_exp
 # monta por bind-mount desde el host (ver ../docker-compose.yml, servicio
 # `nmap-service`), pero Fargate no soporta bind-mounts de archivos del host.
 # Se hornea aquí en la misma ruta, así que SSL_CERT_FILE no cambia de valor.
-# El build de despliegue (deploy/aws/05-build-push-core-images.sh) copia
-# broker/rabbitmq/tls/ca_certificate.pem a este directorio antes de construir,
-# ya que el build context de este Dockerfile es ./nmap-service.
-COPY ca_certificate.pem /etc/rabbitmq-tls/ca_certificate.pem
+# `tls` es un build context adicional (BuildKit) que apunta a
+# broker/rabbitmq/tls/ — ver `additional_contexts` en docker-compose.yml y
+# el flag `--build-context tls=...` en deploy/aws/05-build-push-core-images.sh
+# y deploy/aws/CONSOLE_GUIDE.md. Evita copiar/duplicar el archivo a mano:
+# el build context normal de este Dockerfile sigue siendo solo ./nmap-service.
+COPY --from=tls ca_certificate.pem /etc/rabbitmq-tls/ca_certificate.pem
 
 # El CSV es un dato de sólo lectura bundleado: fija la ruta que lee `config`
 # (MS_NMAP_EXPLOITDB_CSV). Es la única env var con valor en la imagen; el resto
