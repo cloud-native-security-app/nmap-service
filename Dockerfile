@@ -76,6 +76,17 @@ LABEL org.opencontainers.image.title="ms-nmap" \
 COPY --from=builder /app/target/release/ms-nmap /usr/local/bin/ms-nmap
 COPY --from=exploitdb /opt/exploitdb/files_exploits.csv /opt/exploitdb/files_exploits.csv
 
+# CA de laboratorio del Broker (RabbitMQ AMQPS): en docker-compose.yml se
+# monta por bind-mount desde el host (ver ../docker-compose.yml, servicio
+# `nmap-service`), pero Fargate no soporta bind-mounts de archivos del host.
+# Se hornea aquí en la misma ruta, así que SSL_CERT_FILE no cambia de valor.
+# `tls` es un build context adicional (BuildKit) que apunta a
+# broker/rabbitmq/tls/ — ver `additional_contexts` en docker-compose.yml y
+# el flag `--build-context tls=...` en deploy/aws/05-build-push-core-images.sh
+# y deploy/aws/CONSOLE_GUIDE.md. Evita copiar/duplicar el archivo a mano:
+# el build context normal de este Dockerfile sigue siendo solo ./nmap-service.
+COPY --from=tls ca_certificate.pem /etc/rabbitmq-tls/ca_certificate.pem
+
 # El CSV es un dato de sólo lectura bundleado: fija la ruta que lee `config`
 # (MS_NMAP_EXPLOITDB_CSV). Es la única env var con valor en la imagen; el resto
 # se inyectan en `docker run` (ver README.md).
