@@ -94,6 +94,33 @@
   minimizar el riesgo de degradar el servicio del objetivo (evitar
   timing agresivo tipo `-T4`/`-T5` como default).
 
+### Timing de escaneo configurable (feature `configurable_scan_timing`)
+
+- `MS_NMAP_SCAN_TIMING` (opcional, `src/config.rs`) permite elegir la
+  plantilla de temporización (`-T`) de `nmap` entre `polite` (`-T2`),
+  `normal` (`-T3`) y `aggressive` (`-T4`) sin recompilar el servicio. Es un
+  **knob operativo**, pensado para pruebas/demos contra laboratorios propios
+  donde el timing conservador por defecto, combinado con
+  `--script vuln`, puede superar `MS_NMAP_SSH_COMMAND_TIMEOUT_SECS` en un
+  escaneo real.
+- Si la variable está ausente (o vacía), el comportamiento no cambia respecto
+  a antes de esta feature: el default sigue siendo exactamente `Timing::Polite`
+  (`-T2`), el mismo valor conservador que ya exige esta sección para no
+  degradar el servicio del objetivo. Un valor fuera de `polite`/`normal`/
+  `aggressive` es un error de configuración tipado (`ConfigError::InvalidValue`),
+  no un "mejor esfuerzo" ni un `-T5`/`-T0` silencioso.
+- `detection_flags` (`-sV --script vuln`) queda **fuera del alcance** de esta
+  variable: sigue hardcodeado en `ScanOptions::default()`, sin ningún mecanismo
+  para que `MS_NMAP_SCAN_TIMING` ni ninguna otra variable de entorno lo altere.
+  Esto es deliberado: no se abre la puerta a habilitar categorías NSE
+  `exploit`/`intrusive` vía configuración (ver "Límite de las capacidades de
+  escaneo" más arriba).
+- En producción se recomienda no fijar `MS_NMAP_SCAN_TIMING` (o fijarla
+  explícitamente a `polite`) para conservar el default seguro; `normal`/
+  `aggressive` son para entornos de laboratorio/demo controlados por quien
+  despliega, nunca para acelerar un escaneo contra un objetivo de producción
+  sin evaluar el riesgo de degradación del servicio.
+
 ### Enriquecimiento de vulnerabilidades desde la API NVD (feature `nvd_enrichment`)
 
 - El adaptador `NvdApiEnricher` consulta la API NVD 2.0

@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use secrecy::SecretString;
 
+use crate::scanner::Timing;
+
 /// Nombre de la variable de entorno con la URI de conexión a MongoDB (`db-nmap`).
 pub const MONGO_URI_VAR: &str = "MS_NMAP_MONGO_URI";
 
@@ -82,6 +84,20 @@ pub const NVD_API_KEY_VAR: &str = "MS_NMAP_NVD_API_KEY";
 /// enriquecimiento NVD está deshabilitado no se exige (ni se lee su valor).
 pub const NVD_CACHE_TTL_VAR: &str = "MS_NMAP_NVD_CACHE_TTL_SECS";
 
+/// Nombre de la variable de entorno opcional con la plantilla de temporización
+/// (`-T`) que usa [`crate::scanner::run_scan`] (vía [`crate::scanner::ScanOptions`]).
+///
+/// Acepta exactamente `"polite"`, `"normal"` o `"aggressive"`, mapeando a
+/// [`Timing::Polite`] (`-T2`), [`Timing::Normal`] (`-T3`) y
+/// [`Timing::Aggressive`] (`-T4`) respectivamente. Es un knob **operativo**
+/// para pruebas/demos (acelerar un escaneo sin recompilar, ver
+/// `docs/security-scope.md`): si está ausente, el default sigue siendo
+/// exactamente el actual ([`Timing::Polite`]), sin cambio de comportamiento
+/// para quien no la configure. No afecta en absoluto a `detection_flags`
+/// (`-sV --script vuln`), que permanece hardcodeado y fuera del alcance de
+/// esta variable.
+pub const SCAN_TIMING_VAR: &str = "MS_NMAP_SCAN_TIMING";
+
 /// Errores posibles al construir la [`Config`] del servicio.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -150,6 +166,9 @@ pub struct Config {
     /// [`Config::nvd_enrichment_enabled`] es `true` (en ese caso es
     /// obligatorio); `None` si el enriquecimiento NVD está deshabilitado.
     pub nvd_cache_ttl: Option<Duration>,
+    /// Plantilla de temporización (`-T`) elegida para el escaneo. Ver
+    /// [`SCAN_TIMING_VAR`]. Default (variable ausente): [`Timing::Polite`].
+    pub scan_timing: Timing,
 }
 
 impl Config {
@@ -166,8 +185,10 @@ impl Config {
     ///   [`NVD_ENRICHMENT_ENABLED_VAR`] es `"true"`.
     /// - [`ConfigError::InvalidValue`] si un timeout está presente pero no es
     ///   un entero de segundos positivo, si [`SSH_PORT_VAR`] no es un entero en
-    ///   el rango `1..=65535`, o si [`NVD_ENRICHMENT_ENABLED_VAR`] no es
-    ///   exactamente `"true"` o `"false"`.
+    ///   el rango `1..=65535`, si [`NVD_ENRICHMENT_ENABLED_VAR`] no es
+    ///   exactamente `"true"` o `"false"`, o si [`SCAN_TIMING_VAR`] (opcional)
+    ///   está presente pero no es exactamente `"polite"`, `"normal"` o
+    ///   `"aggressive"`.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_source(|key| std::env::var(key).ok())
     }
@@ -202,6 +223,7 @@ impl Config {
         } else {
             None
         };
+        let scan_timing = parse_timing(SCAN_TIMING_VAR, lookup(SCAN_TIMING_VAR))?;
 
         Ok(Self {
             mongo_uri,
@@ -216,6 +238,7 @@ impl Config {
             nvd_enrichment_enabled,
             nvd_api_key,
             nvd_cache_ttl,
+            scan_timing,
         })
     }
 }
@@ -296,6 +319,27 @@ fn optional_secret(raw: Option<String>) -> Option<SecretString> {
         .map(SecretString::from)
 }
 
+/// Parsea [`SCAN_TIMING_VAR`]: variable genuinamente opcional (ausente o
+/// vacía, tras `trim`, es el default [`Timing::Polite`]) cuyo valor, si está
+/// presente, debe ser exactamente `"polite"`, `"normal"` o `"aggressive"`.
+fn parse_timing(var: &'static str, raw: Option<String>) -> Result<Timing, ConfigError> {
+    let Some(value) = raw.filter(|v| !v.trim().is_empty()) else {
+        return Ok(Timing::Polite);
+    };
+
+    match value.trim() {
+        "polite" => Ok(Timing::Polite),
+        "normal" => Ok(Timing::Normal),
+        "aggressive" => Ok(Timing::Aggressive),
+        other => Err(ConfigError::InvalidValue {
+            var,
+            reason: format!(
+                "se esperaba \"polite\", \"normal\" o \"aggressive\", se recibió {other:?}"
+            ),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -344,6 +388,60 @@ mod tests {
         assert!(!config.nvd_enrichment_enabled);
         assert!(config.nvd_api_key.is_none());
         assert!(config.nvd_cache_ttl.is_none());
+        assert_eq!(config.scan_timing, Timing::Polite);
+    }
+
+    #[test]
+    fn missing_scan_timing_var_defaults_to_polite() {
+        let vars = valid_vars();
+        // Sin SCAN_TIMING_VAR.
+
+        let config = config_from(&vars).expect("sin MS_NMAP_SCAN_TIMING debe cargar igual");
+
+        assert_eq!(config.scan_timing, Timing::Polite);
+    }
+
+    #[test]
+    fn scan_timing_var_normal_maps_to_timing_normal() {
+        let mut vars = valid_vars();
+        vars.insert(SCAN_TIMING_VAR, "normal");
+
+        let config = config_from(&vars).expect("\"normal\" debe cargar");
+
+        assert_eq!(config.scan_timing, Timing::Normal);
+    }
+
+    #[test]
+    fn scan_timing_var_aggressive_maps_to_timing_aggressive() {
+        let mut vars = valid_vars();
+        vars.insert(SCAN_TIMING_VAR, "aggressive");
+
+        let config = config_from(&vars).expect("\"aggressive\" debe cargar");
+
+        assert_eq!(config.scan_timing, Timing::Aggressive);
+    }
+
+    #[test]
+    fn scan_timing_var_rejects_invalid_values() {
+        for bad in ["T4", "AGGRESSIVE", "insane", ""] {
+            let mut vars = valid_vars();
+            vars.insert(SCAN_TIMING_VAR, bad);
+
+            if bad.is_empty() {
+                let config = config_from(&vars).expect("vacío se trata como ausente");
+                assert_eq!(config.scan_timing, Timing::Polite);
+                continue;
+            }
+
+            let err = config_from(&vars).expect_err(&format!("{bad:?} no es un timing válido"));
+
+            match err {
+                ConfigError::InvalidValue { var, .. } => assert_eq!(var, SCAN_TIMING_VAR),
+                other => {
+                    panic!("valor {bad:?}: se esperaba InvalidValue, se obtuvo {other:?}")
+                }
+            }
+        }
     }
 
     #[test]
