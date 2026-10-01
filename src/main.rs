@@ -37,7 +37,10 @@ async fn main() {
             connect: config.ssh_connect_timeout,
             command: config.ssh_command_timeout,
         },
-        scan_options: ScanOptions::default(),
+        scan_options: ScanOptions {
+            timing: config.scan_timing,
+            ..ScanOptions::default()
+        },
     };
 
     run(ports, pipeline_config, Some(source), Some(cancellations)).await;

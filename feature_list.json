@@ -286,6 +286,22 @@
         "./init.sh en verde (2-3 corridas, sin flakiness); cargo clippy/fmt/doc limpios; sin regresión en features 1-16"
       ],
       "status": "done"
+    },
+    {
+      "id": 18,
+      "name": "configurable_scan_timing",
+      "title": "Permitir configurar el timing del escaneo vía entorno (sin tocar el default seguro)",
+      "description": "ScanOptions::default() (src/scanner.rs) usa Timing::Polite (-T2) a propósito, autorizado por docs/security-scope.md para no degradar el objetivo -- es lento por diseño, no un bug. Combinado con --script vuln, un escaneo real fácilmente supera los 5 minutos (MS_NMAP_SSH_COMMAND_TIMEOUT_SECS), como se vio probando contra una EC2 propia (tiempo de espera agotado en la operación SSH). Hoy no hay forma de acelerarlo para pruebas/demos sin recompilar: timing está hardcodeado, a diferencia de los timeouts SSH (feature 2), que ya son configurables por entorno. Esta feature agrega esa misma flexibilidad solo para el timing (NO para detection_flags: --script vuln sigue fijo, nunca configurable, para no abrir la puerta a categorías exploit/intrusive vía entorno).",
+      "acceptance": [
+        "Nueva variable de entorno opcional MS_NMAP_SCAN_TIMING (ver patrón de MS_NMAP_SSH_COMMAND_TIMEOUT_SECS en src/config.rs): acepta exactamente 'polite' | 'normal' | 'aggressive' (mapeando a Timing::Polite/-T2, Timing::Normal/-T3, Timing::Aggressive/-T4); cualquier otro valor es un ConfigError::InvalidValue tipado, igual que los timeouts existentes",
+        "Si la variable no está presente, el default sigue siendo exactamente el actual: Timing::Polite (-T2) -- ningún comportamiento cambia para quien no la configure",
+        "detection_flags (-sV --script vuln) NO se vuelve configurable por esta feature: sigue hardcodeado en ScanOptions::default(), sin ningún mecanismo para que una variable de entorno lo altere",
+        "El Config resultante expone el Timing elegido y run_scan/build_command lo reciben igual que hoy reciben ScanOptions (sin cambiar la firma pública de build_command)",
+        "docs/security-scope.md documenta la nueva variable: explica que es un knob operativo para pruebas/demos (acelerar sin recompilar), que el default de producción sigue siendo el conservador (-T2), y que detection_flags permanece fuera del alcance de esta configurabilidad",
+        "Tests unitarios nuevos en src/config.rs (mismo patrón que los de SSH_COMMAND_TIMEOUT_VAR): variable ausente -> default Polite; 'normal'/'aggressive' -> Timing correspondiente; valor inválido -> ConfigError::InvalidValue tipado",
+        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test e ./init.sh pasan en verde"
+      ],
+      "status": "done"
     }
   ]
 }

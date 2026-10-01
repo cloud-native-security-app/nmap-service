@@ -1230,3 +1230,58 @@ que el token ya se encuentra).
   aislamiento y no volvió a repetirse. No se tocó esa feature.
 - Detalle: `progress/impl_broker_adapter.md`, `progress/review.md`.
 - Commit pendiente (lo gestiona el leader).
+
+---
+
+## 2026-10-01 — Feature 18: configurable_scan_timing
+
+- **Agente:** implementer + reviewer
+- **Estado final:** `done` (reviewer aprobó, ver `progress/review.md`)
+
+### Qué se hizo
+
+- `src/config.rs`: nueva variable **opcional** `MS_NMAP_SCAN_TIMING`
+  (`SCAN_TIMING_VAR`), mismo patrón que las variables de timeout SSH
+  (`MS_NMAP_SSH_COMMAND_TIMEOUT_SECS`): `'polite'|'normal'|'aggressive'` ->
+  `Timing::Polite/Normal/Aggressive` (reusa el enum ya existente de
+  `src/scanner.rs`, sin duplicarlo); ausente o vacía -> default exactamente
+  `Timing::Polite` (`-T2`), sin error y sin cambio de comportamiento; cualquier
+  otro valor -> `ConfigError::InvalidValue` tipado (sin tipo de error nuevo).
+  Nuevo campo público `Config::scan_timing: Timing`.
+- `src/main.rs` (composition root): `ScanOptions` se arma con
+  `timing: config.scan_timing` y el resto por `..ScanOptions::default()`
+  (struct-update), en vez de `ScanOptions::default()` a secas. `build_command`/
+  `run_scan`/`run_scan_with` (`src/scanner.rs`) sin ningún cambio de firma ni
+  de lógica — `detection_flags` (`-sV --script vuln`) sigue hardcodeado,
+  intencionalmente fuera del alcance de esta variable.
+- `docs/security-scope.md`: nueva subsección "Timing de escaneo configurable"
+  bajo "Límite de las capacidades de escaneo" — explica el knob operativo para
+  pruebas/demos, que el default de producción sigue siendo el conservador
+  (`-T2`) y que `detection_flags` permanece fuera de alcance.
+- Tests nuevos en `#[cfg(test)] mod tests` de `src/config.rs`:
+  `missing_scan_timing_var_defaults_to_polite`,
+  `scan_timing_var_normal_maps_to_timing_normal`,
+  `scan_timing_var_aggressive_maps_to_timing_aggressive`,
+  `scan_timing_var_rejects_invalid_values` (`"T4"`/`"AGGRESSIVE"`/`"insane"` ->
+  `InvalidValue` tipado; `""` tratado como ausente); el test existente de carga
+  válida ahora también verifica el default `Timing::Polite`.
+
+### Verificación
+
+- `./init.sh` verde de punta a punta (incluye `cargo test -- --ignored` contra
+  Docker real): `cargo fmt --check` sin diferencias, `cargo clippy
+  --all-targets -- -D warnings` sin warnings, `cargo test` 147 passed (28 en
+  `config::tests`, 4 nuevos), `cargo test -- --ignored` 25 passed
+  (`broker_adapter` 5/5, `repository` 11/11, `scan_pipeline` 4/4, `scanner`
+  4/4, `ssh` 5/5), `cargo doc --no-deps` sin errores.
+- Review estricto del `reviewer`: **APPROVED**, acceptance 1-7 cumplidos,
+  checkpoints C1-C5 `[x]`, sin cambios requeridos (una observación de estilo no
+  bloqueante sobre el agrupamiento del caso `""` en el test de valores
+  inválidos).
+
+### Notas / seguimiento
+
+- No reapareció el flakiness intermitente preexistente de `enrichment::nvd`
+  (feature 14) en esta corrida.
+- Detalle: `progress/impl_configurable_scan_timing.md`, `progress/review.md`.
+- Commit pendiente (lo gestiona el leader).
