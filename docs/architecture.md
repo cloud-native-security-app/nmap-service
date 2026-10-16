@@ -158,7 +158,7 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
     `lib::run(...)`. Sin lógica de negocio propia.
 
 No introducir capas adicionales hasta que haya una razón concreta
-documentada en `feature_list.json`.
+documentada en `docs/decisions.md`.
 
 ## Flujo de datos
 

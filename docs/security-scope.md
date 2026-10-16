@@ -21,7 +21,7 @@
 - Si en algún momento se necesita que `ms-nmap` también valide el objetivo
   (allowlist de rangos IP, confirmación explícita, etc.), eso es una decisión
   de producto que se discute con el usuario y se documenta como una feature
-  nueva en `feature_list.json` — no se improvisa dentro de otra feature.
+  nueva (registrada en `odd/tasks/` y `docs/decisions.md`) — no se improvisa dentro de otra feature.
 
 ## Desarrollo y tests
 
@@ -160,7 +160,7 @@
 
 ## Si algo no está claro
 
-Si una feature de `feature_list.json` roza alguno de estos límites y no está
+Si una tarea roza alguno de estos límites y no está
 claro cómo proceder, el agente **para y pregunta al usuario** en vez de
 asumir qué está autorizado — igual que cualquier otro bloqueo, se documenta
-en `progress/current.md`.
+en el documento de feature (`odd/tasks/`).

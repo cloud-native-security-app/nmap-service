@@ -4,8 +4,6 @@
 target/
 .git/
 .gitignore
-.claude/
-progress/
 docs/
 tests/
 *.md

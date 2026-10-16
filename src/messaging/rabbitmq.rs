@@ -15,8 +15,7 @@
 //! El repo hermano `gateway` ya resolvió `lapin` 2.x + AMQPS + TLS de
 //! producción vs. laboratorio + `testcontainers` para este mismo runtime
 //! `tokio` (`gateway/src/broker.rs`,
-//! `gateway/progress/explore_lapin_publish.md`,
-//! `gateway/progress/explore_lapin_testcontainers.md`). Este módulo reutiliza
+//! y los spikes de lapin/testcontainers del repo `gateway`). Este módulo reutiliza
 //! ese patrón tal cual, no uno reinventado:
 //!
 //! - **`ConnectionProperties` con `tokio-executor-trait`/`tokio-reactor-trait`**:
