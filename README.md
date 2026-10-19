@@ -70,6 +70,48 @@ cada funcionalidad sustancial se planifica en un documento ODD en
 verificación), espejado en la memoria persistente Engram bajo el tópico
 `odd/<feature>/tasks`. Los commits siguen Conventional Commits.
 
+## CI/CD
+
+### En cada pull request y push a `develop` (`.github/workflows/ci.yml`)
+
+- **verify**: Rust 1.98 (el mismo del builder del `Dockerfile`) y `make verify`
+  (fmt, clippy `-D warnings`, `cargo test`, `cargo test -- --ignored` con
+  LocalStack, MongoDB y un `sshd` en Docker, `cargo doc`).
+- **docker-build**: `docker build .` sin push.
+
+### En push a `main` (`.github/workflows/deploy.yml`)
+
+Construye la imagen, la publica en ECR como `security-app/nmap-service:<sha>`
+(y `:latest`) y despliega en el servicio ECS `nmap-service` del cluster
+`security-app-cluster-v2`. Terraform (repo `infra`) es la única fuente de
+verdad de la task definition (variables de entorno, secretos de SSM, roles,
+logs): CI solo descarga la task definition vigente del servicio, cambia la
+imagen del contenedor `nmap-service` por `<sha>`, registra la nueva revisión y
+espera la estabilidad del servicio. Nada de esto se versiona en este repo.
+
+`nmap-service` es un worker sin load balancer ni puerto expuesto, así que
+"estable" significa que la tarea queda en estado `RUNNING` con
+`runningCount == desiredCount`.
+
+Requisitos en GitHub (Learner Lab no tiene OIDC; los fija
+`scripts/refresh-gh-secrets.sh` del repo `infra`):
+
+| Nombre | Tipo | Quién lo define |
+|--------|------|-----------------|
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | secrets del repo | `infra` `scripts/refresh-gh-secrets.sh` |
+| `AWS_REGION` | variable del repo | `infra` `scripts/refresh-gh-secrets.sh` |
+
+Las credenciales de Learner Lab caducan: si el deploy falla al autenticarse,
+ejecuta `scripts/refresh-gh-secrets.sh` en `infra` y vuelve a lanzar el workflow.
+
+### Redeploy manual y rollback
+
+- Redeploy: pestaña Actions, workflow **Deploy**, **Run workflow**
+  (`workflow_dispatch`).
+- Rollback: lanza **Run workflow** eligiendo la ref (rama o tag) de un commit
+  anterior, que reconstruye y despliega esa imagen; o, sin reconstruir,
+  `aws ecs update-service --cluster security-app-cluster-v2 --service nmap-service --task-definition <familia>:<revisión anterior>`.
+
 ## Despliegue (Docker)
 
 El `Dockerfile` de la raíz produce una imagen multi-stage:
