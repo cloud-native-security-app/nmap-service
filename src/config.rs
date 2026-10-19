@@ -98,6 +98,29 @@ pub const NVD_CACHE_TTL_VAR: &str = "MS_NMAP_NVD_CACHE_TTL_SECS";
 /// esta variable.
 pub const SCAN_TIMING_VAR: &str = "MS_NMAP_SCAN_TIMING";
 
+/// Nombre de la variable de entorno con la región AWS de SQS/SNS. Requerida.
+pub const AWS_REGION_VAR: &str = "AWS_REGION";
+
+/// Nombre de la variable de entorno opcional con el endpoint AWS alternativo
+/// (sólo LocalStack/desarrollo). Ausente en AWS real.
+pub const AWS_ENDPOINT_URL_VAR: &str = "AWS_ENDPOINT_URL";
+
+/// Nombre de la variable de entorno con la URL de la cola SQS de solicitudes
+/// de escaneo.
+pub const SCAN_REQUESTS_QUEUE_URL_VAR: &str = "MS_NMAP_SCAN_REQUESTS_QUEUE_URL";
+
+/// Nombre de la variable de entorno con la URL de la cola SQS de cancelaciones.
+pub const SCAN_CANCELLATIONS_QUEUE_URL_VAR: &str = "MS_NMAP_SCAN_CANCELLATIONS_QUEUE_URL";
+
+/// Nombre de la variable de entorno con la URL de la DLQ de solicitudes.
+pub const SCAN_REQUESTS_DLQ_URL_VAR: &str = "MS_NMAP_SCAN_REQUESTS_DLQ_URL";
+
+/// Nombre de la variable de entorno con la URL de la DLQ de cancelaciones.
+pub const SCAN_CANCELLATIONS_DLQ_URL_VAR: &str = "MS_NMAP_SCAN_CANCELLATIONS_DLQ_URL";
+
+/// Nombre de la variable de entorno con el ARN del topic SNS de desenlaces.
+pub const SCAN_OUTCOMES_TOPIC_ARN_VAR: &str = "MS_NMAP_SCAN_OUTCOMES_TOPIC_ARN";
+
 /// Errores posibles al construir la [`Config`] del servicio.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -113,6 +136,25 @@ pub enum ConfigError {
         /// Descripción legible de por qué el valor es inválido (nunca incluye
         /// el contenido de una credencial).
         reason: String,
+    },
+
+    /// Una variable URL está presente pero no se puede parsear.
+    #[error("URL inválida en {var}: {source}")]
+    InvalidUrl {
+        /// Nombre de la variable de entorno con la URL inválida.
+        var: &'static str,
+        /// Error de parseo subyacente.
+        source: url::ParseError,
+    },
+
+    /// Una variable ARN no tiene la forma esperada. No incluye el valor.
+    #[error(
+        "ARN de topic SNS inválido en {var}: se esperaba \
+         arn:<partición>:sns:<región>:<cuenta de 12 dígitos>:<nombre>"
+    )]
+    InvalidArn {
+        /// Nombre de la variable de entorno con el ARN inválido.
+        var: &'static str,
     },
 }
 
@@ -169,6 +211,21 @@ pub struct Config {
     /// Plantilla de temporización (`-T`) elegida para el escaneo. Ver
     /// [`SCAN_TIMING_VAR`]. Default (variable ausente): [`Timing::Polite`].
     pub scan_timing: Timing,
+    /// Región AWS usada por los clientes SQS/SNS. Ver [`AWS_REGION_VAR`].
+    pub aws_region: String,
+    /// Endpoint AWS alternativo (sólo LocalStack). `None` en AWS real. Ver
+    /// [`AWS_ENDPOINT_URL_VAR`].
+    pub aws_endpoint_url: Option<url::Url>,
+    /// URL de la cola SQS de solicitudes de escaneo.
+    pub scan_requests_queue_url: url::Url,
+    /// URL de la cola SQS de cancelaciones de escaneo.
+    pub scan_cancellations_queue_url: url::Url,
+    /// URL de la DLQ de solicitudes de escaneo.
+    pub scan_requests_dlq_url: url::Url,
+    /// URL de la DLQ de cancelaciones de escaneo.
+    pub scan_cancellations_dlq_url: url::Url,
+    /// ARN del topic SNS donde se publican los desenlaces de escaneo.
+    pub scan_outcomes_topic_arn: String,
 }
 
 impl Config {
@@ -182,7 +239,14 @@ impl Config {
     ///   [`BROKER_VHOST_VAR`], [`SSH_CONNECT_TIMEOUT_VAR`],
     ///   [`SSH_COMMAND_TIMEOUT_VAR`], [`EXPLOITDB_CSV_VAR`],
     ///   [`NVD_ENRICHMENT_ENABLED_VAR`], o [`NVD_CACHE_TTL_VAR`] cuando
-    ///   [`NVD_ENRICHMENT_ENABLED_VAR`] es `"true"`.
+    ///   [`NVD_ENRICHMENT_ENABLED_VAR`] es `"true"`; y las variables SQS/SNS
+    ///   [`AWS_REGION_VAR`], [`SCAN_REQUESTS_QUEUE_URL_VAR`],
+    ///   [`SCAN_CANCELLATIONS_QUEUE_URL_VAR`], [`SCAN_REQUESTS_DLQ_URL_VAR`],
+    ///   [`SCAN_CANCELLATIONS_DLQ_URL_VAR`] y [`SCAN_OUTCOMES_TOPIC_ARN_VAR`].
+    /// - [`ConfigError::InvalidUrl`] si una URL de cola o [`AWS_ENDPOINT_URL_VAR`]
+    ///   (opcional) no se puede parsear.
+    /// - [`ConfigError::InvalidArn`] si [`SCAN_OUTCOMES_TOPIC_ARN_VAR`] no es un
+    ///   ARN de topic SNS (el error no incluye el valor).
     /// - [`ConfigError::InvalidValue`] si un timeout está presente pero no es
     ///   un entero de segundos positivo, si [`SSH_PORT_VAR`] no es un entero en
     ///   el rango `1..=65535`, si [`NVD_ENRICHMENT_ENABLED_VAR`] no es
@@ -224,6 +288,26 @@ impl Config {
             None
         };
         let scan_timing = parse_timing(SCAN_TIMING_VAR, lookup(SCAN_TIMING_VAR))?;
+        let aws_region = required(AWS_REGION_VAR, lookup(AWS_REGION_VAR))?;
+        let aws_endpoint_url = optional_url(AWS_ENDPOINT_URL_VAR, lookup(AWS_ENDPOINT_URL_VAR))?;
+        let scan_requests_queue_url = required_url(
+            SCAN_REQUESTS_QUEUE_URL_VAR,
+            lookup(SCAN_REQUESTS_QUEUE_URL_VAR),
+        )?;
+        let scan_cancellations_queue_url = required_url(
+            SCAN_CANCELLATIONS_QUEUE_URL_VAR,
+            lookup(SCAN_CANCELLATIONS_QUEUE_URL_VAR),
+        )?;
+        let scan_requests_dlq_url =
+            required_url(SCAN_REQUESTS_DLQ_URL_VAR, lookup(SCAN_REQUESTS_DLQ_URL_VAR))?;
+        let scan_cancellations_dlq_url = required_url(
+            SCAN_CANCELLATIONS_DLQ_URL_VAR,
+            lookup(SCAN_CANCELLATIONS_DLQ_URL_VAR),
+        )?;
+        let scan_outcomes_topic_arn = required_sns_topic_arn(
+            SCAN_OUTCOMES_TOPIC_ARN_VAR,
+            lookup(SCAN_OUTCOMES_TOPIC_ARN_VAR),
+        )?;
 
         Ok(Self {
             mongo_uri,
@@ -239,6 +323,13 @@ impl Config {
             nvd_api_key,
             nvd_cache_ttl,
             scan_timing,
+            aws_region,
+            aws_endpoint_url,
+            scan_requests_queue_url,
+            scan_cancellations_queue_url,
+            scan_requests_dlq_url,
+            scan_cancellations_dlq_url,
+            scan_outcomes_topic_arn,
         })
     }
 }
@@ -248,6 +339,45 @@ fn required(var: &'static str, raw: Option<String>) -> Result<String, ConfigErro
         Some(value) if !value.trim().is_empty() => Ok(value),
         _ => Err(ConfigError::MissingVar(var)),
     }
+}
+
+fn parse_url(var: &'static str, value: &str) -> Result<url::Url, ConfigError> {
+    url::Url::parse(value.trim()).map_err(|source| ConfigError::InvalidUrl { var, source })
+}
+
+fn required_url(var: &'static str, raw: Option<String>) -> Result<url::Url, ConfigError> {
+    parse_url(var, &required(var, raw)?)
+}
+
+/// Variable URL genuinamente opcional: ausente o vacía es `None`.
+fn optional_url(var: &'static str, raw: Option<String>) -> Result<Option<url::Url>, ConfigError> {
+    raw.filter(|v| !v.trim().is_empty())
+        .map(|v| parse_url(var, &v))
+        .transpose()
+}
+
+fn required_sns_topic_arn(var: &'static str, raw: Option<String>) -> Result<String, ConfigError> {
+    let value = required(var, raw)?;
+    if is_sns_topic_arn(value.trim()) {
+        Ok(value.trim().to_owned())
+    } else {
+        Err(ConfigError::InvalidArn { var })
+    }
+}
+
+/// `true` si `value` es `arn:<partición>:sns:<región>:<cuenta de 12 dígitos>:<nombre>`.
+fn is_sns_topic_arn(value: &str) -> bool {
+    let parts: Vec<&str> = value.split(':').collect();
+    let [arn, partition, service, region, account, name] = parts.as_slice() else {
+        return false;
+    };
+    *arn == "arn"
+        && !partition.is_empty()
+        && *service == "sns"
+        && !region.is_empty()
+        && account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && !name.is_empty()
 }
 
 fn parse_port(var: &'static str, raw: Option<String>) -> Result<u16, ConfigError> {
@@ -349,6 +479,23 @@ mod tests {
     use super::*;
 
     const TEST_BROKER_CREDENTIAL: &str = "s3cr3t-token";
+    const VALID_REQUESTS_QUEUE_URL: &str =
+        "https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-requests";
+    const VALID_CANCELLATIONS_QUEUE_URL: &str =
+        "https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-cancellations";
+    const VALID_REQUESTS_DLQ_URL: &str =
+        "https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-requests-dlq";
+    const VALID_CANCELLATIONS_DLQ_URL: &str =
+        "https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-cancellations-dlq";
+    const VALID_OUTCOMES_TOPIC_ARN: &str = "arn:aws:sns:us-east-1:123456789012:scan-outcomes";
+    const NEW_REQUIRED_VARS: [&str; 6] = [
+        AWS_REGION_VAR,
+        SCAN_REQUESTS_QUEUE_URL_VAR,
+        SCAN_CANCELLATIONS_QUEUE_URL_VAR,
+        SCAN_REQUESTS_DLQ_URL_VAR,
+        SCAN_CANCELLATIONS_DLQ_URL_VAR,
+        SCAN_OUTCOMES_TOPIC_ARN_VAR,
+    ];
 
     fn valid_vars() -> HashMap<&'static str, &'static str> {
         HashMap::from([
@@ -362,6 +509,15 @@ mod tests {
             (SSH_COMMAND_TIMEOUT_VAR, "120"),
             (EXPLOITDB_CSV_VAR, "/opt/exploitdb/files_exploits.csv"),
             (NVD_ENRICHMENT_ENABLED_VAR, "false"),
+            (AWS_REGION_VAR, "us-east-1"),
+            (SCAN_REQUESTS_QUEUE_URL_VAR, VALID_REQUESTS_QUEUE_URL),
+            (
+                SCAN_CANCELLATIONS_QUEUE_URL_VAR,
+                VALID_CANCELLATIONS_QUEUE_URL,
+            ),
+            (SCAN_REQUESTS_DLQ_URL_VAR, VALID_REQUESTS_DLQ_URL),
+            (SCAN_CANCELLATIONS_DLQ_URL_VAR, VALID_CANCELLATIONS_DLQ_URL),
+            (SCAN_OUTCOMES_TOPIC_ARN_VAR, VALID_OUTCOMES_TOPIC_ARN),
         ])
     }
 
@@ -726,5 +882,147 @@ mod tests {
             !rendered.contains("nvd-super-secret-key"),
             "Debug de Config no debe exponer la API key de NVD: {rendered}"
         );
+    }
+
+    #[test]
+    fn loads_aws_messaging_settings() {
+        let config = config_from(&valid_vars()).expect("la config válida debe cargar");
+
+        assert_eq!(config.aws_region, "us-east-1");
+        assert!(config.aws_endpoint_url.is_none());
+        assert_eq!(
+            config.scan_requests_queue_url.as_str(),
+            VALID_REQUESTS_QUEUE_URL
+        );
+        assert_eq!(
+            config.scan_cancellations_queue_url.as_str(),
+            VALID_CANCELLATIONS_QUEUE_URL
+        );
+        assert_eq!(
+            config.scan_requests_dlq_url.as_str(),
+            VALID_REQUESTS_DLQ_URL
+        );
+        assert_eq!(
+            config.scan_cancellations_dlq_url.as_str(),
+            VALID_CANCELLATIONS_DLQ_URL
+        );
+        assert_eq!(config.scan_outcomes_topic_arn, VALID_OUTCOMES_TOPIC_ARN);
+    }
+
+    #[test]
+    fn each_missing_aws_messaging_var_yields_missing_var_error() {
+        for name in NEW_REQUIRED_VARS {
+            let mut vars = valid_vars();
+            vars.remove(name);
+
+            let err = config_from(&vars).expect_err("falta una variable requerida");
+
+            assert!(
+                matches!(err, ConfigError::MissingVar(n) if n == name),
+                "esperaba MissingVar({name}), obtuve {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_aws_messaging_var_is_treated_as_missing() {
+        for name in NEW_REQUIRED_VARS {
+            let mut vars = valid_vars();
+            vars.insert(name, "  ");
+
+            let err = config_from(&vars).expect_err("valor vacío debe fallar");
+
+            assert!(
+                matches!(err, ConfigError::MissingVar(n) if n == name),
+                "esperaba MissingVar({name}), obtuve {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_endpoint_url_is_optional() {
+        let mut vars = valid_vars();
+        vars.insert(AWS_ENDPOINT_URL_VAR, "  ");
+
+        let config = config_from(&vars).expect("endpoint vacío equivale a ausente");
+
+        assert!(config.aws_endpoint_url.is_none());
+    }
+
+    #[test]
+    fn valid_aws_endpoint_url_is_parsed() {
+        let mut vars = valid_vars();
+        vars.insert(AWS_ENDPOINT_URL_VAR, "http://localstack:4566");
+
+        let config = config_from(&vars).expect("endpoint válido debe cargar");
+
+        assert_eq!(
+            config.aws_endpoint_url.expect("debe ser Some").as_str(),
+            "http://localstack:4566/"
+        );
+    }
+
+    #[test]
+    fn invalid_urls_yield_typed_invalid_url_error() {
+        for name in [
+            AWS_ENDPOINT_URL_VAR,
+            SCAN_REQUESTS_QUEUE_URL_VAR,
+            SCAN_CANCELLATIONS_QUEUE_URL_VAR,
+            SCAN_REQUESTS_DLQ_URL_VAR,
+            SCAN_CANCELLATIONS_DLQ_URL_VAR,
+        ] {
+            for bad in ["not-a-url", "://missing-scheme", "http://"] {
+                let mut vars = valid_vars();
+                vars.insert(name, bad);
+
+                let err = config_from(&vars).expect_err("URL malformada debe fallar");
+
+                assert!(
+                    matches!(err, ConfigError::InvalidUrl { var, .. } if var == name),
+                    "esperaba InvalidUrl({name}) para {bad:?}, obtuve {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_topic_arns_yield_invalid_arn_without_echoing_value() {
+        for bad in [
+            "not-an-arn",
+            "arn:aws:sqs:us-east-1:123456789012:scan-outcomes",
+            "arn:aws:sns:us-east-1:123456789012",
+            "arn:aws:sns:us-east-1:12345:scan-outcomes",
+            "arn:aws:sns:us-east-1:12345678901a:scan-outcomes",
+            "arn:aws:sns:us-east-1:123456789012:",
+            "arn:aws:sns::123456789012:scan-outcomes",
+            "arn::sns:us-east-1:123456789012:scan-outcomes",
+            "arn:aws:sns:us-east-1:123456789012:scan:outcomes",
+        ] {
+            let mut vars = valid_vars();
+            vars.insert(SCAN_OUTCOMES_TOPIC_ARN_VAR, bad);
+
+            let err = config_from(&vars).expect_err("ARN malformado debe fallar");
+
+            assert!(
+                matches!(err, ConfigError::InvalidArn { var } if var == SCAN_OUTCOMES_TOPIC_ARN_VAR),
+                "esperaba InvalidArn para {bad:?}, obtuve {err:?}"
+            );
+            assert!(
+                !err.to_string().contains(bad),
+                "el mensaje no debe repetir el valor: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_output_still_redacts_secrets_with_aws_settings() {
+        let mut vars = valid_vars();
+        vars.insert(NVD_API_KEY_VAR, "nvd-super-secret-key");
+
+        let config = config_from(&vars).expect("config válida");
+        let rendered = format!("{config:?}");
+
+        assert!(!rendered.contains(TEST_BROKER_CREDENTIAL));
+        assert!(!rendered.contains("nvd-super-secret-key"));
     }
 }

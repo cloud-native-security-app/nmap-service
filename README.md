@@ -89,6 +89,13 @@ habilitado):
 | `MS_NMAP_BROKER_ENDPOINT` | Endpoint del Broker de mensajería del que se consumen solicitudes/cancelaciones y al que se publican desenlaces. Forma esperada: `esquema://host:puerto` (p. ej. `amqps://broker.lab:5671`), **sin** usuario ni vhost — `ms-nmap` conecta siempre por AMQPS (el esquema recibido se ignora), fija el usuario RabbitMQ del servicio (`ms-nmap`) y añade `MS_NMAP_BROKER_CREDENTIAL` y `MS_NMAP_BROKER_VHOST` |
 | `MS_NMAP_BROKER_CREDENTIAL` | Contraseña del usuario RabbitMQ `ms-nmap` contra el Broker (secreto) |
 | `MS_NMAP_BROKER_VHOST` | Vhost de RabbitMQ al que conectarse (p. ej. `security-app`), definido en la topología del Broker |
+| `AWS_REGION` | Región AWS de SQS/SNS (p. ej. `us-east-1`). Obligatoria. Las credenciales salen de la cadena de proveedores por defecto de AWS (rol de la tarea ECS), nunca de variables propias |
+| `AWS_ENDPOINT_URL` | Endpoint AWS alternativo, **sólo LocalStack** (p. ej. `http://localstack:4566`). Opcional: ausente en AWS real |
+| `MS_NMAP_SCAN_REQUESTS_QUEUE_URL` | URL de la cola SQS de solicitudes de escaneo (obligatoria) |
+| `MS_NMAP_SCAN_CANCELLATIONS_QUEUE_URL` | URL de la cola SQS de cancelaciones de escaneo (obligatoria) |
+| `MS_NMAP_SCAN_REQUESTS_DLQ_URL` | URL de la DLQ de solicitudes de escaneo (obligatoria) |
+| `MS_NMAP_SCAN_CANCELLATIONS_DLQ_URL` | URL de la DLQ de cancelaciones de escaneo (obligatoria) |
+| `MS_NMAP_SCAN_OUTCOMES_TOPIC_ARN` | ARN del topic SNS de desenlaces, `arn:<partición>:sns:<región>:<cuenta de 12 dígitos>:<nombre>` (obligatoria) |
 | `MS_NMAP_SSH_CONNECT_TIMEOUT_SECS` | Timeout en segundos para establecer la conexión SSH con el objetivo |
 | `MS_NMAP_SSH_COMMAND_TIMEOUT_SECS` | Timeout en segundos para la ejecución del comando `nmap` remoto |
 | `MS_NMAP_EXPLOITDB_CSV` | Ruta al CSV `files_exploits.csv` de Exploit-DB para el enriquecimiento offline de vulnerabilidades. En la imagen Docker ya viene fijada por `ENV` a `/opt/exploitdb/files_exploits.csv` (el CSV se bundlea en la build); sólo hay que definirla al ejecutar fuera del contenedor |
