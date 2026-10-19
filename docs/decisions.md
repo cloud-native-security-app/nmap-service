@@ -98,6 +98,8 @@ broker_adapter y configurable_scan_timing.
 
 ## ADR-10 — Adaptador RabbitMQ (AMQPS) reutilizando el patrón de `gateway`
 
+- **Estado:** sustituido por ADR-16 (2026-10-19). Se conserva como historia.
+
 - **Decisión:** `lapin` 2.x con `rustls`, executor/reactor de tokio, TLS vía
   almacén nativo en producción y CA de laboratorio inyectada en tests. Usuario
   RabbitMQ fijo `ms-nmap` (parte del contrato de topología); la contraseña
@@ -150,3 +152,38 @@ broker_adapter y configurable_scan_timing.
 - **Consecuencia:** la CA de laboratorio del Broker se hornea con un build
   context adicional `tls`; ver el plan `odd/tasks/ci-cd-deploy.md` para
   hacerla opcional en AWS.
+
+## ADR-16 — SQS + SNS en lugar de RabbitMQ (sustituye al ADR-10)
+
+- **Contexto:** Amazon MQ no está disponible en el Learner Lab; se decidió
+  (2026-10-17) reemplazar RabbitMQ por SNS + SQS. El contrato de los mensajes no
+  cambia; la topología la fija el repo `broker`
+  (`odd/tasks/sqs-sns-migration.md`).
+- **Decisión:** `aws-sdk-sqs` consume `ms-nmap-scan-requests` y
+  `ms-nmap-scan-cancellations` (long poll de 20 s) y `aws-sdk-sns` publica en el
+  topic `scan-outcomes` con el atributo `routing_key`. Se elimina `lapin` (y
+  `tokio-executor-trait`, `tokio-reactor-trait`, `futures-util`), el módulo
+  `messaging::rabbitmq`, `BrokerError`, `PublishError::NotAcknowledged` y las
+  variables `MS_NMAP_BROKER_*`. Las credenciales salen de la cadena por defecto
+  de AWS (rol de la tarea ECS); `AWS_ENDPOINT_URL` solo apunta a LocalStack.
+  Una solicitud se borra de su cola únicamente tras publicar su desenlace
+  terminal (at-least-once); la idempotencia por `correlation_id` evita
+  un segundo escaneo. El apagado es ordenado: ver "Apagado ordenado" en
+  `docs/architecture.md`.
+- **Consecuencia:** los tests de mensajería usan LocalStack real
+  (`tests/common/mod.rs`) en vez de RabbitMQ. Las cancelaciones siguen siendo
+  en proceso: con más de una réplica una cancelación puede perderse (hoy
+  `desired_count = 1`). Con `lapin` fuera, el guard defensivo del proveedor
+  criptográfico de `rustls` en los tests ya no se necesita y se eliminó junto con
+  la dependencia `rustls` de desarrollo.
+
+## ADR-17 — Sin CA de laboratorio horneada en la imagen (sustituye la consecuencia del ADR-15)
+
+- **Contexto:** con RabbitMQ AMQPS la imagen horneaba la CA de laboratorio con un
+  build context adicional `tls` (cross-repo) y `SSL_CERT_FILE`.
+- **Decisión:** SQS y SNS usan HTTPS con CA públicas, que ya cubre el paquete
+  `ca-certificates` de distroless. Se elimina el stage/`COPY` de la CA, el
+  contexto `tls` y toda referencia a `SSL_CERT_FILE` y `/etc/rabbitmq-tls`.
+- **Consecuencia:** `docker build .` funciona desde este repo solo, sin
+  `--build-context`. El pipeline de build y la definición de tarea de `infra`
+  dejan de necesitar el contexto `tls` y `SSL_CERT_FILE`.

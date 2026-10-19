@@ -65,8 +65,10 @@ ADD --chmod=0644 \
 # Stage 3 — runtime
 # ---------------------------------------------------------------------------
 # distroless/cc-debian12: glibc + libgcc (para el binario Rust), paquete
-# ca-certificates (TLS a MongoDB/Broker vía rustls) y el usuario no-root
-# `nonroot` (uid 65532). No trae shell ni gestor de paquetes.
+# ca-certificates (TLS a MongoDB y a los endpoints públicos de AWS SQS/SNS, que
+# usan CA públicas: no se hornea ninguna CA de laboratorio ni hace falta una
+# variable de CA custom) y el usuario no-root `nonroot` (uid 65532). No trae
+# shell ni gestor de paquetes. El build no necesita contextos de otros repos.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 
 LABEL org.opencontainers.image.title="ms-nmap" \
@@ -75,17 +77,6 @@ LABEL org.opencontainers.image.title="ms-nmap" \
 
 COPY --from=builder /app/target/release/ms-nmap /usr/local/bin/ms-nmap
 COPY --from=exploitdb /opt/exploitdb/files_exploits.csv /opt/exploitdb/files_exploits.csv
-
-# CA de laboratorio del Broker (RabbitMQ AMQPS): en docker-compose.yml se
-# monta por bind-mount desde el host (ver ../docker-compose.yml, servicio
-# `nmap-service`), pero Fargate no soporta bind-mounts de archivos del host.
-# Se hornea aquí en la misma ruta, así que SSL_CERT_FILE no cambia de valor.
-# `tls` es un build context adicional (BuildKit) que apunta a
-# broker/rabbitmq/tls/ — ver `additional_contexts` en docker-compose.yml y
-# el flag `--build-context tls=...` en deploy/aws/05-build-push-core-images.sh
-# y deploy/aws/CONSOLE_GUIDE.md. Evita copiar/duplicar el archivo a mano:
-# el build context normal de este Dockerfile sigue siendo solo ./nmap-service.
-COPY --from=tls ca_certificate.pem /etc/rabbitmq-tls/ca_certificate.pem
 
 # El CSV es un dato de sólo lectura bundleado: fija la ruta que lee `config`
 # (MS_NMAP_EXPLOITDB_CSV). Es la única env var con valor en la imagen; el resto

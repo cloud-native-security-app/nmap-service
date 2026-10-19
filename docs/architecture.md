@@ -19,14 +19,12 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 - **Se usa el binario `nmap` real**, no una reimplementación en Rust. La
   detección de vulnerabilidades se apoya en scripts NSE (`--script vuln`), no
   en una base de CVEs propia.
-- **Comunicación asíncrona vía cola de mensajes** con el Broker **RabbitMQ
-  sobre AMQPS** (contrato fijado en el repo hermano `broker`:
-  `subject/contracts/README.md` y `subject/rabbitmq/definitions.json`; la
-  tecnología ya está decidida desde la feature `broker_adapter`, no es una
-  decisión abierta). La capa de mensajería se aísla detrás de los traits
-  `ScanRequestSource`, `ScanCancellationSource` y `ScanResultSink`: el resto
-  del servicio no conoce la tecnología concreta del broker, sólo los
-  adaptadores reales de `messaging::rabbitmq` (y el `wiring`).
+- **Comunicación asíncrona vía colas SQS y un topic SNS** (contrato y topología
+  fijados en el repo hermano `broker`, `odd/tasks/sqs-sns-migration.md`; ver
+  ADR-16, que sustituye al RabbitMQ/AMQPS del ADR-10). La capa de mensajería se
+  aísla detrás de los traits `ScanRequestSource`, `ScanCancellationSource` y
+  `ScanResultSink`: el resto del servicio no conoce la tecnología concreta, sólo
+  los adaptadores reales de `messaging::sqs`, `messaging::sns` (y el `wiring`).
 - **Persistencia en MongoDB** (`db-nmap`) vía el driver oficial `mongodb`
   (async). Los resultados de escaneo son documentos de estructura variable
   (número de puertos/servicios/vulnerabilidades no es fijo), lo que encaja
@@ -58,9 +56,9 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 
   | Puerto (trait)                     | Módulo        | Adaptador de producción         |
   |------------------------------------|---------------|---------------------------------|
-  | `messaging::ScanRequestSource`     | `messaging`   | `messaging::rabbitmq::RabbitMqScanRequestSource` |
-  | `messaging::ScanCancellationSource` | `messaging`  | `messaging::rabbitmq::RabbitMqScanCancellationSource` |
-  | `messaging::ScanResultSink`        | `messaging`   | `messaging::rabbitmq::RabbitMqScanResultSink` |
+  | `messaging::ScanRequestSource`     | `messaging`   | `messaging::sqs::SqsScanRequestSource` |
+  | `messaging::ScanCancellationSource` | `messaging`  | `messaging::sqs::SqsScanCancellationSource` |
+  | `messaging::ScanResultSink`        | `messaging`   | `messaging::sns::SnsScanResultSink` |
   | `ssh::HostKeyStore`                | `ssh`         | `repository::MongoHostKeyStore`  |
   | `ssh::RemoteExecutor` (`connect`)  | `ssh`         | `ssh::RusshExecutor`             |
   | `ssh::RemoteSession` (`run_command`) | `ssh`       | `ssh::SshSession`               |
@@ -125,24 +123,22 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
 8. **`messaging`** — `consumer` (recibe `ScanRequest` y `ScanCancellation` del
    Broker) y `publisher` (envía `ScanOutcome`/`ScanResult` o error al Broker),
    cada uno detrás de un trait para no acoplar el resto del servicio a la
-   tecnología del broker. El submódulo `rabbitmq` implementa los tres traits
-   con `lapin` sobre AMQPS (`RabbitMqScanRequestSource`,
-   `RabbitMqScanCancellationSource`, `RabbitMqScanResultSink`): TLS con el
-   almacén de certificados nativo del proceso en producción, `confirm_select`
-   en el canal del publicador (no se confirma un mensaje que el Broker no
-   aceptó), y sin declarar topología (las colas/exchanges los declara el
-   `broker`, ver "Qué NO hacer"). El patrón es el mismo que ya resolvió
-   `gateway::broker`.
+   tecnología de cola. El submódulo `sns` implementa `ScanResultSink`
+   (`SnsScanResultSink`, `aws-sdk-sns`): publica cada desenlace en el topic
+   `scan-outcomes` con el atributo `routing_key`. Ni `sqs` ni `sns` declaran
+   topología (colas, DLQ y topic los crea el `broker`/Terraform, ver "Qué NO
+   hacer"); las credenciales salen de la cadena por defecto de AWS (rol de la
+   tarea ECS).
 
-   El submódulo `sqs` (MSG-NM-02, aún sin cablear hasta MSG-NM-04) añade
-   `SqsScanRequestSource` y `SqsScanCancellationSource` sobre `aws-sdk-sqs`
+   El submódulo `sqs` implementa los dos traits de entrada
+   (`SqsScanRequestSource`, `SqsScanCancellationSource`) sobre `aws-sdk-sqs`
    (long poll de 20 s, backoff 1–30 s dentro del adaptador, malformados a la DLQ
    con `SendMessage` explícito). **Cambio de forma del puerto**:
    `IncomingScanRequest` porta ahora un `Arc<dyn Acknowledger>` (`ack`, en SQS
    `DeleteMessage`) además de la `ScanRequest`; `ScanPipeline::process_one`
    devuelve `bool` (¿desenlace terminal publicado?) y el pipeline confirma el
    mensaje solo cuando es `true` (borrado tras manejar). Las fuentes en memoria
-   y RabbitMQ usan un ack no-op. **Idempotencia por `correlation_id`**: una
+   usan un ack no-op. **Idempotencia por `correlation_id`**: una
    solicitud ya en vuelo en la réplica se omite sin ack; una ya terminada
    (documento en `scan_results`) republica su `Completed` sin reescanear;
    `MongoRepository::save` es un upsert con índice único sobre `correlation_id`
@@ -157,19 +153,34 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
     reales de cada puerto desde la `Config` y los agrupa en `ServicePorts`. Si el
     CSV de Exploit-DB no carga, el servicio no arranca (`WiringError::Enrichment`).
     `NvdApiEnricher` sólo se construye (y por tanto sólo existe la posibilidad de
-    egress hacia NVD) si `config.nvd_enrichment_enabled` es `true`. Conecta
-    también los tres adaptadores de broker contra el Broker por AMQPS (almacén
-    de certificados nativo del proceso, sin CA custom) y devuelve junto a los
-    `ServicePorts` los adaptadores reales de `ScanRequestSource` y
-    `ScanCancellationSource` para `lib::run`; un Broker inaccesible al arrancar
-    detiene el proceso de forma limpia con `WiringError::Broker` (mismo
-    criterio que `WiringError::Mongo`), nunca `panic`.
+    egress hacia NVD) si `config.nvd_enrichment_enabled` es `true`. Construye
+    también los adaptadores SQS/SNS (región, endpoint opcional para LocalStack y
+    URLs/ARN de la `Config`) y devuelve junto a los `ServicePorts` los
+    adaptadores reales de `ScanRequestSource` y `ScanCancellationSource` para
+    `lib::run`. El SDK de AWS conecta de forma perezosa: un endpoint inaccesible
+    no falla al arrancar sino en la primera recepción (reintento con backoff) o
+    publicación (el mensaje no se borra y SQS lo reentrega);
+    `WiringError::Messaging` queda reservado para validar la mensajería al
+    arrancar. Nunca `panic`.
 11. **`lib` (`src/lib.rs`)** — declara `pub mod` para cada capa anterior y
-    expone `pub async fn run(ports, config, source)` que arma el `ScanPipeline`
-    y lo pone a consumir.
+    expone `pub async fn run(ports, config, source, cancellations, shutdown)` que
+    arma el `ScanPipeline` y lo pone a consumir hasta que `shutdown` (un
+    `CancellationToken`) se cancele; ver "Apagado ordenado".
 12. **`main` (`src/main.rs`)** — envoltorio delgado: inicializa runtime tokio,
     tracing y config, llama a `wiring::service_ports_from_config` y a
-    `lib::run(...)`. Sin lógica de negocio propia.
+    `lib::run(...)`, y cancela el token de apagado al recibir `SIGTERM` o
+    `Ctrl-C`. Sin lógica de negocio propia.
+
+### Apagado ordenado
+
+ECS detiene la tarea con `SIGTERM`. Al recibirlo (o `Ctrl-C`): (1) se deja de
+pedir mensajes de inmediato, descartando el long poll SQS en curso; (2) se espera
+hasta `SHUTDOWN_DRAIN_TIMEOUT` (25 s, por debajo de los 30 s de `stopTimeout` por
+defecto de ECS) a que terminen los escaneos en vuelo, cada uno borrado de su cola
+solo tras su desenlace terminal; (3) los que sigan corriendo se abortan. Un
+mensaje no borrado reaparece al vencer el `VisibilityTimeout` y se reprocesa de
+forma idempotente por `correlation_id`. Las cancelaciones recibidas durante el
+drenado no se aplican (simplificación aceptada: el proceso está saliendo).
 
 No introducir capas adicionales hasta que haya una razón concreta
 documentada en `docs/decisions.md`.
@@ -221,8 +232,8 @@ Broker  ──(ScanRequest)──▶  messaging::consumer
     `latest`/`main`). Sólo el CSV, no el CLI `searchsploit` (feature
     `vuln_enrichment`).
   - **Stage runtime** (`gcr.io/distroless/cc-debian12:nonroot`): contiene el
-    binario `ms-nmap`, los certificados CA del sistema (TLS a MongoDB, al Broker
-    y, si está habilitado, a la API NVD, todos vía `rustls`) y
+    binario `ms-nmap`, los certificados CA del sistema (TLS a MongoDB, a los endpoints
+    públicos de AWS SQS/SNS y, si está habilitado, a la API NVD) y
     `files_exploits.csv` en `/opt/exploitdb/` (dato de sólo lectura para
     `enrichment`; la ruta se fija con `ENV MS_NMAP_EXPLOITDB_CSV`). Corre como
     usuario no-root (`nonroot`, uid 65532).
