@@ -80,3 +80,9 @@ Planned. Blocked on broker MSG-01 (topology sign-off, including the visibility-t
 ## Next step
 
 MSG-NM-01 once broker MSG-01 is signed off.
+
+## Decisions for MSG-NM-02 (2026-10-19)
+
+- Delete after handle (same as the gateway, user decision A): a request message is deleted only after the scan finished AND its terminal outcome was published. `process_one` returns whether the terminal publish succeeded; on failure the message stays and SQS redelivers it.
+- Idempotency by `correlation_id` (user decision A): before scanning, look up Mongo for a finished scan with that `correlation_id`; if found, republish its terminal outcome and delete the message without rescanning. If the same `correlation_id` is already in flight in this replica, skip the duplicate without deleting it. `MongoRepository::save` becomes an upsert keyed by `correlation_id` with a unique index, so a redelivery never creates a second document.
+- Known limitation (accepted, documented): cancellations are in-process. With more than one replica a cancellation can be consumed by a replica that is not running the scan and is lost; a cancellation that arrives before its request is also lost. Today the service runs one replica (`desired_count = 1`). The same limitation existed with RabbitMQ.
