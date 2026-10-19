@@ -51,7 +51,7 @@ Out:
 
 - [x] MSG-NM-01 Config: SQS/SNS variables with typed errors; RED: config tests first. Removing `MS_NMAP_BROKER_*` moves to MSG-NM-04 so the build stays green (same sequencing as the gateway).
 - [x] MSG-NM-02 Request and cancellation consumers on `aws-sdk-sqs`: long poll, delete after success, malformed handling, fixed visibility timeout set by Terraform (SSH connect + command timeout + 60 s, broker decision Q1; no ChangeMessageVisibility heartbeat), idempotency by `scan_id`; LocalStack tests including redrive to DLQ after 3 receives.
-- [ ] MSG-NM-03 Outcome publisher on `aws-sdk-sns` with `routing_key` attribute; LocalStack test verifies the filters (Gateway gets `started`/`completed`/`failed`, the `ms-analisis` filter check is deferred until that queue exists, see broker sqs-sns-migration Q7).
+- [x] MSG-NM-03 Outcome publisher on `aws-sdk-sns` with `routing_key` attribute; LocalStack test verifies the filters (Gateway gets `started`/`completed`/`failed`, the `ms-analisis` filter check is deferred until that queue exists, see broker sqs-sns-migration Q7).
 - [ ] MSG-NM-04 Wiring and cleanup: update `src/wiring.rs`, remove `lapin` and the `broker_adapter` AMQP module, LocalStack in compose and README, `make verify` green.
 - [ ] MSG-NM-05 Drop the baked lab CA (Dockerfile CA stage, `SSL_CERT_FILE`, `tls` build context); the image then builds with no cross-repo context.
 
@@ -98,6 +98,20 @@ Planned. Blocked on broker MSG-01 (topology sign-off, including the visibility-t
   - Crypto provider: adding `aws-config`/`aws-sdk-sqs` (default features, aws-lc-rs TLS connector with an explicit provider) changed nothing about provider ambiguity: `Cargo.lock` already had `ring` (russh/reqwest/lapin) and `aws-lc-rs` (mongodb/testcontainers) for rustls 0.23. The new LocalStack test file reuses the defensive `rustls::crypto::ring::default_provider().install_default()` guard; LocalStack is plain HTTP. No production `main` change; revisit at MSG-NM-04 once `lapin` is gone.
 - Accepted limitation (unchanged): cancellations are in-process. With more than one replica a cancellation can be consumed by a replica not running the scan and be lost; a cancellation arriving before its request is also lost. Today `desired_count = 1`.
 - Wiring (`src/wiring.rs`) and the lapin adapters are unchanged; the SQS sources are not used until MSG-NM-04.
+
+## MSG-NM-03 evidence
+
+- Route: delegated writer (single bounded writer; parent verifies afterwards). Checkbox intentionally not ticked. No commit/push.
+- RED (tests first):
+  - `cargo test --lib --no-run` -> `E0433/E0425` (`ScanOutcome`, `encode_outcome`, `MAX_OUTCOME_BODY_BYTES`, `RESULT_TOO_LARGE_REASON`, `replacement_if_oversized` unresolved) with only the 7 new `sns` unit tests present.
+  - `cargo test --test sns_sink_localstack --no-run` -> lib did not compile (`missing documentation for a module`, `#![deny(missing_docs)]`) before the adapter existed.
+- GREEN:
+  - `cargo test` -> lib `172 passed; 0 failed` (165 before: +7 sns unit tests, `routing_key_for` test moved to `publisher.rs`); integration suites only `ignored`.
+  - `cargo test --test sns_sink_localstack -- --ignored` -> `3 passed; 0 failed` (~13 s): Started/Completed/Failed arrive through the Gateway filter `{"routing_key":[{"prefix":"scan.outcome."}]}` with exact JSON body and `routing_key` attribute; oversized Completed arrives as Failed with the fixed reason; missing topic -> `PublishError::Sns`.
+  - `cargo test --test sqs_sources_localstack -- --ignored` -> `8 passed; 0 failed` (still green). `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo doc --no-deps`: clean. `tests/broker_adapter.rs` not run.
+- Threshold: `MAX_OUTCOME_BODY_BYTES = 250 * 1024` (256000 B). SNS caps body + attributes at 256 KiB (262144 B); the `routing_key` attribute and envelope need well under 1 KiB, leaving ~6 KiB margin. Only `Completed` is checked (the only variant that grows); body exactly at the threshold is published unchanged.
+- Change summary: new `src/messaging/sns.rs` (`SnsScanResultSink::{from_client, connect}`, pure `replacement_if_oversized`, `RESULT_TOO_LARGE_REASON`, `ROUTING_KEY_ATTRIBUTE`); `routing_key_for` and the three `ROUTING_KEY_SCAN_OUTCOME_*` consts moved to `publisher.rs` (values unchanged; `rabbitmq.rs` re-exports the consts so `tests/broker_adapter.rs` imports still resolve); new `PublishError::Sns { topic, #[source] Box<dyn Error + Send + Sync> }`; `aws-sdk-sns = "1.116.0"`. On oversize a `warn` logs only `correlation_id` and byte sizes; bodies are never logged. Wiring and lapin adapters unchanged.
+- Deferred: the `ms-analisis` filter check waits for its queue (broker Q7).
 
 ## Next step
 

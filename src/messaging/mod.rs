@@ -13,4 +13,5 @@
 pub mod consumer;
 pub mod publisher;
 pub mod rabbitmq;
+pub mod sns;
 pub mod sqs;

@@ -95,7 +95,12 @@ use crate::messaging::consumer::{
     ConsumeError, IncomingScanRequest, ScanCancellationSource, ScanRequestSource,
 };
 use crate::messaging::publisher::{
-    encode_outcome, log_outcome_published, PublishError, ScanOutcome, ScanResultSink,
+    encode_outcome, log_outcome_published, routing_key_for, PublishError, ScanOutcome,
+    ScanResultSink,
+};
+pub use crate::messaging::publisher::{
+    ROUTING_KEY_SCAN_OUTCOME_COMPLETED, ROUTING_KEY_SCAN_OUTCOME_FAILED,
+    ROUTING_KEY_SCAN_OUTCOME_STARTED,
 };
 
 /// Exchange donde el Gateway publica cada [`crate::domain::ScanRequest`]
@@ -128,15 +133,6 @@ pub const QUEUE_SCAN_CANCELLATIONS: &str = "ms-nmap.scan-cancellations";
 /// Exchange donde `ms-nmap` publica cada [`ScanOutcome`] (topic, ya declarado
 /// por `broker/rabbitmq/definitions.json` — no se redeclara aquí).
 pub const EXCHANGE_SCAN_OUTCOMES: &str = "scan.outcomes";
-
-/// Routing key de [`ScanOutcome::Started`].
-pub const ROUTING_KEY_SCAN_OUTCOME_STARTED: &str = "scan.outcome.started";
-
-/// Routing key de [`ScanOutcome::Completed`].
-pub const ROUTING_KEY_SCAN_OUTCOME_COMPLETED: &str = "scan.outcome.completed";
-
-/// Routing key de [`ScanOutcome::Failed`].
-pub const ROUTING_KEY_SCAN_OUTCOME_FAILED: &str = "scan.outcome.failed";
 
 /// Usuario RabbitMQ con el que este servicio se autentica contra el Broker.
 ///
@@ -530,18 +526,6 @@ impl RabbitMqScanResultSink {
     }
 }
 
-/// Devuelve la routing key de [`EXCHANGE_SCAN_OUTCOMES`] que corresponde al
-/// `status` de `outcome`. Exhaustivo sobre las variantes de [`ScanOutcome`]
-/// (sin rama comodín): si se añadiera una variante nueva, este `match` deja
-/// de compilar en vez de enrutarla silenciosamente mal.
-fn routing_key_for(outcome: &ScanOutcome) -> &'static str {
-    match outcome {
-        ScanOutcome::Started { .. } => ROUTING_KEY_SCAN_OUTCOME_STARTED,
-        ScanOutcome::Completed { .. } => ROUTING_KEY_SCAN_OUTCOME_COMPLETED,
-        ScanOutcome::Failed { .. } => ROUTING_KEY_SCAN_OUTCOME_FAILED,
-    }
-}
-
 #[async_trait::async_trait]
 impl ScanResultSink for RabbitMqScanResultSink {
     async fn publish(&self, outcome: &ScanOutcome) -> Result<(), PublishError> {
@@ -639,31 +623,5 @@ mod tests {
             "security-app",
         );
         assert_eq!(uri.matches("s3cr3t").count(), 1);
-    }
-
-    #[test]
-    fn routing_key_for_maps_each_status_to_its_exact_contract_routing_key() {
-        use crate::domain::{CorrelationId, ScanResult};
-        use time::macros::datetime;
-
-        let result = ScanResult {
-            host: "192.0.2.10".parse().expect("IP de prueba válida"),
-            ports: Vec::new(),
-            vulnerabilities: Vec::new(),
-            scanned_at: datetime!(2026-08-27 12:30:00 UTC),
-        };
-
-        assert_eq!(
-            routing_key_for(&ScanOutcome::started(CorrelationId::from("c1"))),
-            ROUTING_KEY_SCAN_OUTCOME_STARTED
-        );
-        assert_eq!(
-            routing_key_for(&ScanOutcome::completed(CorrelationId::from("c2"), result)),
-            ROUTING_KEY_SCAN_OUTCOME_COMPLETED
-        );
-        assert_eq!(
-            routing_key_for(&ScanOutcome::failed(CorrelationId::from("c3"), "x")),
-            ROUTING_KEY_SCAN_OUTCOME_FAILED
-        );
     }
 }

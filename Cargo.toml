@@ -66,6 +66,9 @@ futures-util = "0.3"
 # tarea ECS), sin claves estáticas.
 aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
 aws-sdk-sqs = "1.114.0"
+# Publicador de desenlaces en SNS (`src/messaging/sns.rs`, MSG-NM-03); misma
+# versión que `gateway/Cargo.toml`.
+aws-sdk-sns = "1.116.0"
 
 [dev-dependencies]
 testcontainers = "0.24"
