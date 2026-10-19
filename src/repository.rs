@@ -34,9 +34,9 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use mongodb::bson::{self, doc, oid::ObjectId, Bson, DateTime as BsonDateTime, Document};
+use mongodb::bson::{self, doc, oid::ObjectId, DateTime as BsonDateTime, Document};
 use mongodb::error::ErrorKind;
-use mongodb::options::IndexOptions;
+use mongodb::options::{IndexOptions, ReturnDocument};
 use mongodb::{Client, Collection, Database, IndexModel};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -54,6 +54,9 @@ const HOST_KEYS_COLLECTION: &str = "ssh_host_keys";
 
 /// Colección donde [`MongoNvdCache`] cachea los hallazgos de NVD por CPE 2.3.
 const NVD_CACHE_COLLECTION: &str = "nvd_cache";
+
+/// Nombre del índice único sobre `correlation_id` en [`SCAN_RESULTS_COLLECTION`].
+const SCAN_CORRELATION_ID_INDEX_NAME: &str = "scan_results_correlation_id_unique";
 
 /// Nombre del índice TTL (`expireAfterSeconds`) sobre `cached_at` en
 /// [`NVD_CACHE_COLLECTION`].
@@ -190,6 +193,7 @@ impl MongoRepository {
         let client = Client::with_uri_str(uri).await?;
         let database = client.database(db_name);
         database.run_command(doc! { "ping": 1 }).await?;
+        ensure_scan_correlation_id_unique_index(&database).await?;
         Ok(Self {
             scans: database.collection(SCAN_RESULTS_COLLECTION),
             host_keys: database.collection(HOST_KEYS_COLLECTION),
@@ -226,7 +230,13 @@ impl MongoRepository {
     }
 
     /// Persiste `result` junto con `correlation_id` y una marca temporal de
-    /// guardado, y devuelve el [`ScanId`] asignado.
+    /// guardado, y devuelve el [`ScanId`] del documento.
+    ///
+    /// Es un **upsert por `correlation_id`** (idempotencia ante la entrega
+    /// al-menos-una-vez de SQS): guardar dos veces con el mismo
+    /// `correlation_id` deja un único documento (el último resultado) y
+    /// devuelve el mismo [`ScanId`]. Lo respalda el índice único creado por
+    /// [`MongoRepository::connect`].
     ///
     /// # Errores
     ///
@@ -246,13 +256,23 @@ impl MongoRepository {
             result: result.clone(),
         };
 
-        let inserted = self.scans.insert_one(&document).await?;
+        // `id: None` no se serializa: el reemplazo conserva el `_id` del
+        // documento existente o deja que Mongo asigne uno al insertar.
+        let stored = self
+            .scans
+            .find_one_and_replace(
+                doc! { "correlation_id": correlation_id.as_str() },
+                &document,
+            )
+            .upsert(true)
+            .return_document(ReturnDocument::After)
+            .await?;
 
-        match inserted.inserted_id {
-            Bson::ObjectId(oid) => Ok(ScanId::from(oid)),
-            other => Err(RepoError::Serialization(format!(
-                "MongoDB devolvió un _id que no es ObjectId: {other:?}"
-            ))),
+        match stored.and_then(|stored| stored.id) {
+            Some(oid) => Ok(ScanId::from(oid)),
+            None => Err(RepoError::Serialization(
+                "MongoDB no devolvió el documento guardado con su _id".to_owned(),
+            )),
         }
     }
 
@@ -552,6 +572,26 @@ fn nvd_cache_error(err: mongodb::error::Error) -> EnrichError {
 /// `createIndexes` (error `IndexOptionsConflict`/`IndexKeySpecsConflict`):
 /// `collMod` es la única forma soportada de cambiar el `expireAfterSeconds` de
 /// un índice existente sin borrarlo primero, así que se usa como fallback.
+/// Crea (idempotente) el índice único sobre `correlation_id` de
+/// [`SCAN_RESULTS_COLLECTION`]: garantiza un único documento por solicitud
+/// aunque dos réplicas guarden a la vez. Si la colección ya contuviera
+/// `correlation_id` duplicados de versiones anteriores, la creación falla con
+/// [`RepoError::Backend`] y el arranque se aborta (requiere depuración manual).
+async fn ensure_scan_correlation_id_unique_index(database: &Database) -> Result<(), RepoError> {
+    let collection: Collection<Document> = database.collection(SCAN_RESULTS_COLLECTION);
+    let index = IndexModel::builder()
+        .keys(doc! { "correlation_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name(SCAN_CORRELATION_ID_INDEX_NAME.to_owned())
+                .unique(true)
+                .build(),
+        )
+        .build();
+    collection.create_index(index).await?;
+    Ok(())
+}
+
 async fn ensure_nvd_cache_ttl_index(database: &Database, ttl: Duration) -> Result<(), RepoError> {
     let collection: Collection<Document> = database.collection(NVD_CACHE_COLLECTION);
     let index = IndexModel::builder()

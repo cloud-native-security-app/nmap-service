@@ -27,7 +27,7 @@
 //! no transporta ningún dato sensible ni del objetivo original.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::domain::{ScanCancellation, ScanRequest};
 
@@ -169,24 +169,84 @@ pub fn log_cancellation_received(cancellation: &ScanCancellation) {
     );
 }
 
+/// Fallo al confirmar (`ack`, es decir borrar de la cola) un mensaje ya
+/// procesado.
+///
+/// No es fatal: el mensaje simplemente se reentregará al vencer su visibilidad
+/// y el camino de idempotencia por `correlation_id` lo resolverá sin
+/// reescanear. Agnóstico del SDK: la causa original va en `source`.
+#[derive(Debug, thiserror::Error)]
+#[error("no se pudo confirmar el mensaje de la cola {queue}: {detail}")]
+pub struct AckError {
+    /// Cola (URL) de la que se intentó borrar el mensaje.
+    pub queue: String,
+    /// Descripción legible de la causa (sin el cuerpo del mensaje).
+    pub detail: String,
+    /// Error original del cliente de la cola.
+    #[source]
+    pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// Confirmación de un mensaje entrante: la acción que lo retira de la cola
+/// (en SQS, `DeleteMessage`).
+///
+/// El pipeline la invoca **solo después** de que el escaneo terminó y su
+/// desenlace terminal se publicó (semántica "borrar tras manejar", ver
+/// [`crate::pipeline::ScanPipeline::run`]). Si nunca se invoca, el broker
+/// reentrega el mensaje. Es dyn-compatible: [`IncomingScanRequest`] la porta
+/// como `Arc<dyn Acknowledger>`.
+#[async_trait::async_trait]
+pub trait Acknowledger: std::fmt::Debug + Send + Sync {
+    /// Retira el mensaje de la cola.
+    ///
+    /// # Errores
+    ///
+    /// [`AckError`] si el broker rechazó o no pudo completar la operación.
+    async fn ack(&self) -> Result<(), AckError>;
+}
+
+/// [`Acknowledger`] que no hace nada: lo usan las fuentes en memoria y los
+/// adaptadores sin semántica de confirmación diferida.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopAcknowledger;
+
+#[async_trait::async_trait]
+impl Acknowledger for NoopAcknowledger {
+    async fn ack(&self) -> Result<(), AckError> {
+        Ok(())
+    }
+}
+
 /// Solicitud de escaneo recibida del Broker, lista para entrar al pipeline.
 ///
-/// Hoy es un envoltorio fino sobre [`ScanRequest`]. Existe como punto de
-/// extensión: cuando se decida la tecnología de broker y ésta necesite confirmar
-/// (`ack`) o rechazar (`nack`) el mensaje, el token opaco requerido se añadirá
-/// aquí sin cambiar la firma de [`ScanRequestSource::next_request`]. Por eso es
-/// `#[non_exhaustive]`.
+/// Envuelve el [`ScanRequest`] ya validado y el [`Acknowledger`] que retira el
+/// mensaje de la cola. Es `#[non_exhaustive]`: construirla con
+/// [`new`](Self::new) (ack no-op) o [`with_ack`](Self::with_ack).
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct IncomingScanRequest {
     /// La solicitud ya deserializada y validada.
     pub request: ScanRequest,
+    /// Confirmación diferida del mensaje; el pipeline la ejecuta tras
+    /// publicar el desenlace terminal.
+    pub ack: Arc<dyn Acknowledger>,
 }
 
 impl IncomingScanRequest {
-    /// Envuelve una solicitud ya validada.
+    /// Envuelve una solicitud ya validada con un ack no-op.
     pub fn new(request: ScanRequest) -> Self {
-        Self { request }
+        Self::with_ack(request, Arc::new(NoopAcknowledger))
+    }
+
+    /// Envuelve una solicitud ya validada con el `ack` que retira su mensaje
+    /// de la cola.
+    pub fn with_ack(request: ScanRequest, ack: Arc<dyn Acknowledger>) -> Self {
+        Self { request, ack }
+    }
+
+    /// Confirma el mensaje (lo retira de la cola). Ver [`Acknowledger::ack`].
+    pub async fn ack(&self) -> Result<(), AckError> {
+        self.ack.ack().await
     }
 }
 

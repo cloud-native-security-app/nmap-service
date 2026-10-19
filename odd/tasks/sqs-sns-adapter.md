@@ -50,7 +50,7 @@ Out:
 ## Checklist
 
 - [x] MSG-NM-01 Config: SQS/SNS variables with typed errors; RED: config tests first. Removing `MS_NMAP_BROKER_*` moves to MSG-NM-04 so the build stays green (same sequencing as the gateway).
-- [ ] MSG-NM-02 Request and cancellation consumers on `aws-sdk-sqs`: long poll, delete after success, malformed handling, fixed visibility timeout set by Terraform (SSH connect + command timeout + 60 s, broker decision Q1; no ChangeMessageVisibility heartbeat), idempotency by `scan_id`; LocalStack tests including redrive to DLQ after 3 receives.
+- [x] MSG-NM-02 Request and cancellation consumers on `aws-sdk-sqs`: long poll, delete after success, malformed handling, fixed visibility timeout set by Terraform (SSH connect + command timeout + 60 s, broker decision Q1; no ChangeMessageVisibility heartbeat), idempotency by `scan_id`; LocalStack tests including redrive to DLQ after 3 receives.
 - [ ] MSG-NM-03 Outcome publisher on `aws-sdk-sns` with `routing_key` attribute; LocalStack test verifies the filters (Gateway gets `started`/`completed`/`failed`, the `ms-analisis` filter check is deferred until that queue exists, see broker sqs-sns-migration Q7).
 - [ ] MSG-NM-04 Wiring and cleanup: update `src/wiring.rs`, remove `lapin` and the `broker_adapter` AMQP module, LocalStack in compose and README, `make verify` green.
 - [ ] MSG-NM-05 Drop the baked lab CA (Dockerfile CA stage, `SSL_CERT_FILE`, `tls` build context); the image then builds with no cross-repo context.
@@ -77,6 +77,34 @@ Planned. Blocked on broker MSG-01 (topology sign-off, including the visibility-t
 - Change: `src/config.rs` adds `AWS_REGION`, optional `AWS_ENDPOINT_URL`, four queue URLs and `MS_NMAP_SCAN_OUTCOMES_TOPIC_ARN` (typed `MissingVar`, `InvalidUrl`, `InvalidArn` without echoing the value); `url = "2"` added to `Cargo.toml` (already in the lock). README env table lists the 7 vars. `MS_NMAP_BROKER_*` and `SSL_CERT_FILE` untouched (MSG-NM-04/05).
 - Note: `Config::from_env` now requires the new vars at runtime, so local runs/compose must set them until MSG-NM-04 wires LocalStack.
 
+## MSG-NM-02 evidence
+
+- Route: delegated writer (single bounded writer; parent verifies afterwards). Checkbox intentionally not ticked. No commit/push.
+- RED (tests first):
+  - `cargo test --lib` -> compile failure `E0432` (`AckError`/`Acknowledger` unresolved; the pipeline tests for ack, in-flight skip and finished-scan republish).
+  - `cargo test --test sqs_sources_localstack --no-run` -> `E0432: unresolved import nmap_service::messaging::sqs`.
+  - `cargo test --test repository -- --ignored saving_twice connect_creates` -> `0 passed; 2 failed` (second `save` returned a different `ScanId`; `ns does not exist` / no unique index).
+- GREEN:
+  - `cargo test` -> lib `165 passed; 0 failed` (155 before: 8 pipeline tests + 2 sqs unit tests added); integration suites only `ignored`.
+  - `cargo test --test sqs_sources_localstack -- --ignored` -> `8 passed; 0 failed` (~35 s, LocalStack 4.4 per test).
+  - `cargo test --test repository -- --ignored` -> `13 passed; 0 failed` (2 new). `cargo test --test scan_pipeline -- --ignored` -> `4 passed; 0 failed`.
+  - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo doc --no-deps`: clean. `tests/broker_adapter.rs` (RabbitMQ) intentionally not run.
+- Design notes:
+  - Ack handle: `IncomingScanRequest { request, ack: Arc<dyn Acknowledger> }` (`new` = `NoopAcknowledger`, `with_ack`); `Acknowledger::ack() -> Result<(), AckError>` where `AckError` is SDK-agnostic (queue, detail, boxed `#[source]`). `process_one` returns `bool` (terminal outcome published; `false` also for an in-flight skip); the private `handle_incoming` (spawned by `run`) acks only on `true`. An ack failure is logged, not fatal.
+  - Idempotency: `CancellationRegistry::try_register` doubles as the in-flight set; a duplicate returns `false` without touching the original token. Then `find_by_correlation_id`: found -> republish `Completed` (no `Started`, no scan), unregister, ack if the publish succeeded. A lookup error falls back to scanning (the upsert prevents duplicate documents). Only successful scans are persisted, so a `Failed` outcome cannot be rebuilt: a redelivered message whose `Failed` publish had failed is rescanned (accepted, documented in `process_one`).
+  - Mongo: `save` is `find_one_and_replace(..).upsert(true)` keyed by `correlation_id` (same `ScanId` on retry); `MongoRepository::connect` creates the unique index `scan_results_correlation_id_unique` idempotently. Startup fails if legacy duplicates already exist.
+  - SQS adapters (`src/messaging/sqs.rs`): requests `MaxNumberOfMessages=1`, cancellations batch of 10 with a buffer; long poll 20 s; fixed visibility (no `ChangeMessageVisibility`). Malformed -> explicit `SendMessage` of the raw body with all message attributes to the DLQ, then delete (no delete if the DLQ send fails); the source returns `Err(MalformedPayload|InvalidSchema)` so the pipeline logs and continues. Receive errors back off 1 s..30 s inside the adapter and are never surfaced as `Transport` (`with_backoff` exists for fast tests). Bodies are never logged (only length).
+  - Cancellation deletion: the source deletes a delivered cancellation when the pipeline asks for the next one (the loop applies, then re-polls), so "delete after applying" needs no port change.
+  - Crypto provider: adding `aws-config`/`aws-sdk-sqs` (default features, aws-lc-rs TLS connector with an explicit provider) changed nothing about provider ambiguity: `Cargo.lock` already had `ring` (russh/reqwest/lapin) and `aws-lc-rs` (mongodb/testcontainers) for rustls 0.23. The new LocalStack test file reuses the defensive `rustls::crypto::ring::default_provider().install_default()` guard; LocalStack is plain HTTP. No production `main` change; revisit at MSG-NM-04 once `lapin` is gone.
+- Accepted limitation (unchanged): cancellations are in-process. With more than one replica a cancellation can be consumed by a replica not running the scan and be lost; a cancellation arriving before its request is also lost. Today `desired_count = 1`.
+- Wiring (`src/wiring.rs`) and the lapin adapters are unchanged; the SQS sources are not used until MSG-NM-04.
+
 ## Next step
 
 MSG-NM-01 once broker MSG-01 is signed off.
+
+## Decisions for MSG-NM-02 (2026-10-19)
+
+- Delete after handle (same as the gateway, user decision A): a request message is deleted only after the scan finished AND its terminal outcome was published. `process_one` returns whether the terminal publish succeeded; on failure the message stays and SQS redelivers it.
+- Idempotency by `correlation_id` (user decision A): before scanning, look up Mongo for a finished scan with that `correlation_id`; if found, republish its terminal outcome and delete the message without rescanning. If the same `correlation_id` is already in flight in this replica, skip the duplicate without deleting it. `MongoRepository::save` becomes an upsert keyed by `correlation_id` with a unique index, so a redelivery never creates a second document.
+- Known limitation (accepted, documented): cancellations are in-process. With more than one replica a cancellation can be consumed by a replica that is not running the scan and is lost; a cancellation that arrives before its request is also lost. Today the service runs one replica (`desired_count = 1`). The same limitation existed with RabbitMQ.
