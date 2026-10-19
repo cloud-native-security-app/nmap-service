@@ -2,8 +2,8 @@
 
 - **Master plan:** repo `infra`, `odd/tasks/cloud-native-deploy.md` (Engram `odd/cloud-native-deploy/tasks`)
 - **Engram topic:** `odd/ci-cd-deploy/tasks` (project: `nmap-service`)
-- **Branch:** `v1`
-- **Status:** planned
+- **Branch:** `feature/ci_cd`
+- **Status:** implemented locally; live checks pending
 
 ## Objective
 
@@ -24,14 +24,16 @@ Each service repo must own its build, test and deploy path.
 ## Scope
 
 In:
-- Task definition owned by this repo (`.aws/task-definition.json`).
-- Messaging env config in the task definition (queue URLs, topic ARN,
-  region) from `infra` outputs; the code is `sqs-sns-adapter`. The baked lab
-  CA is not needed on AWS (public-CA HTTPS).
+- CI owns only the image revision (Decision D1): deploy downloads the task
+  definition the ECS service currently runs, swaps the `nmap-service`
+  container image to `<ECR repo>:${{ github.sha }}`, registers it and updates
+  the service.
 - `.github/workflows/ci.yml` (pull requests) and `deploy.yml` (main + manual).
 - README / docs updates.
 
 Out:
+- Task definition content (env, SSM secrets, roles, logging): Terraform in
+  `infra` is the single source of truth; nothing is committed here.
 - Terraform resources (ECS service, ECR, cluster, IAM): owned by `infra`.
 - Messaging topology design (`broker`) and its Terraform (`infra` TF-10); adapter code (`sqs-sns-adapter`).
 - Changes to scanning logic or `docs/security-scope.md` limits.
@@ -43,11 +45,11 @@ Out:
   `AWS_SESSION_TOKEN`, refreshed with `infra`'s `refresh-gh-secrets.sh`.
   Role in use: `LabRole`.
 - Terraform owns the ECS service (`nmap-service` in cluster
-  `security-app-cluster-v2`); CI owns task definition revisions only (the
-  service ignores `task_definition` drift).
+  `security-app-cluster-v2`, bootstrap task definition,
+  `ignore_changes = [task_definition]`); CI only registers revisions that
+  differ from the current one in the image (D1).
 - Messaging is AWS SNS + SQS over HTTPS; credentials come from the ECS task role (`LabRole`, shared by all services).
-- Secrets never committed; the lab password in the old task def must not be
-  copied into `.aws/task-definition.json` (use ECS `secrets` / injected value).
+- Secrets never committed; no task definition is versioned in this repo.
 - Artifacts in English; existing Spanish docs keep being edited in Spanish.
 
 ## Tooling
@@ -59,39 +61,47 @@ Out:
 
 ## Checklist
 
-- [ ] **CI-01** Move the task definition to `.aws/task-definition.json`
-      (placeholders for image, execution role, region, secrets).
-- [ ] **CI-02** Messaging env vars in the task definition (queue URLs, topic
-      ARN, region) and removal of `SSL_CERT_FILE` from the AWS task def.
-      Code changes are tracked in `sqs-sns-adapter` (MSG-NM-01..05); depends on
-      MSG-NM-01. (Superseded: the Amazon MQ / AMQPS public-CA variant.)
-- [ ] **CI-03** `ci.yml` on `pull_request`: `cargo fmt --check`, `clippy -D
-      warnings`, `cargo test`, `docker build` without push. The Dockerfile
-      `tls` build context (`broker/rabbitmq/tls`) is a cross-repo dependency;
-      it disappears when `sqs-sns-adapter` MSG-NM-05 drops the lab CA.
-      **The `ARG INCLUDE_LAB_CA` proposal is OBSOLETE for AWS** (2026-10-17):
-      with SNS + SQS there is no lab CA to include. Depends on MSG-NM-05.
-- [ ] **CI-04** `deploy.yml` on push to `main` + `workflow_dispatch`:
-      `aws-actions/configure-aws-credentials` -> `amazon-ecr-login` ->
-      build and push `:${{ github.sha }}` -> `amazon-ecs-render-task-definition`
-      -> `amazon-ecs-deploy-task-definition` with `wait-for-service-stability`;
-      cluster `security-app-cluster-v2`, service `nmap-service`.
-- [ ] **CI-05** Docs: README section for CI/CD (secrets, refresh flow, how to
-      trigger a deploy, rollback by redeploying a previous SHA).
+- [x] **CI-01** Repo-owned `.aws/task-definition.json`: superseded by D1
+      (done-by-design). The task definition lives in Terraform.
+- [x] **CI-02** Messaging env vars in the task definition: superseded by D1
+      (done-by-design). Env comes from the Terraform task definition; code
+      changes stay in `sqs-sns-adapter`.
+- [x] **CI-03** `.github/workflows/ci.yml` on `pull_request` and push to
+      `develop`: `make verify` (fmt, clippy `-D warnings`, tests, ignored
+      integration suites, doc) and `docker build` without push or extra
+      build contexts. `actionlint` clean.
+- [x] **CI-04** `.github/workflows/deploy.yml` on push to `main` +
+      `workflow_dispatch`: configure-aws-credentials -> ECR login -> build and
+      push `:${{ github.sha }}` (+ `:latest`) -> download current task
+      definition -> render (image swap) -> deploy with
+      `wait-for-service-stability`; cluster `security-app-cluster-v2`,
+      service `nmap-service`.
+- [x] **CI-05** Docs: README CI/CD section (secrets, refresh flow, manual
+      redeploy, rollback, no-load-balancer stability note).
+
+## Decisions
+
+- D1 (2026-10-19, user, same as gateway): Terraform (`infra`) owns the task
+  definition (env, SSM secrets, roles, logging). CI owns only the image:
+  `deploy.yml` fetches the service's current task definition, strips read-only
+  fields with jq, swaps the image of container `nmap-service` to
+  `${{ github.sha }}` and deploys. Supersedes CI-01 and CI-02. `:latest` is
+  also pushed because the bootstrap task definition may point at it.
 
 ## Acceptance criteria
 
 - A pull request runs fmt, clippy, unit tests and a Docker build, all green,
   with no cross-repo checkout.
 - A merge to `main` pushes `:<sha>` to ECR, registers a new task definition
-  revision and the ECS service reaches a stable state.
+  revision (image swap only) and the ECS service reaches a stable state
+  (task stays RUNNING; no load balancer).
 - The running task consumes and publishes through SQS/SNS over HTTPS with the task role.
 - `docker compose` locally still works (with LocalStack, per `sqs-sns-adapter`).
 - `actionlint` reports no errors on both workflows.
 
 ## Checks
 
-- `make verify` (fmt, clippy, tests, doc).
+- `make verify` (fmt, clippy, tests, ignored integration suites, doc).
 - `actionlint .github/workflows/*.yml`.
 - `docker build` of the image without extra build contexts.
 - Post-deploy: `aws ecs describe-services` shows `runningCount == desiredCount`.
@@ -104,8 +114,24 @@ Out:
 
 ## Progress
 
-Planned. No task started.
+CI-01/02 superseded by D1. CI-03..05 implemented locally (workflows, README
+CI/CD section); local checks passed. Not committed yet. Live checks pending:
+green PR run and real deploy (need the user to open a PR / merge to `main`
+with repo secrets and variable set).
+
+## CI/CD evidence
+
+Route: delegated writer (single bounded writer). Strict TDD = observable checks first.
+
+- Baseline (before): `mise exec actionlint@1.7.12 shellcheck@latest -- actionlint .github/workflows/*.yml` -> `could not read ".github/workflows/*.yml": no such file or directory` (workflow dir absent).
+- After: same command -> clean, exit 0.
+- `make verify` -> exit 0.
+- `docker build -t nmap-service:ci-check .` -> exit 0; image removed afterwards.
+- `git status --short` -> ` M README.md`, `?? .github/` (plus this feature doc).
+- Pinned actions (full SHA, same as gateway): configure-aws-credentials v6.3.0, amazon-ecr-login v2.1.7, amazon-ecs-render-task-definition v1.9.1, amazon-ecs-deploy-task-definition v2.6.4, Swatinem/rust-cache v2.9.2; `actions/checkout@v4`.
+- Pending (needs user): green PR run of `ci.yml`; real `deploy.yml` rollout.
 
 ## Next step
 
-CI-01: move the task definition into `.aws/task-definition.json`.
+Commit (user), push and open a PR to verify CI live; run infra
+`refresh-gh-secrets.sh` before the first deploy.
