@@ -187,6 +187,39 @@ pub enum PublishError {
         /// Exchange contra el que se publicó el mensaje rechazado.
         exchange: &'static str,
     },
+
+    /// Fallo del SDK de AWS al publicar en un topic SNS. La causa original se
+    /// conserva (boxed) como `#[source]` sin acoplar este tipo al SDK.
+    #[error("fallo al publicar en el topic SNS '{topic}'")]
+    Sns {
+        /// ARN del topic al que se intentó publicar.
+        topic: String,
+        /// Error original del SDK.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Routing key de [`ScanOutcome::Started`] (transporte AMQP y atributo
+/// `routing_key` de SNS).
+pub const ROUTING_KEY_SCAN_OUTCOME_STARTED: &str = "scan.outcome.started";
+
+/// Routing key de [`ScanOutcome::Completed`].
+pub const ROUTING_KEY_SCAN_OUTCOME_COMPLETED: &str = "scan.outcome.completed";
+
+/// Routing key de [`ScanOutcome::Failed`].
+pub const ROUTING_KEY_SCAN_OUTCOME_FAILED: &str = "scan.outcome.failed";
+
+/// Devuelve la routing key que corresponde al `status` de `outcome`, común a
+/// todos los transportes. Exhaustivo sobre las variantes de [`ScanOutcome`]
+/// (sin rama comodín): si se añadiera una variante nueva, este `match` deja
+/// de compilar en vez de enrutarla silenciosamente mal.
+pub fn routing_key_for(outcome: &ScanOutcome) -> &'static str {
+    match outcome {
+        ScanOutcome::Started { .. } => ROUTING_KEY_SCAN_OUTCOME_STARTED,
+        ScanOutcome::Completed { .. } => ROUTING_KEY_SCAN_OUTCOME_COMPLETED,
+        ScanOutcome::Failed { .. } => ROUTING_KEY_SCAN_OUTCOME_FAILED,
+    }
 }
 
 /// Serializa un [`ScanOutcome`] al cuerpo de mensaje canónico (JSON UTF-8) que
@@ -581,5 +614,31 @@ mod tests {
             sample_result(),
         ));
         log_outcome_published(&ScanOutcome::failed(CorrelationId::from("c"), "x"));
+    }
+
+    #[test]
+    fn routing_key_for_maps_each_status_to_its_exact_contract_routing_key() {
+        use crate::domain::{CorrelationId, ScanResult};
+        use time::macros::datetime;
+
+        let result = ScanResult {
+            host: "192.0.2.10".parse().expect("IP de prueba válida"),
+            ports: Vec::new(),
+            vulnerabilities: Vec::new(),
+            scanned_at: datetime!(2026-08-27 12:30:00 UTC),
+        };
+
+        assert_eq!(
+            routing_key_for(&ScanOutcome::started(CorrelationId::from("c1"))),
+            ROUTING_KEY_SCAN_OUTCOME_STARTED
+        );
+        assert_eq!(
+            routing_key_for(&ScanOutcome::completed(CorrelationId::from("c2"), result)),
+            ROUTING_KEY_SCAN_OUTCOME_COMPLETED
+        );
+        assert_eq!(
+            routing_key_for(&ScanOutcome::failed(CorrelationId::from("c3"), "x")),
+            ROUTING_KEY_SCAN_OUTCOME_FAILED
+        );
     }
 }
