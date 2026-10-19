@@ -61,6 +61,11 @@ tokio-reactor-trait = "1"
 # sobre él en `RabbitMqScanRequestSource`/`RabbitMqScanCancellationSource` es
 # código de producción (`src/messaging/rabbitmq.rs`), no solo de test.
 futures-util = "0.3"
+# Adaptadores SQS (`src/messaging/sqs.rs`, MSG-NM-02). Mismas versiones mayores
+# que `gateway/Cargo.toml`. Credenciales: cadena por defecto de AWS (rol de la
+# tarea ECS), sin claves estáticas.
+aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-sdk-sqs = "1.114.0"
 
 [dev-dependencies]
 testcontainers = "0.24"

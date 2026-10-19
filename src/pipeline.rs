@@ -34,6 +34,7 @@
 //! `docs/security-scope.md`). [`ScanCancellation`] no lleva IP ni credenciales
 //! del escaneo original.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -42,7 +43,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::domain::{CorrelationId, ScanCancellation, ScanRequest, ScanResult, VulnFinding};
 use crate::enrichment::VulnEnricher;
-use crate::messaging::consumer::{ConsumeError, ScanCancellationSource, ScanRequestSource};
+use crate::messaging::consumer::{
+    ConsumeError, IncomingScanRequest, ScanCancellationSource, ScanRequestSource,
+};
 use crate::messaging::publisher::{ScanOutcome, ScanResultSink};
 use crate::parser;
 use crate::repository::ScanResultRepository;
@@ -67,7 +70,9 @@ struct CancellationRegistry {
 }
 
 impl CancellationRegistry {
-    /// Registra una nueva tarea y devuelve su token de cancelación.
+    /// Registra una nueva tarea y devuelve su token de cancelación
+    /// (sobrescribe un registro previo; el pipeline usa [`try_register`](Self::try_register)).
+    #[cfg(test)]
     fn register(&self, correlation_id: CorrelationId) -> CancellationToken {
         let token = CancellationToken::new();
         let mut guard = match self.tokens.lock() {
@@ -76,6 +81,24 @@ impl CancellationRegistry {
         };
         guard.insert(correlation_id, token.clone());
         token
+    }
+
+    /// Registra una nueva tarea solo si `correlation_id` no está ya en vuelo
+    /// en esta réplica. Devuelve `None` (sin tocar el registro existente) si
+    /// ya hay una tarea registrada con ese identificador.
+    fn try_register(&self, correlation_id: CorrelationId) -> Option<CancellationToken> {
+        let mut guard = match self.tokens.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.entry(correlation_id) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(slot) => {
+                let token = CancellationToken::new();
+                slot.insert(token.clone());
+                Some(token)
+            }
+        }
     }
 
     /// Retira el registro de una tarea que ya terminó (éxito, fallo o
@@ -217,7 +240,25 @@ impl ScanPipeline {
     /// trabajo en el próximo punto de espera async y se publica
     /// [`ScanOutcome::Failed`] con un motivo que da constancia explícita de
     /// la cancelación, en vez del desenlace normal.
-    pub async fn process_one(&self, request: ScanRequest) {
+    ///
+    /// # Valor de retorno
+    ///
+    /// `true` si el desenlace terminal quedó publicado (el mensaje de origen se
+    /// puede confirmar/borrar); `false` si la publicación falló o si la
+    /// solicitud se omitió por estar ya en vuelo en esta réplica (en ambos casos
+    /// el mensaje debe quedar en la cola para su reentrega).
+    ///
+    /// # Idempotencia por `correlation_id`
+    ///
+    /// - Ya en vuelo en esta réplica: se omite (`false`) sin tocar el registro
+    ///   del escaneo original.
+    /// - Ya terminado (documento guardado en el repositorio): se republica un
+    ///   [`ScanOutcome::Completed`] con el resultado guardado, sin `Started` y
+    ///   sin reescanear. Solo los escaneos exitosos se persisten, así que un
+    ///   escaneo que terminó en `Failed` y cuyo mensaje se reentrega (porque
+    ///   falló la publicación) se vuelve a escanear: es el único desenlace que
+    ///   el repositorio no puede reconstruir.
+    pub async fn process_one(&self, request: ScanRequest) -> bool {
         let correlation_id = request.correlation_id.clone();
         tracing::info!(
             correlation_id = %correlation_id,
@@ -225,7 +266,43 @@ impl ScanPipeline {
             "pipeline de escaneo iniciado"
         );
 
-        let token = self.cancellations.register(correlation_id.clone());
+        // Idempotencia (1/2): el mismo `correlation_id` ya está en vuelo en
+        // esta réplica. No se confirma el mensaje: reaparecerá al vencer su
+        // visibilidad y entonces caerá en el camino de "escaneo terminado".
+        let Some(token) = self.cancellations.try_register(correlation_id.clone()) else {
+            tracing::warn!(
+                correlation_id = %correlation_id,
+                "solicitud duplicada de un escaneo en curso; se omite sin confirmar"
+            );
+            return false;
+        };
+
+        // Idempotencia (2/2): el escaneo ya terminó (redelivery tras fallar la
+        // publicación o el borrado). Se republica su desenlace y no se
+        // reescanea. Un fallo de la consulta no bloquea: se escanea igual
+        // (`save` es un upsert, nunca duplica el documento).
+        match self
+            .repository
+            .find_by_correlation_id(&correlation_id)
+            .await
+        {
+            Ok(Some(result)) => {
+                tracing::info!(
+                    correlation_id = %correlation_id,
+                    "escaneo ya terminado para este correlation_id; se republica su desenlace"
+                );
+                self.cancellations.unregister(&correlation_id);
+                return self
+                    .publish_terminal(&ScanOutcome::completed(correlation_id, result))
+                    .await;
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                correlation_id = %correlation_id,
+                error = %err,
+                "no se pudo consultar si el escaneo ya terminó; se escanea igual"
+            ),
+        }
 
         if let Err(err) = self
             .sink
@@ -262,18 +339,50 @@ impl ScanPipeline {
 
         self.cancellations.unregister(&correlation_id);
 
+        self.publish_terminal(&outcome).await
+    }
+
+    /// Publica el desenlace terminal y devuelve si el broker lo aceptó.
+    async fn publish_terminal(&self, outcome: &ScanOutcome) -> bool {
+        let correlation_id = outcome.correlation_id();
         let status = outcome.status_label();
-        match self.sink.publish(&outcome).await {
-            Ok(()) => tracing::info!(
-                correlation_id = %correlation_id,
-                status,
-                "pipeline de escaneo finalizado; desenlace publicado"
-            ),
-            Err(err) => tracing::error!(
-                correlation_id = %correlation_id,
-                error = %err,
-                "no se pudo publicar el desenlace del escaneo; se descarta"
-            ),
+        match self.sink.publish(outcome).await {
+            Ok(()) => {
+                tracing::info!(
+                    correlation_id = %correlation_id,
+                    status,
+                    "pipeline de escaneo finalizado; desenlace publicado"
+                );
+                true
+            }
+            Err(err) => {
+                tracing::error!(
+                    correlation_id = %correlation_id,
+                    error = %err,
+                    "no se pudo publicar el desenlace del escaneo; el mensaje no se confirma \
+                     y se reentregará"
+                );
+                false
+            }
+        }
+    }
+
+    /// Procesa una solicitud entrante y, solo si [`process_one`](Self::process_one)
+    /// terminó **y** su desenlace terminal se publicó, confirma (borra) el
+    /// mensaje de la cola. Un fallo del ack se registra (sin cuerpo ni
+    /// credenciales) y no es fatal: el mensaje se reentregará y el camino de
+    /// idempotencia lo resolverá sin reescanear.
+    async fn handle_incoming(&self, incoming: IncomingScanRequest) {
+        let IncomingScanRequest { request, ack } = incoming;
+        let correlation_id = request.correlation_id.clone();
+        if self.process_one(request).await {
+            if let Err(err) = ack.ack().await {
+                tracing::error!(
+                    correlation_id = %correlation_id,
+                    error = %err,
+                    "no se pudo confirmar el mensaje ya procesado; se reentregará"
+                );
+            }
         }
     }
 
@@ -372,7 +481,7 @@ impl ScanPipeline {
 
         while let Some(request) = next_valid_request(source.as_ref()).await {
             let pipeline = self.clone();
-            tasks.spawn(async move { pipeline.process_one(request).await });
+            tasks.spawn(async move { pipeline.handle_incoming(request).await });
         }
 
         while let Some(joined) = tasks.join_next().await {
@@ -408,10 +517,10 @@ impl ScanPipeline {
 ///
 /// Los mensajes malformados o con esquema inválido se descartan con
 /// `tracing::warn!` y no interrumpen el consumo.
-async fn next_valid_request(source: &dyn ScanRequestSource) -> Option<ScanRequest> {
+async fn next_valid_request(source: &dyn ScanRequestSource) -> Option<IncomingScanRequest> {
     loop {
         match source.next_request().await {
-            Ok(Some(incoming)) => return Some(incoming.request),
+            Ok(Some(incoming)) => return Some(incoming),
             Ok(None) => return None,
             Err(err @ (ConsumeError::MalformedPayload(_) | ConsumeError::InvalidSchema(_))) => {
                 tracing::warn!(error = %err, "solicitud del Broker descartada; se continúa");
@@ -492,8 +601,8 @@ mod tests {
     use crate::domain::{CorrelationId, PortFinding, Severity, SshCredentialsRef, VulnSource};
     use crate::enrichment::EnrichError;
     use crate::messaging::consumer::{
-        InMemoryScanCancellationSource, InMemoryScanRequestSource, IncomingScanRequest,
-        ScanCancellationSource,
+        AckError, Acknowledger, InMemoryScanCancellationSource, InMemoryScanRequestSource,
+        IncomingScanRequest, ScanCancellationSource,
     };
     use crate::messaging::publisher::InMemoryScanResultSink;
     use crate::parser::ParseError;
@@ -526,11 +635,11 @@ mod tests {
         ]);
 
         let first = next_valid_request(&source).await.expect("primera válida");
-        assert_eq!(first.correlation_id.as_str(), "corr-1");
+        assert_eq!(first.request.correlation_id.as_str(), "corr-1");
 
         // El mensaje envenenado se descarta y se entrega la siguiente válida.
         let second = next_valid_request(&source).await.expect("segunda válida");
-        assert_eq!(second.correlation_id.as_str(), "corr-2");
+        assert_eq!(second.request.correlation_id.as_str(), "corr-2");
 
         assert!(next_valid_request(&source).await.is_none());
     }
@@ -783,7 +892,7 @@ mod tests {
             _result: &ScanResult,
             _correlation_id: &CorrelationId,
         ) -> Result<ScanId, RepoError> {
-            unreachable!("repository no debe llamarse si la etapa SSH falló")
+            unreachable!("repository.save no debe llamarse si la etapa SSH falló")
         }
 
         async fn find_by_id(&self, _id: &ScanId) -> Result<Option<ScanResult>, RepoError> {
@@ -794,7 +903,9 @@ mod tests {
             &self,
             _correlation_id: &CorrelationId,
         ) -> Result<Option<ScanResult>, RepoError> {
-            unreachable!()
+            // La consulta de idempotencia previa al escaneo siempre se hace;
+            // "sin escaneo terminado previo" es el caso normal.
+            Ok(None)
         }
     }
 
@@ -1219,5 +1330,291 @@ mod tests {
             published[1].correlation_id().as_str(),
             "corr-run-with-cancellations"
         );
+    }
+
+    // --- MSG-NM-02: borrado tras el desenlace terminal e idempotencia ---
+
+    /// [`Acknowledger`] que cuenta cuántas veces se confirmó el mensaje.
+    #[derive(Debug, Clone, Default)]
+    struct RecordingAck(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl RecordingAck {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Acknowledger for RecordingAck {
+        async fn ack(&self) -> Result<(), AckError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn incoming_with_ack(correlation_id: &str, ack: &RecordingAck) -> IncomingScanRequest {
+        IncomingScanRequest::with_ack(test_request(correlation_id), Arc::new(ack.clone()))
+    }
+
+    /// [`ScanResultSink`] que falla siempre al publicar.
+    struct AlwaysFailingSink;
+
+    #[async_trait::async_trait]
+    impl ScanResultSink for AlwaysFailingSink {
+        async fn publish(
+            &self,
+            _outcome: &ScanOutcome,
+        ) -> Result<(), crate::messaging::publisher::PublishError> {
+            Err(crate::messaging::publisher::PublishError::Transport(
+                "fallo simulado de transporte".to_owned(),
+            ))
+        }
+    }
+
+    /// [`RemoteExecutor`] que no debe invocarse (el escaneo no debe ocurrir).
+    struct ForbiddenExecutor;
+
+    #[async_trait::async_trait]
+    impl RemoteExecutor for ForbiddenExecutor {
+        async fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            _user: &str,
+            _credentials: &SshCredentialsRef,
+            _store: &Arc<dyn HostKeyStore>,
+            _timeouts: SshTimeouts,
+        ) -> Result<Box<dyn RemoteSession>, SshError> {
+            panic!("no debe volver a escanear una solicitud ya terminada o en vuelo")
+        }
+    }
+
+    /// Repositorio cuya consulta por `correlation_id` devuelve un resultado
+    /// fijo (o un error), como si el escaneo ya estuviera guardado.
+    struct LookupRepository(Result<Option<ScanResult>, String>);
+
+    #[async_trait::async_trait]
+    impl ScanResultRepository for LookupRepository {
+        async fn save(
+            &self,
+            _result: &ScanResult,
+            _correlation_id: &CorrelationId,
+        ) -> Result<ScanId, RepoError> {
+            unreachable!("la consulta de idempotencia no guarda")
+        }
+
+        async fn find_by_id(&self, _id: &ScanId) -> Result<Option<ScanResult>, RepoError> {
+            unreachable!()
+        }
+
+        async fn find_by_correlation_id(
+            &self,
+            _correlation_id: &CorrelationId,
+        ) -> Result<Option<ScanResult>, RepoError> {
+            self.0.clone().map_err(RepoError::ConnectionFailed)
+        }
+    }
+
+    fn stored_result() -> ScanResult {
+        ScanResult {
+            host: "198.51.100.7".parse().expect("IP de prueba válida"),
+            ports: Vec::new(),
+            vulnerabilities: Vec::new(),
+            scanned_at: time::macros::datetime!(2026-08-27 12:30:00 UTC),
+        }
+    }
+
+    fn pipeline_with(
+        executor: Arc<dyn RemoteExecutor>,
+        repository: Arc<dyn ScanResultRepository>,
+        sink: Arc<dyn ScanResultSink>,
+    ) -> ScanPipeline {
+        ScanPipeline::new(
+            ServicePorts {
+                executor,
+                scanner: Arc::new(UnusedScanner),
+                repository,
+                enricher: Arc::new(StubEnricher(Vec::new())),
+                host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+                sink,
+            },
+            test_config(),
+        )
+    }
+
+    #[tokio::test]
+    async fn message_is_acked_only_after_the_terminal_outcome_was_published() {
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = pipeline_with(
+            Arc::new(FailingExecutor),
+            Arc::new(UnusedRepository),
+            sink.clone(),
+        );
+        let ack = RecordingAck::default();
+
+        pipeline
+            .handle_incoming(incoming_with_ack("corr-ack-ok", &ack))
+            .await;
+
+        assert_eq!(sink.published().len(), 2, "started + terminal");
+        assert_eq!(ack.count(), 1, "se borra tras publicar el desenlace");
+    }
+
+    #[tokio::test]
+    async fn message_is_not_acked_when_the_terminal_publish_fails() {
+        let pipeline = pipeline_with(
+            Arc::new(FailingExecutor),
+            Arc::new(UnusedRepository),
+            Arc::new(AlwaysFailingSink),
+        );
+        let ack = RecordingAck::default();
+
+        pipeline
+            .handle_incoming(incoming_with_ack("corr-ack-publish-fails", &ack))
+            .await;
+
+        assert_eq!(
+            ack.count(),
+            0,
+            "sin desenlace publicado SQS debe reentregar"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_in_flight_is_skipped_without_ack_and_keeps_the_original_registered() {
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = pipeline_with(
+            Arc::new(ForbiddenExecutor),
+            Arc::new(UnusedRepository),
+            sink.clone(),
+        );
+        let id = CorrelationId::from("corr-in-flight");
+        let original = pipeline.cancellations.register(id.clone());
+        let ack = RecordingAck::default();
+
+        pipeline
+            .handle_incoming(incoming_with_ack(id.as_str(), &ack))
+            .await;
+
+        assert_eq!(ack.count(), 0, "el duplicado reaparece tras la visibilidad");
+        assert!(sink.published().is_empty(), "no publica nada del duplicado");
+        assert!(
+            pipeline.cancellations.cancel(&id) && original.is_cancelled(),
+            "el escaneo original sigue registrado y cancelable"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_scan_redelivery_republishes_the_stored_outcome_without_rescanning() {
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = pipeline_with(
+            Arc::new(ForbiddenExecutor),
+            Arc::new(LookupRepository(Ok(Some(stored_result())))),
+            sink.clone(),
+        );
+        let ack = RecordingAck::default();
+
+        pipeline
+            .handle_incoming(incoming_with_ack("corr-finished", &ack))
+            .await;
+
+        let published = sink.published();
+        assert_eq!(published.len(), 1, "solo el terminal, sin started");
+        match &published[0] {
+            ScanOutcome::Completed {
+                correlation_id,
+                result,
+            } => {
+                assert_eq!(correlation_id.as_str(), "corr-finished");
+                assert_eq!(result, &stored_result());
+            }
+            other => panic!("se esperaba Completed, se obtuvo {other:?}"),
+        }
+        assert_eq!(ack.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn finished_scan_republish_failure_keeps_the_message() {
+        let pipeline = pipeline_with(
+            Arc::new(ForbiddenExecutor),
+            Arc::new(LookupRepository(Ok(Some(stored_result())))),
+            Arc::new(AlwaysFailingSink),
+        );
+        let ack = RecordingAck::default();
+
+        pipeline
+            .handle_incoming(incoming_with_ack("corr-finished-flaky", &ack))
+            .await;
+
+        assert_eq!(ack.count(), 0);
+        assert!(
+            !pipeline
+                .cancellations
+                .cancel(&CorrelationId::from("corr-finished-flaky")),
+            "no queda registrado tras terminar"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_lookup_failure_falls_back_to_scanning() {
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = pipeline_with(
+            Arc::new(FailingExecutor),
+            Arc::new(LookupRepository(Err("mongo caído".to_owned()))),
+            sink.clone(),
+        );
+        let ack = RecordingAck::default();
+
+        pipeline
+            .handle_incoming(incoming_with_ack("corr-lookup-fails", &ack))
+            .await;
+
+        assert_eq!(sink.published().len(), 2, "se escaneó (started + Failed)");
+        assert_eq!(ack.count(), 1);
+    }
+
+    /// Fuente que entrega solicitudes con un [`RecordingAck`] por cada una.
+    struct AckingSource {
+        queue: Mutex<Vec<IncomingScanRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ScanRequestSource for AckingSource {
+        async fn next_request(&self) -> Result<Option<IncomingScanRequest>, ConsumeError> {
+            Ok(self.queue.lock().expect("lock").pop())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_acks_each_request_after_its_terminal_outcome() {
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = pipeline_with(
+            Arc::new(FailingExecutor),
+            Arc::new(UnusedRepository),
+            sink.clone(),
+        );
+        let ack_a = RecordingAck::default();
+        let ack_b = RecordingAck::default();
+        let source = Arc::new(AckingSource {
+            queue: Mutex::new(vec![
+                incoming_with_ack("corr-run-a", &ack_a),
+                incoming_with_ack("corr-run-b", &ack_b),
+            ]),
+        });
+
+        pipeline
+            .run(source, Arc::new(InMemoryScanCancellationSource::default()))
+            .await;
+
+        assert_eq!(ack_a.count(), 1);
+        assert_eq!(ack_b.count(), 1);
+        assert_eq!(sink.published().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn in_memory_sources_ack_is_a_noop() {
+        let incoming = IncomingScanRequest::new(test_request("corr-noop-ack"));
+
+        incoming.ack().await.expect("el ack por defecto no falla");
     }
 }

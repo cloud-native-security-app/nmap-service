@@ -133,6 +133,20 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
    aceptó), y sin declarar topología (las colas/exchanges los declara el
    `broker`, ver "Qué NO hacer"). El patrón es el mismo que ya resolvió
    `gateway::broker`.
+
+   El submódulo `sqs` (MSG-NM-02, aún sin cablear hasta MSG-NM-04) añade
+   `SqsScanRequestSource` y `SqsScanCancellationSource` sobre `aws-sdk-sqs`
+   (long poll de 20 s, backoff 1–30 s dentro del adaptador, malformados a la DLQ
+   con `SendMessage` explícito). **Cambio de forma del puerto**:
+   `IncomingScanRequest` porta ahora un `Arc<dyn Acknowledger>` (`ack`, en SQS
+   `DeleteMessage`) además de la `ScanRequest`; `ScanPipeline::process_one`
+   devuelve `bool` (¿desenlace terminal publicado?) y el pipeline confirma el
+   mensaje solo cuando es `true` (borrado tras manejar). Las fuentes en memoria
+   y RabbitMQ usan un ack no-op. **Idempotencia por `correlation_id`**: una
+   solicitud ya en vuelo en la réplica se omite sin ack; una ya terminada
+   (documento en `scan_results`) republica su `Completed` sin reescanear;
+   `MongoRepository::save` es un upsert con índice único sobre `correlation_id`
+   (creado de forma idempotente en `connect`).
 9. **`pipeline` (`src/pipeline.rs`)** — orquesta
    `consumer -> ssh -> scanner -> parser -> enrichment -> repository -> publisher`
    en `ScanPipeline`, construido a partir de los puertos inyectados

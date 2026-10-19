@@ -436,3 +436,75 @@ async fn nvd_cache_store_updates_the_ttl_via_collmod_when_the_ttl_changes() {
     let expire_after = nvd_cache_ttl_index_expire_after_seconds(&container).await;
     assert_eq!(expire_after, Some(Duration::from_secs(120)));
 }
+
+// --- MSG-NM-02: idempotencia por correlation_id ---
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn saving_twice_with_the_same_correlation_id_leaves_a_single_document() {
+    let container = start_mongo().await;
+    let repo = connect(&container).await;
+    let correlation_id = CorrelationId::new("corr-upsert");
+
+    let first_id = repo
+        .save(&sample_result(), &correlation_id)
+        .await
+        .expect("primer save");
+    let mut updated = sample_result();
+    updated.ports.truncate(1);
+    let second_id = repo
+        .save(&updated, &correlation_id)
+        .await
+        .expect("el segundo save no debe chocar con el índice único");
+
+    assert_eq!(first_id, second_id, "el upsert conserva el mismo documento");
+
+    let client = mongodb::Client::with_uri_str(&uri(&container).await)
+        .await
+        .expect("cliente raw");
+    let raw: mongodb::Collection<Document> = client.database(TEST_DB).collection("scan_results");
+    let count = raw
+        .count_documents(doc! { "correlation_id": "corr-upsert" })
+        .await
+        .expect("count");
+    assert_eq!(count, 1, "un reintento no crea un segundo documento");
+
+    let found = repo
+        .find_by_correlation_id(&correlation_id)
+        .await
+        .expect("find")
+        .expect("existe");
+    assert_eq!(found.ports.len(), 1, "queda el último resultado guardado");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn connect_creates_an_idempotent_unique_index_on_correlation_id() {
+    let container = start_mongo().await;
+    let _first = connect(&container).await;
+    // Segundo arranque: la creación del índice debe ser idempotente.
+    let _second = connect(&container).await;
+
+    let client = mongodb::Client::with_uri_str(&uri(&container).await)
+        .await
+        .expect("cliente raw");
+    let raw: mongodb::Collection<Document> = client.database(TEST_DB).collection("scan_results");
+    let mut cursor = raw.list_indexes().await.expect("listIndexes");
+    let mut found_unique = false;
+    while cursor.advance().await.expect("avanzar el cursor") {
+        let index: IndexModel = cursor.deserialize_current().expect("IndexModel");
+        let on_correlation_id = index.keys == doc! { "correlation_id": 1 };
+        let unique = index
+            .options
+            .as_ref()
+            .and_then(|options| options.unique)
+            .unwrap_or(false);
+        if on_correlation_id && unique {
+            found_unique = true;
+        }
+    }
+    assert!(
+        found_unique,
+        "debe existir un índice único sobre correlation_id"
+    );
+}
