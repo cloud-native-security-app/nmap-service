@@ -37,6 +37,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -470,24 +471,83 @@ impl ScanPipeline {
         source: Arc<dyn ScanRequestSource>,
         cancellations: Arc<dyn ScanCancellationSource>,
     ) {
+        self.run_until_shutdown(
+            source,
+            cancellations,
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await;
+    }
+
+    /// Igual que [`run`](Self::run), pero con apagado ordenado: al cancelarse
+    /// `shutdown` deja de pedir solicitudes y cancelaciones (el long poll en
+    /// curso se descarta de inmediato), espera hasta `drain_timeout` a que
+    /// terminen los escaneos en vuelo y aborta los que sigan corriendo.
+    ///
+    /// Un escaneo en vuelo que termina dentro del plazo publica su desenlace
+    /// terminal y confirma (borra) su mensaje como siempre. Uno abortado no
+    /// confirma nada: su mensaje reaparece en la cola al vencer el
+    /// `VisibilityTimeout` y se reprocesa (idempotencia por `correlation_id`).
+    /// Un mensaje que el long poll descartado ya hubiera recibido sigue el mismo
+    /// camino. Con `shutdown` sin cancelar se comporta exactamente como `run`.
+    pub async fn run_until_shutdown(
+        &self,
+        source: Arc<dyn ScanRequestSource>,
+        cancellations: Arc<dyn ScanCancellationSource>,
+        shutdown: CancellationToken,
+        drain_timeout: Duration,
+    ) {
         let mut tasks: JoinSet<()> = JoinSet::new();
 
         let pipeline_for_cancellations = self.clone();
+        let cancellations_shutdown = shutdown.clone();
         tasks.spawn(async move {
-            while let Some(cancellation) = next_valid_cancellation(cancellations.as_ref()).await {
-                pipeline_for_cancellations.apply_cancellation(&cancellation);
+            loop {
+                let next = tokio::select! {
+                    () = cancellations_shutdown.cancelled() => break,
+                    next = next_valid_cancellation(cancellations.as_ref()) => next,
+                };
+                match next {
+                    Some(cancellation) => {
+                        pipeline_for_cancellations.apply_cancellation(&cancellation);
+                    }
+                    None => break,
+                }
             }
         });
 
-        while let Some(request) = next_valid_request(source.as_ref()).await {
+        loop {
+            let next = tokio::select! {
+                () = shutdown.cancelled() => break,
+                next = next_valid_request(source.as_ref()) => next,
+            };
+            let Some(request) = next else { break };
             let pipeline = self.clone();
             tasks.spawn(async move { pipeline.handle_incoming(request).await });
         }
 
-        while let Some(joined) = tasks.join_next().await {
-            if let Err(err) = joined {
-                tracing::error!(error = %err, "una tarea de escaneo no terminó limpiamente");
-            }
+        if !shutdown.is_cancelled() {
+            join_all(&mut tasks).await;
+            return;
+        }
+
+        tracing::info!(
+            in_flight = tasks.len(),
+            drain_timeout_secs = drain_timeout.as_secs(),
+            "apagado: se dejó de consumir; se espera a los escaneos en vuelo"
+        );
+        if tokio::time::timeout(drain_timeout, join_all(&mut tasks))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                aborted = tasks.len(),
+                "apagado: escaneos aún en curso tras el plazo; se abortan y sus mensajes \
+                 reaparecerán en la cola"
+            );
+            tasks.abort_all();
+            join_all(&mut tasks).await;
         }
     }
 
@@ -507,6 +567,18 @@ impl ScanPipeline {
                 requested_by = %cancellation.requested_by,
                 "cancelación recibida para un escaneo desconocido o ya finalizado; no-op"
             );
+        }
+    }
+}
+
+/// Espera a que terminen todas las tareas de `tasks`, registrando las que no
+/// terminaron limpiamente (las abortadas por el apagado no son un error).
+async fn join_all(tasks: &mut JoinSet<()>) {
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(err) = joined {
+            if !err.is_cancelled() {
+                tracing::error!(error = %err, "una tarea de escaneo no terminó limpiamente");
+            }
         }
     }
 }
@@ -1609,6 +1681,190 @@ mod tests {
         assert_eq!(ack_a.count(), 1);
         assert_eq!(ack_b.count(), 1);
         assert_eq!(sink.published().len(), 4);
+    }
+
+    // --- MSG-NM-04: apagado ordenado ---
+
+    /// Fuente cuyo long poll nunca termina por sí solo (como un `ReceiveMessage`
+    /// sin mensajes).
+    struct PendingSource;
+
+    #[async_trait::async_trait]
+    impl ScanRequestSource for PendingSource {
+        async fn next_request(&self) -> Result<Option<IncomingScanRequest>, ConsumeError> {
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScanCancellationSource for PendingSource {
+        async fn next_cancellation(&self) -> Result<Option<ScanCancellation>, ConsumeError> {
+            std::future::pending().await
+        }
+    }
+
+    /// Entrega una única solicitud y luego se queda esperando (long poll vacío).
+    struct OneThenPendingSource(Mutex<Option<IncomingScanRequest>>);
+
+    #[async_trait::async_trait]
+    impl ScanRequestSource for OneThenPendingSource {
+        async fn next_request(&self) -> Result<Option<IncomingScanRequest>, ConsumeError> {
+            let next = self.0.lock().expect("lock").take();
+            match next {
+                Some(incoming) => Ok(Some(incoming)),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Ejecutor que avisa (`started`) al empezar, espera `release` y falla con
+    /// `AuthFailed` (desenlace terminal `Failed`, suficiente para el ack).
+    struct GatedExecutor {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExecutor for GatedExecutor {
+        async fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            _user: &str,
+            _credentials: &SshCredentialsRef,
+            _store: &Arc<dyn HostKeyStore>,
+            _timeouts: SshTimeouts,
+        ) -> Result<Box<dyn RemoteSession>, SshError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Err(SshError::AuthFailed)
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_request_loop_promptly_while_the_long_poll_is_pending() {
+        let pipeline = pipeline_with(
+            Arc::new(FailingExecutor),
+            Arc::new(UnusedRepository),
+            Arc::new(InMemoryScanResultSink::new()),
+        );
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                pipeline
+                    .run_until_shutdown(
+                        Arc::new(PendingSource),
+                        Arc::new(PendingSource),
+                        shutdown,
+                        Duration::from_secs(30),
+                    )
+                    .await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !run.is_finished(),
+            "sigue consumiendo mientras no hay señal"
+        );
+
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("el bucle debe parar de inmediato, sin esperar al long poll")
+            .expect("sin panic");
+    }
+
+    #[tokio::test]
+    async fn shutdown_lets_an_in_flight_scan_finish_publish_and_ack() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = pipeline_with(
+            Arc::new(GatedExecutor {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            Arc::new(UnusedRepository),
+            sink.clone(),
+        );
+        let ack = RecordingAck::default();
+        let source = Arc::new(OneThenPendingSource(Mutex::new(Some(incoming_with_ack(
+            "corr-drain",
+            &ack,
+        )))));
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                pipeline
+                    .run_until_shutdown(
+                        source,
+                        Arc::new(PendingSource),
+                        shutdown,
+                        Duration::from_secs(30),
+                    )
+                    .await;
+            }
+        });
+        started.notified().await;
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!run.is_finished(), "espera al escaneo en vuelo");
+        assert_eq!(ack.count(), 0);
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("termina al acabar el escaneo")
+            .expect("sin panic");
+
+        assert_eq!(ack.count(), 1, "se borra tras el desenlace terminal");
+        assert_eq!(sink.published().len(), 2, "started + Failed");
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_scans_still_running_after_the_drain_timeout_without_acking() {
+        let started = Arc::new(Notify::new());
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = pipeline_with(
+            Arc::new(SlowExecutor {
+                started: started.clone(),
+            }),
+            Arc::new(UnusedRepository),
+            sink.clone(),
+        );
+        let ack = RecordingAck::default();
+        let source = Arc::new(OneThenPendingSource(Mutex::new(Some(incoming_with_ack(
+            "corr-abort",
+            &ack,
+        )))));
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                pipeline
+                    .run_until_shutdown(
+                        source,
+                        Arc::new(PendingSource),
+                        shutdown,
+                        Duration::from_millis(200),
+                    )
+                    .await;
+            }
+        });
+        started.notified().await;
+
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("tras el timeout de drenado el run debe volver")
+            .expect("sin panic");
+        assert_eq!(ack.count(), 0, "sin desenlace terminal no hay ack");
+        assert_eq!(sink.published().len(), 1, "solo started: el SQS reentrega");
     }
 
     #[tokio::test]

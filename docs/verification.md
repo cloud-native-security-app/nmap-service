@@ -44,6 +44,9 @@ se documenta con `#[allow(...)]` y un comentario explicando por qué.
   un laboratorio controlado — ver `docs/security-scope.md`.
 - `repository`: contra el contenedor MongoDB oficial levantado vía
   `testcontainers`, nunca contra `db-nmap` de producción.
+- `messaging` (`sqs`, `sns`): contra un LocalStack real (`localstack/localstack:4.4`)
+  levantado vía `testcontainers`, nunca contra una cuenta AWS ni con mocks del
+  SDK; el arnés común está en `tests/common/mod.rs`.
 - `parser`: contra fixtures de XML real guardadas en `tests/fixtures/`, no
   contra XML inventado a mano que no representa la salida real de `nmap`.
 - Todo test de esta categoría se marca `#[ignore = "requiere Docker"]` (ver

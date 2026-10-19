@@ -1,5 +1,5 @@
 //! Carga y validación de la configuración del servicio desde variables de
-//! entorno (URI de MongoDB, endpoint/credenciales del Broker, timeouts SSH).
+//! entorno (URI de MongoDB, colas SQS y topic SNS, timeouts SSH).
 //!
 //! La lectura del entorno del proceso ([`Config::from_env`]) se separa de la
 //! lógica de validación (`Config::from_source`, privada) para poder testear
@@ -25,25 +25,6 @@ pub const MONGO_DB_VAR: &str = "MS_NMAP_MONGO_DB";
 /// (todos los objetivos de un mismo entorno escuchan SSH en el mismo puerto).
 /// Se expresa como un entero `1..=65535`.
 pub const SSH_PORT_VAR: &str = "MS_NMAP_SSH_PORT";
-
-/// Nombre de la variable de entorno con el endpoint del Broker.
-pub const BROKER_ENDPOINT_VAR: &str = "MS_NMAP_BROKER_ENDPOINT";
-
-/// Nombre de la variable de entorno con la credencial (token/password) de
-/// acceso al Broker. Su valor se trata como secreto (ver `docs/security-scope.md`).
-pub const BROKER_CREDENTIAL_VAR: &str = "MS_NMAP_BROKER_CREDENTIAL";
-
-/// Nombre de la variable de entorno con el vhost de RabbitMQ al que se conecta
-/// el servicio (p. ej. `security-app`, ver `broker/rabbitmq/definitions.json`
-/// en el repo hermano `broker`).
-///
-/// Añadida por la feature `broker_adapter`: [`BROKER_ENDPOINT_VAR`] no lo
-/// incluye (es solo `esquema://host:puerto`, sin vhost ni credenciales — ver
-/// [`Config::broker_endpoint`]), así que hace falta una variable propia para
-/// terminar de construir la URI AMQPS. Sin valor por defecto, como el resto de
-/// variables de despliegue de este módulo (nunca un vhost de producción
-/// hardcodeado en el código).
-pub const BROKER_VHOST_VAR: &str = "MS_NMAP_BROKER_VHOST";
 
 /// Nombre de la variable de entorno con el timeout de establecimiento de la
 /// conexión SSH, expresado en segundos enteros.
@@ -164,9 +145,11 @@ pub enum ConfigError {
 /// valores provienen del entorno; el código no hardcodea URIs, endpoints ni
 /// timeouts de negocio.
 ///
-/// El campo [`Config::broker_credential`] es un [`SecretString`]: su contenido
-/// se redacta al formatear la struct con `Debug`, de modo que no puede
-/// filtrarse por accidente vía `tracing::debug!`/`error!` ni en un panic.
+/// Los secretos ([`Config::nvd_api_key`]) son [`SecretString`]: su contenido
+/// se redacta al formatear la struct con `Debug`, de modo que no pueden
+/// filtrarse por accidente vía `tracing::debug!`/`error!` ni en un panic. Las
+/// credenciales de AWS no pasan por aquí: salen de la cadena de proveedores por
+/// defecto del SDK (rol de la tarea ECS).
 #[derive(Debug)]
 pub struct Config {
     /// URI de conexión a MongoDB (`db-nmap`).
@@ -175,21 +158,6 @@ pub struct Config {
     pub mongo_db: String,
     /// Puerto SSH del objetivo (`1..=65535`).
     pub ssh_port: u16,
-    /// Endpoint del Broker (cola de mensajes) al que se conecta el servicio.
-    ///
-    /// Forma esperada: `esquema://host:puerto` (p. ej.
-    /// `amqps://broker.lab:5671`), sin userinfo ni vhost — el adaptador real
-    /// ([`crate::messaging::rabbitmq`], feature `broker_adapter`) ignora el
-    /// esquema recibido (siempre conecta por AMQPS, nunca AMQP en claro) y le
-    /// añade el usuario RabbitMQ fijo del servicio (`ms-nmap`, fijado por la
-    /// topología del Broker, no una credencial), [`Config::broker_credential`]
-    /// y [`Config::broker_vhost`].
-    pub broker_endpoint: String,
-    /// Credencial de acceso al Broker. Contenido redactado en `Debug`.
-    pub broker_credential: SecretString,
-    /// Vhost de RabbitMQ al que se conecta el servicio. Ver
-    /// [`BROKER_VHOST_VAR`].
-    pub broker_vhost: String,
     /// Timeout para establecer la conexión SSH con el objetivo.
     pub ssh_connect_timeout: Duration,
     /// Timeout para la ejecución de un comando remoto sobre la sesión SSH.
@@ -235,8 +203,7 @@ impl Config {
     ///
     /// - [`ConfigError::MissingVar`] si falta (o está vacía) una variable
     ///   requerida: [`MONGO_URI_VAR`], [`MONGO_DB_VAR`], [`SSH_PORT_VAR`],
-    ///   [`BROKER_ENDPOINT_VAR`], [`BROKER_CREDENTIAL_VAR`],
-    ///   [`BROKER_VHOST_VAR`], [`SSH_CONNECT_TIMEOUT_VAR`],
+    ///   [`SSH_CONNECT_TIMEOUT_VAR`],
     ///   [`SSH_COMMAND_TIMEOUT_VAR`], [`EXPLOITDB_CSV_VAR`],
     ///   [`NVD_ENRICHMENT_ENABLED_VAR`], o [`NVD_CACHE_TTL_VAR`] cuando
     ///   [`NVD_ENRICHMENT_ENABLED_VAR`] es `"true"`; y las variables SQS/SNS
@@ -267,9 +234,6 @@ impl Config {
         let mongo_uri = required(MONGO_URI_VAR, lookup(MONGO_URI_VAR))?;
         let mongo_db = required(MONGO_DB_VAR, lookup(MONGO_DB_VAR))?;
         let ssh_port = parse_port(SSH_PORT_VAR, lookup(SSH_PORT_VAR))?;
-        let broker_endpoint = required(BROKER_ENDPOINT_VAR, lookup(BROKER_ENDPOINT_VAR))?;
-        let broker_credential = required(BROKER_CREDENTIAL_VAR, lookup(BROKER_CREDENTIAL_VAR))?;
-        let broker_vhost = required(BROKER_VHOST_VAR, lookup(BROKER_VHOST_VAR))?;
 
         let ssh_connect_timeout =
             parse_timeout(SSH_CONNECT_TIMEOUT_VAR, lookup(SSH_CONNECT_TIMEOUT_VAR))?;
@@ -313,9 +277,6 @@ impl Config {
             mongo_uri,
             mongo_db,
             ssh_port,
-            broker_endpoint,
-            broker_credential: SecretString::from(broker_credential),
-            broker_vhost,
             ssh_connect_timeout,
             ssh_command_timeout,
             exploitdb_csv,
@@ -478,7 +439,6 @@ mod tests {
 
     use super::*;
 
-    const TEST_BROKER_CREDENTIAL: &str = "s3cr3t-token";
     const VALID_REQUESTS_QUEUE_URL: &str =
         "https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-requests";
     const VALID_CANCELLATIONS_QUEUE_URL: &str =
@@ -502,9 +462,6 @@ mod tests {
             (MONGO_URI_VAR, "mongodb://db-nmap:27017/nmap"),
             (MONGO_DB_VAR, "db-nmap"),
             (SSH_PORT_VAR, "22"),
-            (BROKER_ENDPOINT_VAR, "amqp://broker:5672"),
-            (BROKER_CREDENTIAL_VAR, TEST_BROKER_CREDENTIAL),
-            (BROKER_VHOST_VAR, "security-app"),
             (SSH_CONNECT_TIMEOUT_VAR, "7"),
             (SSH_COMMAND_TIMEOUT_VAR, "120"),
             (EXPLOITDB_CSV_VAR, "/opt/exploitdb/files_exploits.csv"),
@@ -532,12 +489,6 @@ mod tests {
         assert_eq!(config.mongo_uri, "mongodb://db-nmap:27017/nmap");
         assert_eq!(config.mongo_db, "db-nmap");
         assert_eq!(config.ssh_port, 22);
-        assert_eq!(config.broker_endpoint, "amqp://broker:5672");
-        assert_eq!(
-            config.broker_credential.expose_secret(),
-            TEST_BROKER_CREDENTIAL
-        );
-        assert_eq!(config.broker_vhost, "security-app");
         assert_eq!(config.ssh_connect_timeout, Duration::from_secs(7));
         assert_eq!(config.ssh_command_timeout, Duration::from_secs(120));
         assert_eq!(config.exploitdb_csv, "/opt/exploitdb/files_exploits.csv");
@@ -728,34 +679,27 @@ mod tests {
     #[test]
     fn empty_required_var_is_treated_as_missing() {
         let mut vars = valid_vars();
-        vars.insert(BROKER_CREDENTIAL_VAR, "   ");
+        vars.insert(MONGO_URI_VAR, "   ");
 
-        let err = config_from(&vars).expect_err("credencial vacía debe fallar");
+        let err = config_from(&vars).expect_err("URI vacía debe fallar");
 
-        assert!(matches!(
-            err,
-            ConfigError::MissingVar(BROKER_CREDENTIAL_VAR)
-        ));
+        assert!(matches!(err, ConfigError::MissingVar(MONGO_URI_VAR)));
     }
 
     #[test]
-    fn missing_broker_vhost_var_yields_typed_missing_var_error() {
-        let mut vars = valid_vars();
-        vars.remove(BROKER_VHOST_VAR);
+    fn the_retired_amqp_broker_variables_are_neither_required_nor_read() {
+        let vars = valid_vars();
 
-        let err = config_from(&vars).expect_err("sin BROKER_VHOST debe fallar");
+        let config = Config::from_source(|key| {
+            assert!(
+                !key.starts_with("MS_NMAP_BROKER_"),
+                "la config no debe consultar variables del Broker AMQP retirado: {key}"
+            );
+            vars.get(key).map(|v| (*v).to_owned())
+        })
+        .expect("sin MS_NMAP_BROKER_* la config debe cargar");
 
-        assert!(matches!(err, ConfigError::MissingVar(BROKER_VHOST_VAR)));
-    }
-
-    #[test]
-    fn empty_broker_vhost_var_is_treated_as_missing() {
-        let mut vars = valid_vars();
-        vars.insert(BROKER_VHOST_VAR, "   ");
-
-        let err = config_from(&vars).expect_err("vhost vacío debe fallar");
-
-        assert!(matches!(err, ConfigError::MissingVar(BROKER_VHOST_VAR)));
+        assert_eq!(config.aws_region, "us-east-1");
     }
 
     #[test]
@@ -856,18 +800,6 @@ mod tests {
             ConfigError::InvalidValue { var, .. } => assert_eq!(var, SSH_COMMAND_TIMEOUT_VAR),
             other => panic!("se esperaba InvalidValue, se obtuvo {other:?}"),
         }
-    }
-
-    #[test]
-    fn debug_output_does_not_leak_broker_credential() {
-        let config = config_from(&valid_vars()).expect("la config válida debe cargar");
-
-        let rendered = format!("{config:?}");
-
-        assert!(
-            !rendered.contains("s3cr3t-token"),
-            "Debug de Config no debe exponer la credencial: {rendered}"
-        );
     }
 
     #[test]
@@ -1022,7 +954,6 @@ mod tests {
         let config = config_from(&vars).expect("config válida");
         let rendered = format!("{config:?}");
 
-        assert!(!rendered.contains(TEST_BROKER_CREDENTIAL));
         assert!(!rendered.contains("nvd-super-secret-key"));
     }
 }
