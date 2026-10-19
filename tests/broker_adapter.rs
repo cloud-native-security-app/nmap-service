@@ -58,7 +58,7 @@ const MS_NMAP_RABBITMQ_PASSWORD: &str = "lab-only-not-a-real-secret-ms-nmap";
 /// con permiso para declarar/bindear colas de verificación ad-hoc en estos
 /// tests (el usuario `ms-nmap` tiene `configure: "^$"`, no puede declarar
 /// nada — mismo motivo documentado en
-/// `gateway/progress/explore_lapin_testcontainers.md` §3).
+/// el spike de testcontainers del repo `gateway`).
 const ADMIN_RABBITMQ_USER: &str = "lab-admin";
 const ADMIN_RABBITMQ_PASSWORD: &str = "lab-only-not-a-real-secret";
 
@@ -75,7 +75,7 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 /// que `lapin`/`mongodb`/`russh` resuelven a `ring`) del backend `ring` antes
 /// de la primera conexión AMQPS del proceso de test. Sin esto, la primera
 /// conexión no falla: se cuelga indefinidamente (ver
-/// `gateway/progress/explore_lapin_testcontainers.md` §4, el mismo gotcha
+/// el spike de testcontainers del repo `gateway`, el mismo gotcha
 /// documentado por el repo hermano `broker`).
 fn install_crypto_provider_once() {
     CRYPTO_PROVIDER_INIT.call_once(|| {

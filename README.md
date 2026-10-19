@@ -16,9 +16,38 @@ integración con `testcontainers`.
 
 ## Desarrollo
 
-El repositorio se desarrolla guiado por agentes de IA sobre un arnés
-documental (`AGENTS.md`, `feature_list.json`, `docs/`, `CHECKPOINTS.md`).
-Antes de tocar código, lee `CLAUDE.md`.
+Documentación de referencia en `docs/`:
+
+| Documento | Contenido |
+|-----------|-----------|
+| `docs/architecture.md` | Alcance del servicio, decisiones de diseño, capas y flujo de datos |
+| `docs/conventions.md` | Estilo Rust, nombres y estructura de módulos |
+| `docs/verification.md` | Niveles de verificación y tests de integración |
+| `docs/security-scope.md` | Límites de autorización y alcance (SSH, credenciales, escaneo) |
+| `docs/decisions.md` | Registro de decisiones técnicas (ADR) |
+
+Antes de implementar algo que dispare escaneo activo, conexión SSH real o
+manejo de credenciales, lee `docs/security-scope.md`.
+
+### Verificación
+
+```
+make verify
+```
+
+Ejecuta, en orden: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test`, `cargo test -- --ignored` (tests de integración con
+`testcontainers`, requieren Docker) y `cargo doc --no-deps`. Cada paso también
+está disponible como target individual (`fmt-check`, `lint`, `test`,
+`test-integration`, `doc`).
+
+### Desarrollo asistido por IA
+
+El trabajo asistido por IA usa [gentle-ai](https://github.com/Gentleman-Programming/gentle-ai):
+cada funcionalidad sustancial se planifica en un documento ODD en
+`odd/tasks/<feature>.md` (checklist, criterios de aceptación y evidencia de
+verificación), espejado en la memoria persistente Engram bajo el tópico
+`odd/<feature>/tasks`. Los commits siguen Conventional Commits.
 
 ## Despliegue (Docker)
 

@@ -41,8 +41,8 @@ tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Cliente AMQPS del adaptador real de broker (`src/messaging/rabbitmq.rs`,
 # feature `broker_adapter`). Mismas versiones que fija `gateway/Cargo.toml`
-# (mismo runtime tokio, mismo patrón ya investigado y verificado en
-# `gateway/progress/explore_lapin_publish.md`): `lapin` 2.x resuelve
+# (mismo runtime tokio, mismo patrón ya investigado y verificado en la
+# investigación del repo `gateway`): `lapin` 2.x resuelve
 # `default-features = false, features = ["rustls"]` a
 # `rustls -> rustls-native-certs` (verificación TLS con el almacén de
 # certificados nativo del proceso en producción; los tests de integración
@@ -50,8 +50,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 lapin = { version = "2", features = ["rustls"], default-features = false }
 # Adapta el executor/reactor de `lapin` al runtime `tokio` que ya usa el
 # resto de este servicio, en vez de dejar que use su propio pool de hilos
-# (`async-global-executor`) — ver `gateway/progress/explore_lapin_publish.md`
-# §3. Son dev-dependencies del propio `lapin` (solo en sus ejemplos/tests),
+# (`async-global-executor`) — ver el
+# spike de lapin del repo `gateway`. Son dev-dependencies del propio `lapin` (solo en sus ejemplos/tests),
 # no algo que un consumidor arrastre transitivamente.
 tokio-executor-trait = "2"
 tokio-reactor-trait = "1"
@@ -69,7 +69,7 @@ wiremock = "0.6"
 # Instalación defensiva del backend criptográfico de `rustls` antes de la
 # primera conexión AMQPS en los tests de integración de `broker_adapter`
 # (gotcha de doble-proveedor `rustls` documentado en
-# `gateway/progress/explore_lapin_testcontainers.md` §4: si el binario de
+# el spike de testcontainers del repo `gateway`: si el binario de
 # test trae dos proveedores criptográficos compilados a la vez, la primera
 # conexión AMQPS se cuelga en vez de fallar). Verificado en `Cargo.lock` de
 # este repo tras añadir `lapin`: solo aparece `ring`, no `aws-lc-rs`, así que

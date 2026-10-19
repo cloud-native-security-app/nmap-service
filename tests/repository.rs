@@ -385,7 +385,7 @@ async fn nvd_cache_get_of_unknown_cpe_is_a_miss_not_an_error() {
 /// test lento y flaky. En su lugar, se verifica directamente contra el
 /// servidor que el índice `expireAfterSeconds` sobre `cached_at` se creó con
 /// el valor de `ttl` pasado a `nvd_cache_store` (documentado en
-/// `progress/impl_nvd_enrichment.md`).
+/// `docs/decisions.md`, ADR-12).
 #[tokio::test]
 #[ignore = "requiere Docker"]
 async fn nvd_cache_store_creates_a_ttl_index_with_the_configured_expire_after_seconds() {
