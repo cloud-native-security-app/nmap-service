@@ -2,17 +2,18 @@
 
 `ms-nmap`: microservicio de escaneo dentro de una plataforma de
 ciberseguridad blue/red team. Recibe una solicitud de escaneo (IP, usuario de
-red y permisos) a través del Broker, se conecta por SSH al objetivo, ejecuta
+red y permisos) a través de una cola SQS, se conecta por SSH al objetivo, ejecuta
 `nmap` para detectar puertos abiertos, servicios, versiones y
 vulnerabilidades, persiste el resultado en MongoDB (`db-nmap`) y lo publica
-de vuelta hacia el Broker para que otro servicio (`ms-analisis`) genere el
+de vuelta en un topic SNS para que otro servicio (`ms-analisis`) genere el
 informe final con IA.
 
 Este repo implementa **únicamente** `ms-nmap`. `ms-usuarios`, `ms-analisis`,
 el Gateway y el Broker viven en otros repos.
 
-Stack: Rust (async con `tokio`), persistencia en MongoDB, tests de
-integración con `testcontainers`.
+Stack: Rust (async con `tokio`), mensajería con AWS SQS (entrada) y SNS
+(salida) vía el SDK oficial, persistencia en MongoDB, tests de integración con
+`testcontainers` (LocalStack, MongoDB y `sshd` reales).
 
 ## Desarrollo
 
@@ -40,6 +41,26 @@ warnings`, `cargo test`, `cargo test -- --ignored` (tests de integración con
 `testcontainers`, requieren Docker) y `cargo doc --no-deps`. Cada paso también
 está disponible como target individual (`fmt-check`, `lint`, `test`,
 `test-integration`, `doc`).
+
+### Tests de integración con LocalStack
+
+SQS y SNS se prueban contra un [LocalStack](https://www.localstack.cloud/) real
+(`localstack/localstack:4.4`) que cada test levanta con `testcontainers`: no hace
+falta cuenta AWS ni configuración previa, sólo Docker (`docker ps` debe
+responder). Los tests con LocalStack comparten el arnés `tests/common/mod.rs`:
+
+| Test | Qué cubre |
+|------|-----------|
+| `tests/sqs_sources_localstack.rs` | Fuentes de solicitudes/cancelaciones: long poll, borrado tras manejar, malformados a la DLQ, redrive tras 3 recepciones |
+| `tests/sns_sink_localstack.rs` | Publicación en SNS con el atributo `routing_key` y el filtro del Gateway; guarda de tamaño |
+| `tests/messaging_e2e_localstack.rs` | De punta a punta: solicitud en SQS -> `wiring` real -> `sshd` con `nmap` falso + MongoDB -> desenlace `completed` en SNS -> solicitud borrada -> apagado inmediato |
+
+```
+cargo test --test messaging_e2e_localstack -- --ignored
+```
+
+El LocalStack para correr el servicio localmente (docker compose) vive en el repo
+`infra`.
 
 ### Desarrollo asistido por IA
 
@@ -77,18 +98,15 @@ docker build -t ms-nmap .
 
 `ms-nmap` lee **toda** su configuración de variables de entorno. La mayoría son
 obligatorias (si falta alguna, registra el error y termina sin arrancar); las
-excepciones son `MS_NMAP_NVD_API_KEY` (genuinamente opcional) y
-`MS_NMAP_NVD_CACHE_TTL_SECS` (obligatoria sólo si el enriquecimiento NVD está
-habilitado):
+excepciones son `AWS_ENDPOINT_URL` y `MS_NMAP_NVD_API_KEY` (genuinamente
+opcionales) y `MS_NMAP_NVD_CACHE_TTL_SECS` (obligatoria sólo si el
+enriquecimiento NVD está habilitado):
 
 | Variable | Descripción |
 |----------|-------------|
 | `MS_NMAP_MONGO_URI` | URI de conexión a MongoDB (`db-nmap`), p. ej. `mongodb://host:27017` |
 | `MS_NMAP_MONGO_DB` | Nombre de la base de datos donde se persisten los resultados y el trust store SSH |
 | `MS_NMAP_SSH_PORT` | Puerto SSH del objetivo al que conectarse (p. ej. `22`) |
-| `MS_NMAP_BROKER_ENDPOINT` | Endpoint del Broker de mensajería del que se consumen solicitudes/cancelaciones y al que se publican desenlaces. Forma esperada: `esquema://host:puerto` (p. ej. `amqps://broker.lab:5671`), **sin** usuario ni vhost — `ms-nmap` conecta siempre por AMQPS (el esquema recibido se ignora), fija el usuario RabbitMQ del servicio (`ms-nmap`) y añade `MS_NMAP_BROKER_CREDENTIAL` y `MS_NMAP_BROKER_VHOST` |
-| `MS_NMAP_BROKER_CREDENTIAL` | Contraseña del usuario RabbitMQ `ms-nmap` contra el Broker (secreto) |
-| `MS_NMAP_BROKER_VHOST` | Vhost de RabbitMQ al que conectarse (p. ej. `security-app`), definido en la topología del Broker |
 | `AWS_REGION` | Región AWS de SQS/SNS (p. ej. `us-east-1`). Obligatoria. Las credenciales salen de la cadena de proveedores por defecto de AWS (rol de la tarea ECS), nunca de variables propias |
 | `AWS_ENDPOINT_URL` | Endpoint AWS alternativo, **sólo LocalStack** (p. ej. `http://localstack:4566`). Opcional: ausente en AWS real |
 | `MS_NMAP_SCAN_REQUESTS_QUEUE_URL` | URL de la cola SQS de solicitudes de escaneo (obligatoria) |
@@ -117,9 +135,12 @@ docker run --rm \
   -e MS_NMAP_MONGO_URI=mongodb://mongo:27017 \
   -e MS_NMAP_MONGO_DB=db-nmap \
   -e MS_NMAP_SSH_PORT=22 \
-  -e MS_NMAP_BROKER_ENDPOINT=amqps://broker.lab:5671 \
-  -e MS_NMAP_BROKER_CREDENTIAL=*** \
-  -e MS_NMAP_BROKER_VHOST=security-app \
+  -e AWS_REGION=us-east-1 \
+  -e MS_NMAP_SCAN_REQUESTS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-requests \
+  -e MS_NMAP_SCAN_REQUESTS_DLQ_URL=https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-requests-dlq \
+  -e MS_NMAP_SCAN_CANCELLATIONS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-cancellations \
+  -e MS_NMAP_SCAN_CANCELLATIONS_DLQ_URL=https://sqs.us-east-1.amazonaws.com/123456789012/ms-nmap-scan-cancellations-dlq \
+  -e MS_NMAP_SCAN_OUTCOMES_TOPIC_ARN=arn:aws:sns:us-east-1:123456789012:scan-outcomes \
   -e MS_NMAP_SSH_CONNECT_TIMEOUT_SECS=10 \
   -e MS_NMAP_SSH_COMMAND_TIMEOUT_SECS=300 \
   -e MS_NMAP_NVD_ENRICHMENT_ENABLED=false \
@@ -135,3 +156,16 @@ Para habilitar el enriquecimiento NVD, añade además:
 ```
 
 (`MS_NMAP_NVD_API_KEY` es opcional incluso con el enriquecimiento habilitado.)
+
+Las credenciales de AWS no son variables de `ms-nmap`: en ECS salen del rol de la
+tarea; fuera de AWS, de la cadena por defecto del SDK (p. ej. `AWS_ACCESS_KEY_ID`
+y `AWS_SECRET_ACCESS_KEY`). Contra LocalStack añade
+`-e AWS_ENDPOINT_URL=http://localstack:4566` y credenciales ficticias.
+
+### Apagado
+
+Con `SIGTERM` (ECS) o `Ctrl-C`, `ms-nmap` deja de pedir mensajes de inmediato,
+espera hasta 25 s a que terminen los escaneos en vuelo (cada uno se borra de la
+cola solo tras publicar su desenlace terminal) y sale. Los que no terminen
+reaparecen en la cola al vencer su `VisibilityTimeout` y se reprocesan. El
+`stopTimeout` de la tarea ECS debe ser de al menos 30 s.

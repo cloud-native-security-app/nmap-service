@@ -16,12 +16,12 @@
 //!   [`NvdApiEnricher`] (egress de red opt-in, ver `docs/security-scope.md`). Si
 //!   está deshabilitado, este módulo no construye `NvdApiEnricher` en absoluto:
 //!   no hay ninguna posibilidad de llamada de red hacia NVD.
-//! - [`ScanRequestSource`] -> [`RabbitMqScanRequestSource`],
-//!   [`ScanCancellationSource`] -> [`RabbitMqScanCancellationSource`],
-//!   [`ScanResultSink`] -> [`RabbitMqScanResultSink`] (feature
-//!   `broker_adapter`): conecta contra el Broker con el almacén de
-//!   certificados nativo del proceso (sin CA custom — ver
-//!   `docs/security-scope.md` y `src/messaging/rabbitmq.rs`).
+//! - [`ScanRequestSource`] -> [`SqsScanRequestSource`],
+//!   [`ScanCancellationSource`] -> [`SqsScanCancellationSource`],
+//!   [`ScanResultSink`] -> [`SnsScanResultSink`]: SQS/SNS vía el SDK de AWS, con
+//!   la cadena de credenciales por defecto (rol de la tarea ECS) y los CA del
+//!   sistema para HTTPS; el endpoint alternativo (`AWS_ENDPOINT_URL`) existe
+//!   sólo para LocalStack (ver `src/messaging/sqs.rs`, `src/messaging/sns.rs`).
 
 use std::sync::Arc;
 
@@ -33,9 +33,8 @@ use crate::enrichment::{
 };
 use crate::messaging::consumer::{ScanCancellationSource, ScanRequestSource};
 use crate::messaging::publisher::ScanResultSink;
-use crate::messaging::rabbitmq::{
-    BrokerError, RabbitMqScanCancellationSource, RabbitMqScanRequestSource, RabbitMqScanResultSink,
-};
+use crate::messaging::sns::SnsScanResultSink;
+use crate::messaging::sqs::{SqsScanCancellationSource, SqsScanRequestSource};
 use crate::repository::{MongoRepository, RepoError, ScanResultRepository};
 use crate::scanner::{NmapCliScanner, NmapScanner};
 use crate::ssh::{HostKeyStore, RemoteExecutor, RusshExecutor};
@@ -62,12 +61,15 @@ pub enum WiringError {
     #[error("configuración NVD inconsistente: {0}")]
     InvalidNvdConfig(String),
 
-    /// No se pudo conectar (o preparar el canal) contra el Broker por AMQPS
-    /// al inicializar alguno de los tres adaptadores de mensajería (feature
-    /// `broker_adapter`). Un Broker inaccesible al arrancar detiene el
-    /// proceso de forma limpia, mismo criterio que [`WiringError::Mongo`].
-    #[error("no se pudo inicializar la mensajería con el Broker: {0}")]
-    Broker(#[from] BrokerError),
+    /// No se pudo preparar alguno de los adaptadores de mensajería SQS/SNS.
+    /// Hoy ninguna ruta lo produce: el SDK de AWS conecta de forma perezosa, así
+    /// que construir los clientes no falla y un endpoint inaccesible se
+    /// manifiesta en la primera recepción (reintentada con backoff) o
+    /// publicación (el mensaje no se borra y se reentrega). Se conserva como
+    /// variante tipada, mismo criterio que [`WiringError::Mongo`], por si el
+    /// arranque llega a validar la mensajería (p. ej. `GetQueueAttributes`).
+    #[error("no se pudo inicializar la mensajería SQS/SNS: {0}")]
+    Messaging(String),
 }
 
 /// Construye los [`ServicePorts`] con los adaptadores de producción a partir de
@@ -77,11 +79,12 @@ pub enum WiringError {
 /// conexión tanto el [`ScanResultRepository`] como el [`HostKeyStore`]
 /// persistente. El resto de adaptadores son unit-structs sin estado.
 ///
-/// También conecta contra el Broker (AMQPS, almacén de certificados nativo
-/// del proceso, sin CA custom) y devuelve, junto a los `ServicePorts`, los
-/// adaptadores reales de [`ScanRequestSource`]/[`ScanCancellationSource`]
-/// listos para pasarle a [`crate::run`] (feature `broker_adapter`; el `sink`
-/// real, [`RabbitMqScanResultSink`], ya viaja dentro de `ServicePorts`).
+/// También construye los adaptadores SQS/SNS (credenciales de la cadena por
+/// defecto de AWS, región y endpoint opcional de `config`) y devuelve, junto a
+/// los `ServicePorts`, los adaptadores reales de
+/// [`ScanRequestSource`]/[`ScanCancellationSource`] listos para pasarle a
+/// [`crate::run`] (el `sink` real, [`SnsScanResultSink`], ya viaja dentro de
+/// `ServicePorts`).
 ///
 /// # Errores
 ///
@@ -91,9 +94,8 @@ pub enum WiringError {
 /// - [`WiringError::InvalidNvdConfig`] si `config` llegó con
 ///   `nvd_enrichment_enabled=true` sin `nvd_cache_ttl` (no debería ocurrir:
 ///   ver [`crate::config::Config`]).
-/// - [`WiringError::Broker`] si no se pudo conectar (o preparar el canal)
-///   contra el Broker por AMQPS para cualquiera de los tres adaptadores de
-///   mensajería.
+/// - [`WiringError::Messaging`] si no se pudo preparar alguno de los tres
+///   adaptadores de mensajería (hoy no se produce: ver la variante).
 pub async fn service_ports_from_config(
     config: &Config,
 ) -> Result<
@@ -142,33 +144,31 @@ pub async fn service_ports_from_config(
     let enricher: Arc<dyn VulnEnricher> = Arc::new(CompositeVulnEnricher::new(enrichers));
     let repository: Arc<dyn ScanResultRepository> = Arc::new(repo);
 
-    // Broker: los tres adaptadores reales, cada uno con su propia conexión
-    // AMQPS/canal (mismo patrón que `gateway::broker`, ver
-    // `src/messaging/rabbitmq.rs`). Almacén de certificados nativo del
-    // proceso en producción (sin CA custom, ver `docs/security-scope.md`).
+    // Mensajería: los tres adaptadores reales del SDK de AWS. Credenciales de la
+    // cadena por defecto (rol de la tarea ECS); `AWS_ENDPOINT_URL` sólo en
+    // LocalStack/desarrollo.
+    let region = config.aws_region.as_str();
+    let endpoint = config.aws_endpoint_url.as_ref().map(url::Url::as_str);
     let source: Arc<dyn ScanRequestSource> = Arc::new(
-        RabbitMqScanRequestSource::connect(
-            &config.broker_endpoint,
-            &config.broker_credential,
-            &config.broker_vhost,
+        SqsScanRequestSource::connect(
+            region,
+            endpoint,
+            config.scan_requests_queue_url.to_string(),
+            config.scan_requests_dlq_url.to_string(),
         )
-        .await?,
+        .await,
     );
     let cancellations: Arc<dyn ScanCancellationSource> = Arc::new(
-        RabbitMqScanCancellationSource::connect(
-            &config.broker_endpoint,
-            &config.broker_credential,
-            &config.broker_vhost,
+        SqsScanCancellationSource::connect(
+            region,
+            endpoint,
+            config.scan_cancellations_queue_url.to_string(),
+            config.scan_cancellations_dlq_url.to_string(),
         )
-        .await?,
+        .await,
     );
     let sink: Arc<dyn ScanResultSink> = Arc::new(
-        RabbitMqScanResultSink::connect(
-            &config.broker_endpoint,
-            &config.broker_credential,
-            &config.broker_vhost,
-        )
-        .await?,
+        SnsScanResultSink::connect(region, endpoint, config.scan_outcomes_topic_arn.clone()).await,
     );
 
     Ok((

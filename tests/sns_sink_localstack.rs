@@ -10,14 +10,9 @@
 //! Requieren Docker y están marcados `#[ignore = "requiere Docker"]`:
 //! `cargo test --test sns_sink_localstack -- --ignored` los ejecuta.
 
-use std::sync::Once;
 use std::time::Duration;
 
-use aws_sdk_sns::config::{BehaviorVersion, Credentials, Region};
 use serde_json::{json, Value};
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use time::macros::datetime;
 
 use nmap_service::domain::{CorrelationId, PortFinding, PortState, Protocol, ScanResult};
@@ -29,111 +24,37 @@ use nmap_service::messaging::sns::{
     SnsScanResultSink, MAX_OUTCOME_BODY_BYTES, RESULT_TOO_LARGE_REASON,
 };
 
-const LOCALSTACK_TAG: &str = "4.4";
-const REGION: &str = "us-east-1";
+mod common;
+use common::{LocalStack, REGION};
+
 const TOPIC: &str = "scan-outcomes";
 /// Política de filtro real del Gateway sobre `scan-outcomes`.
 const GATEWAY_FILTER: &str = r#"{"routing_key":[{"prefix":"scan.outcome."}]}"#;
 
-static CRYPTO_PROVIDER_INIT: Once = Once::new();
-
-/// Mismo guard defensivo de proveedor criptográfico que
-/// `tests/sqs_sources_localstack.rs` (LocalStack va por HTTP plano).
-fn install_crypto_provider_once() {
-    CRYPTO_PROVIDER_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
 struct Fixture {
-    _container: ContainerAsync<GenericImage>,
-    sqs: aws_sdk_sqs::Client,
+    ls: LocalStack,
     queue_url: String,
     sink: SnsScanResultSink,
 }
 
 impl Fixture {
     async fn start() -> Self {
-        install_crypto_provider_once();
-        let container = GenericImage::new("localstack/localstack", LOCALSTACK_TAG)
-            .with_exposed_port(4566.tcp())
-            .with_wait_for(WaitFor::message_on_stdout("Ready."))
-            .with_startup_timeout(Duration::from_secs(180))
-            .start()
-            .await
-            .expect("el contenedor LocalStack de test debe arrancar");
-        let port = container
-            .get_host_port_ipv4(4566.tcp())
-            .await
-            .expect("LocalStack debe publicar el puerto 4566");
-        let endpoint = format!("http://127.0.0.1:{port}");
-        let credentials = || Credentials::new("test", "test", None, None, "localstack-test");
-
-        let sns = aws_sdk_sns::Client::from_conf(
-            aws_sdk_sns::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .region(Region::new(REGION))
-                .endpoint_url(&endpoint)
-                .credentials_provider(credentials())
-                .build(),
-        );
-        let sqs = aws_sdk_sqs::Client::from_conf(
-            aws_sdk_sqs::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .region(Region::new(REGION))
-                .endpoint_url(&endpoint)
-                .credentials_provider(credentials())
-                .build(),
-        );
-
-        let topic_arn = sns
-            .create_topic()
-            .name(TOPIC)
-            .send()
-            .await
-            .expect("crear topic")
-            .topic_arn
-            .expect("topic arn");
-        let queue_url = sqs
-            .create_queue()
-            .queue_name("gateway-scan-outcomes")
-            .send()
-            .await
-            .expect("crear cola")
-            .queue_url
-            .expect("queue url");
-        let queue_arn = sqs
-            .get_queue_attributes()
-            .queue_url(&queue_url)
-            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
-            .send()
-            .await
-            .expect("atributos de la cola")
-            .attributes
-            .expect("atributos")
-            .remove(&aws_sdk_sqs::types::QueueAttributeName::QueueArn)
-            .expect("arn de la cola");
-        sns.subscribe()
-            .topic_arn(&topic_arn)
-            .protocol("sqs")
-            .endpoint(&queue_arn)
-            .attributes("RawMessageDelivery", "true")
-            .attributes("FilterPolicy", GATEWAY_FILTER)
-            .send()
-            .await
-            .expect("suscribir la cola al topic");
-
+        let ls = LocalStack::start().await;
+        let (topic_arn, queue_url) = ls
+            .topic_with_raw_queue(TOPIC, "gateway-scan-outcomes", Some(GATEWAY_FILTER))
+            .await;
+        let sink = SnsScanResultSink::from_client(ls.sns.clone(), topic_arn);
         Self {
-            _container: container,
-            sqs,
+            ls,
             queue_url,
-            sink: SnsScanResultSink::from_client(sns, topic_arn),
+            sink,
         }
     }
 
     async fn receive_one(&self) -> aws_sdk_sqs::types::Message {
         for _ in 0..10 {
             let out = self
+                .ls
                 .sqs
                 .receive_message()
                 .queue_url(&self.queue_url)
@@ -204,7 +125,8 @@ async fn publishes_started_completed_and_failed_with_exact_body_and_routing_key(
     for _ in 0..3 {
         let message = fx.receive_one().await;
         by_key.insert(routing_key_of(&message), body_of(&message));
-        fx.sqs
+        fx.ls
+            .sqs
             .delete_message()
             .queue_url(&fx.queue_url)
             .receipt_handle(message.receipt_handle().expect("handle"))
@@ -261,17 +183,7 @@ async fn oversized_completed_arrives_as_failed_with_the_fixed_reason() {
 async fn publishing_to_a_missing_topic_yields_a_sns_error() {
     let fx = Fixture::start().await;
     let sink = SnsScanResultSink::from_client(
-        aws_sdk_sns::Client::from_conf(
-            aws_sdk_sns::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .region(Region::new(REGION))
-                .endpoint_url(
-                    // reutiliza el mismo LocalStack a través del cliente del fixture
-                    fx_endpoint(&fx).await,
-                )
-                .credentials_provider(Credentials::new("test", "test", None, None, "t"))
-                .build(),
-        ),
+        fx.ls.sns.clone(),
         format!("arn:aws:sns:{REGION}:000000000000:no-existe"),
     );
 
@@ -287,13 +199,4 @@ async fn publishing_to_a_missing_topic_yields_a_sns_error() {
         ),
         "{err:?}"
     );
-}
-
-async fn fx_endpoint(fx: &Fixture) -> String {
-    let port = fx
-        ._container
-        .get_host_port_ipv4(4566.tcp())
-        .await
-        .expect("puerto");
-    format!("http://127.0.0.1:{port}")
 }

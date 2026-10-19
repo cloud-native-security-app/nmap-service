@@ -17,8 +17,9 @@ lint:
 test:
 	$(CARGO) test
 
-# Tests de integración con Docker (testcontainers, #[ignore]). Requieren un
-# daemon de Docker; no se sustituyen por mocks.
+# Tests de integración con Docker (testcontainers, #[ignore]): LocalStack
+# (SQS/SNS), MongoDB y sshd reales. Requieren un daemon de Docker; no se
+# sustituyen por mocks.
 test-integration:
 	$(CARGO) test -- --ignored
 

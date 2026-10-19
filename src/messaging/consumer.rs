@@ -1,18 +1,17 @@
 //! Consumo de solicitudes de escaneo desde el Broker y su conversión a
 //! [`ScanRequest`].
 //!
-//! La tecnología concreta de cola de mensajes (RabbitMQ / NATS / Kafka / Redis
-//! Streams / ...) todavía no está decidida (ver `docs/architecture.md`,
-//! §"Decisiones de diseño"). Por eso el resto del servicio depende sólo del
-//! trait [`ScanRequestSource`] y nunca de un cliente de broker concreto. Este
-//! módulo aporta además:
+//! La tecnología de cola de mensajes (SQS/SNS, ver `docs/decisions.md`, ADR-16)
+//! queda aislada en `src/messaging/sqs.rs` y `src/messaging/sns.rs`: el resto del
+//! servicio depende sólo del trait [`ScanRequestSource`] y nunca de un cliente
+//! concreto. Este módulo aporta además:
 //!
 //! - [`parse_scan_request`]: deserializa el cuerpo de un mensaje a
 //!   [`ScanRequest`], rechazando payloads malformados o incompletos con un
 //!   [`ConsumeError`] tipado en vez de entrar en pánico.
 //! - [`InMemoryScanRequestSource`]: implementación de [`ScanRequestSource`] para
 //!   desarrollo, tests y el pipeline end-to-end (feature `scan_pipeline_wiring`)
-//!   mientras el broker real no esté decidido.
+//!   sin cola real.
 //! - [`log_request_received`]: traza de recepción identificada por
 //!   `correlation_id`.
 //! - [`ScanCancellationSource`] / [`InMemoryScanCancellationSource`] (feature
@@ -34,7 +33,7 @@ use crate::domain::{ScanCancellation, ScanRequest};
 /// Motivo por el que no se pudo obtener o interpretar una solicitud del Broker.
 ///
 /// Cada variante es distinguible para que el llamador reaccione distinto:
-/// descartar un mensaje envenenado (nack sin requeue) frente a reintentar ante
+/// descartar un mensaje envenenado (a la DLQ, sin reencolar) frente a reintentar ante
 /// un corte de transporte. Ninguna hace que el proceso muera.
 ///
 /// # Seguridad
@@ -57,7 +56,7 @@ pub enum ConsumeError {
     InvalidSchema(String),
 
     /// Fallo al comunicarse con el broker: conexión caída, suscripción
-    /// cancelada, ack/nack rechazado, etc.
+    /// cancelada, borrado rechazado, etc.
     #[error("fallo de transporte con el Broker: {0}")]
     Transport(String),
 }
@@ -253,7 +252,7 @@ impl IncomingScanRequest {
 /// Fuente de solicitudes de escaneo entrantes, independiente de la tecnología
 /// concreta del broker.
 ///
-/// Un adaptador concreto (RabbitMQ, NATS, ...) implementará este trait; el
+/// Un adaptador concreto (SQS, NATS, ...) implementará este trait; el
 /// pipeline (feature `scan_pipeline_wiring`) consume solicitudes a través de él
 /// sin conocer el transporte. Es dyn-compatible: se comparte como
 /// `Arc<dyn ScanRequestSource>`.
@@ -347,7 +346,7 @@ impl ScanRequestSource for InMemoryScanRequestSource {
 /// tecnología concreta del broker.
 ///
 /// Mismo patrón hexagonal que [`ScanRequestSource`]: un adaptador concreto
-/// (RabbitMQ, NATS, ...) implementará este trait; [`crate::pipeline::ScanPipeline::run`]
+/// (SQS, NATS, ...) implementará este trait; [`crate::pipeline::ScanPipeline::run`]
 /// consume cancelaciones a través de él sin conocer el transporte, en un
 /// segundo bucle concurrente al de solicitudes. Es dyn-compatible: se
 /// comparte como `Arc<dyn ScanCancellationSource>`.

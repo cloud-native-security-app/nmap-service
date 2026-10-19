@@ -1,11 +1,10 @@
 //! Publicación del desenlace de un escaneo (resultado o fallo) de vuelta hacia
 //! el Broker, para que `ms-analisis` lo consuma y redacte el informe final.
 //!
-//! La tecnología concreta de cola de mensajes (RabbitMQ / NATS / Kafka / Redis
-//! Streams / ...) todavía no está decidida (ver `docs/architecture.md`,
-//! §"Decisiones de diseño"). Por eso el resto del servicio depende sólo del
-//! trait [`ScanResultSink`] y nunca de un cliente de broker concreto. Este
-//! módulo aporta además:
+//! La tecnología de cola de mensajes (SQS/SNS, ver `docs/decisions.md`, ADR-16)
+//! queda aislada en `src/messaging/sqs.rs` y `src/messaging/sns.rs`: el resto del
+//! servicio depende sólo del trait [`ScanResultSink`] y nunca de un cliente
+//! concreto. Este módulo aporta además:
 //!
 //! - [`ScanOutcome`]: unifica los desenlaces posibles del pipeline — el arranque
 //!   ([`ScanOutcome::Started`]), publicado antes de tocar el objetivo, y el
@@ -18,8 +17,7 @@
 //!   canónico (JSON) que consumirá `ms-analisis`.
 //! - [`InMemoryScanResultSink`]: implementación de [`ScanResultSink`] para
 //!   desarrollo, tests y el pipeline end-to-end (feature `scan_pipeline_wiring`)
-//!   mientras el broker real no esté decidido; registra todo lo publicado para
-//!   poder inspeccionarlo.
+//!   sin cola real; registra todo lo publicado para poder inspeccionarlo.
 //! - [`log_outcome_published`]: traza de publicación identificada por
 //!   `correlation_id`.
 //!
@@ -176,18 +174,6 @@ pub enum PublishError {
     #[error("no se pudo serializar el mensaje de resultado: {0}")]
     Serialization(String),
 
-    /// El Broker respondió explícitamente que **no** aceptó el mensaje (nack),
-    /// tras haberlo confirmado que el frame se envió correctamente. Distinta de
-    /// [`PublishError::Transport`]: aquí el envío en sí no falló, fue el propio
-    /// Broker quien rechazó el mensaje (feature `broker_adapter`,
-    /// [`crate::messaging::rabbitmq::RabbitMqScanResultSink`], que activa
-    /// `confirm_select` para poder distinguir ambos casos).
-    #[error("el Broker no confirmó (nack) la publicación en '{exchange}'")]
-    NotAcknowledged {
-        /// Exchange contra el que se publicó el mensaje rechazado.
-        exchange: &'static str,
-    },
-
     /// Fallo del SDK de AWS al publicar en un topic SNS. La causa original se
     /// conserva (boxed) como `#[source]` sin acoplar este tipo al SDK.
     #[error("fallo al publicar en el topic SNS '{topic}'")]
@@ -200,8 +186,7 @@ pub enum PublishError {
     },
 }
 
-/// Routing key de [`ScanOutcome::Started`] (transporte AMQP y atributo
-/// `routing_key` de SNS).
+/// Routing key de [`ScanOutcome::Started`] (atributo `routing_key` de SNS).
 pub const ROUTING_KEY_SCAN_OUTCOME_STARTED: &str = "scan.outcome.started";
 
 /// Routing key de [`ScanOutcome::Completed`].
@@ -307,7 +292,7 @@ fn outcome_log_fields(outcome: &ScanOutcome) -> OutcomeLogFields<'_> {
 /// Destino de los desenlaces de escaneo, independiente de la tecnología concreta
 /// del broker.
 ///
-/// Un adaptador concreto (RabbitMQ, NATS, ...) implementará este trait; el
+/// Un adaptador concreto (SNS, NATS, ...) implementará este trait; el
 /// pipeline (feature `scan_pipeline_wiring`) publica a través de él sin conocer
 /// el transporte. Es dyn-compatible: se comparte como `Arc<dyn ScanResultSink>`.
 #[async_trait::async_trait]

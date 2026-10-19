@@ -2,14 +2,17 @@
 //! subscriber de `tracing`, resuelve la configuración, arma los adaptadores
 //! reales en [`nmap_service::wiring`] y delega el resto en [`nmap_service::run`].
 //!
-//! Nunca hace `panic`: un fallo de configuración, de conexión a MongoDB o de
-//! conexión al Broker (AMQPS) se registra con `tracing::error!` y el proceso
-//! termina de forma limpia.
+//! Nunca hace `panic`: un fallo de configuración o de conexión a MongoDB se
+//! registra con `tracing::error!` y el proceso termina de forma limpia. Con
+//! `SIGTERM`/`Ctrl-C` deja de consumir, espera a los escaneos en vuelo hasta un
+//! plazo acotado y sale (ver [`nmap_service::run`]).
+
+use tokio_util::sync::CancellationToken;
 
 use nmap_service::config::Config;
 use nmap_service::scanner::ScanOptions;
 use nmap_service::ssh::SshTimeouts;
-use nmap_service::{run, wiring, PipelineConfig};
+use nmap_service::{run, shutdown_signal, wiring, PipelineConfig};
 
 #[tokio::main]
 async fn main() {
@@ -43,5 +46,24 @@ async fn main() {
         },
     };
 
-    run(ports, pipeline_config, Some(source), Some(cancellations)).await;
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown_signal().await;
+            tracing::info!(
+                "señal de apagado recibida; se deja de consumir y se drenan los escaneos"
+            );
+            shutdown.cancel();
+        }
+    });
+
+    run(
+        ports,
+        pipeline_config,
+        Some(source),
+        Some(cancellations),
+        shutdown,
+    )
+    .await;
 }
