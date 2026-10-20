@@ -1,0 +1,11 @@
+# Contexto de build mínimo: solo lo que necesita `cargo build --release --bin ms-nmap`.
+# NO excluir Cargo.toml, Cargo.lock (build reproducible) ni src/.
+
+target/
+.git/
+.gitignore
+docs/
+tests/
+*.md
+Dockerfile
+.dockerignore

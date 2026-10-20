@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.98 scan initiated Thu Aug 27 23:40:07 2026 as: /usr/bin/nmap -v -p 22,2222 -oX - 172.18.0.253 172.18.0.2 -->
+<nmaprun scanner="nmap" args="/usr/bin/nmap -v -p 22,2222 -oX - 172.18.0.253 172.18.0.2" start="1787874007" startstr="Thu Aug 27 23:40:07 2026" version="7.98" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="2" services="22,2222"/>
+<verbose level="1"/>
+<debugging level="0"/>
+<taskbegin task="ARP Ping Scan" time="1787874007"/>
+<hosthint><status state="up" reason="arp-response" reason_ttl="0"/>
+<address addr="172.18.0.2" addrtype="ipv4"/>
+<address addr="D2:A1:3C:1F:3C:92" addrtype="mac"/>
+<hostnames>
+</hostnames>
+</hosthint>
+<taskend task="ARP Ping Scan" time="1787874008" extrainfo="2 total hosts"/>
+<taskbegin task="Parallel DNS resolution of 1 host." time="1787874008"/>
+<taskend task="Parallel DNS resolution of 1 host." time="1787874008"/>
+<host><status state="down" reason="no-response" reason_ttl="0"/>
+<address addr="172.18.0.253" addrtype="ipv4"/>
+</host>
+<taskbegin task="SYN Stealth Scan" time="1787874008"/>
+<taskend task="SYN Stealth Scan" time="1787874008" extrainfo="2 total ports"/>
+<host starttime="1787874008" endtime="1787874008"><status state="up" reason="arp-response" reason_ttl="0"/>
+<address addr="172.18.0.2" addrtype="ipv4"/>
+<address addr="D2:A1:3C:1F:3C:92" addrtype="mac"/>
+<hostnames>
+<hostname name="tgt-ssh.nmaplab" type="PTR"/>
+</hostnames>
+<ports><port protocol="tcp" portid="22"><state state="closed" reason="reset" reason_ttl="64"/><service name="ssh" method="table" conf="3"/></port>
+<port protocol="tcp" portid="2222"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="EtherNetIP-1" method="table" conf="3"/></port>
+</ports>
+<times srtt="45" rttvar="2837" to="100000"/>
+</host>
+<runstats><finished time="1787874008" timestr="Thu Aug 27 23:40:08 2026" summary="Nmap done at Thu Aug 27 23:40:08 2026; 2 IP addresses (1 host up) scanned in 1.30 seconds" elapsed="1.30" exit="success"/><hosts up="1" down="1" total="2"/>
+</runstats>
+</nmaprun>

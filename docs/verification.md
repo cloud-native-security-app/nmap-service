@@ -44,12 +44,15 @@ se documenta con `#[allow(...)]` y un comentario explicando por qué.
   un laboratorio controlado — ver `docs/security-scope.md`.
 - `repository`: contra el contenedor MongoDB oficial levantado vía
   `testcontainers`, nunca contra `db-nmap` de producción.
+- `messaging` (`sqs`, `sns`): contra un LocalStack real (`localstack/localstack:4.4`)
+  levantado vía `testcontainers`, nunca contra una cuenta AWS ni con mocks del
+  SDK; el arnés común está en `tests/common/mod.rs`.
 - `parser`: contra fixtures de XML real guardadas en `tests/fixtures/`, no
   contra XML inventado a mano que no representa la salida real de `nmap`.
 - Todo test de esta categoría se marca `#[ignore = "requiere Docker"]` (ver
   `docs/conventions.md`), se ejecuta con `cargo test -- --ignored`, y
   requiere Docker disponible (local o en CI). Si falla por falta de Docker,
-  se documenta como bloqueo en `progress/current.md` — no se reemplaza por
+  se documenta como bloqueo en el documento de feature (`odd/tasks/`) — no se reemplaza por
   un mock.
 
 ### Nivel 4 — Smoke test end-to-end (obligatorio para la feature `scan_pipeline_wiring`, opcional para el resto)
@@ -67,13 +70,13 @@ verifica que un `ScanRequest` válido termina publicando un `ScanResult`.
 - ❌ Probar `ssh`/`scanner` contra una IP real, propia o ajena, fuera de un
   entorno de laboratorio explícitamente autorizado.
 - ❌ Silenciar un warning de `clippy` con `#[allow(...)]` sin comentario.
-- ❌ Marcar la feature como `done` sin pasar `./init.sh`.
+- ❌ Marcar la feature como terminada sin pasar `make verify`.
 
 ## Verificación final antes de cerrar
 
 ```bash
-./init.sh           # debe terminar con [OK] Entorno listo
+make verify        # debe terminar sin errores
 ```
 
-Si `./init.sh` está rojo, **no** marques nada como `done`. Anota el bloqueo
-en `progress/current.md` y pon `"status": "blocked"` en `feature_list.json`.
+Si `make verify` está rojo, **no** marques nada como terminado. Anota el bloqueo
+en el documento de feature (`odd/tasks/<feature>.md`).

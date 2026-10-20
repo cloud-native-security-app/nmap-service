@@ -1,2 +1,8 @@
 /target
 *.tmp
+
+# Material TLS/claves locales: nunca se versionan.
+*.pem
+*.key
+
+.atl
