@@ -28,7 +28,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::domain::{ScanCancellation, ScanRequest};
+use crate::domain::{CorrelationId, ScanCancellation, ScanRequest};
 
 /// Motivo por el que no se pudo obtener o interpretar una solicitud del Broker.
 ///
@@ -55,11 +55,32 @@ pub enum ConsumeError {
     #[error("el mensaje del Broker no tiene la forma de un ScanRequest: {0}")]
     InvalidSchema(String),
 
+    /// Igual que [`ConsumeError::InvalidSchema`], pero el cuerpo conservaba un
+    /// `correlation_id` utilizable (cadena JSON no vacía): el pipeline puede
+    /// cerrar la solicitud en el Gateway publicando un desenlace `Failed` con
+    /// ese identificador (ver [`REJECTED_REQUEST_REASON`]).
+    ///
+    /// `detail` es sólo para logs (descripción de `serde`, con la credencial
+    /// redactada); nunca viaja en el desenlace publicado.
+    #[error("el mensaje del Broker no tiene la forma de un ScanRequest (correlation_id {correlation_id}): {detail}")]
+    RejectedRequest {
+        /// Identificador de correlación recuperado del cuerpo rechazado.
+        correlation_id: CorrelationId,
+        /// Descripción estructural del fallo, sin la credencial.
+        detail: String,
+    },
+
     /// Fallo al comunicarse con el broker: conexión caída, suscripción
     /// cancelada, borrado rechazado, etc.
     #[error("fallo de transporte con el Broker: {0}")]
     Transport(String),
 }
+
+/// Motivo, fijo y no sensible, con el que se publica el desenlace `Failed` de
+/// una solicitud rechazada por [`ConsumeError::RejectedRequest`]. Nunca incluye
+/// valores del payload (IP, credenciales).
+pub const REJECTED_REQUEST_REASON: &str =
+    "la solicitud de escaneo es inválida y fue descartada; revise los campos enviados";
 
 /// Deserializa el cuerpo crudo de un mensaje del Broker a un [`ScanRequest`].
 ///
@@ -68,8 +89,10 @@ pub enum ConsumeError {
 ///
 /// 1. `raw` -> [`serde_json::Value`]; si falla ->
 ///    [`ConsumeError::MalformedPayload`].
-/// 2. `Value` -> [`ScanRequest`]; si falla (campo ausente o tipo incorrecto) ->
-///    [`ConsumeError::InvalidSchema`].
+/// 2. `Value` -> [`ScanRequest`]; si falla (campo ausente, tipo incorrecto o
+///    valor inválido como una IP mal formada) ->
+///    [`ConsumeError::RejectedRequest`] si el JSON trae un `correlation_id`
+///    cadena no vacía, o [`ConsumeError::InvalidSchema`] si no.
 ///
 /// Nunca hace `panic`/`unwrap`: cualquier entrada, incluida basura binaria,
 /// produce un `Err` tipado.
@@ -86,11 +109,26 @@ pub fn parse_scan_request(raw: &[u8]) -> Result<ScanRequest, ConsumeError> {
 
     match serde_json::from_value::<ScanRequest>(payload.clone()) {
         Ok(request) => Ok(request),
-        Err(err) => Err(ConsumeError::InvalidSchema(redact_credential(
-            err.to_string(),
-            &payload,
-        ))),
+        Err(err) => {
+            let detail = redact_credential(err.to_string(), &payload);
+            Err(match usable_correlation_id(&payload) {
+                Some(correlation_id) => ConsumeError::RejectedRequest {
+                    correlation_id,
+                    detail,
+                },
+                None => ConsumeError::InvalidSchema(detail),
+            })
+        }
     }
+}
+
+// `correlation_id` del JSON si es una cadena no vacía; `None` en otro caso.
+fn usable_correlation_id(payload: &serde_json::Value) -> Option<CorrelationId> {
+    payload
+        .get("correlation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(CorrelationId::from)
 }
 
 // Borra el valor de `ssh_credentials_ref` de un mensaje de error de `serde`.
@@ -507,11 +545,63 @@ mod tests {
         let err = parse_scan_request(raw).expect_err("falta 'ip', debe fallar");
 
         match err {
-            ConsumeError::InvalidSchema(detail) => {
-                assert!(detail.contains("ip"), "detalle: {detail}")
+            ConsumeError::RejectedRequest {
+                correlation_id,
+                detail,
+            } => {
+                assert_eq!(correlation_id.as_str(), "corr-1");
+                assert!(detail.contains("ip"), "detalle: {detail}");
             }
-            other => panic!("se esperaba InvalidSchema, se obtuvo {other:?}"),
+            other => panic!("se esperaba RejectedRequest, se obtuvo {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_ip_with_correlation_id_is_rejected_request_without_echoing_values() {
+        let raw = br#"{
+            "correlation_id": "corr-bad-ip",
+            "ip": "172.31.86.37/32",
+            "network_user": "netops",
+            "ssh_credentials_ref": "hunter2-super-secret-token",
+            "has_sudo": false,
+            "requested_by": "a@b.test"
+        }"#;
+
+        let err = parse_scan_request(raw).expect_err("IP con máscara debe fallar");
+
+        match &err {
+            ConsumeError::RejectedRequest { correlation_id, .. } => {
+                assert_eq!(correlation_id.as_str(), "corr-bad-ip")
+            }
+            other => panic!("se esperaba RejectedRequest, se obtuvo {other:?}"),
+        }
+        let printed = err.to_string();
+        assert!(!printed.contains("172.31.86.37"), "{printed}");
+        assert!(!printed.contains(SECRET), "{printed}");
+    }
+
+    #[test]
+    fn json_without_usable_correlation_id_stays_invalid_schema() {
+        for raw in [
+            r#"{"ip": "nope", "network_user": "n"}"#,
+            r#"{"correlation_id": 42, "ip": "nope"}"#,
+            r#"{"correlation_id": "", "ip": "nope"}"#,
+            r#"{"correlation_id": null}"#,
+            r#"[1, 2]"#,
+        ] {
+            let err = parse_scan_request(raw.as_bytes()).expect_err("debe fallar");
+            assert!(
+                matches!(err, ConsumeError::InvalidSchema(_)),
+                "{raw}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_request_reason_is_fixed_and_carries_no_payload_values() {
+        assert!(!REJECTED_REQUEST_REASON.contains("172.31.86.37"));
+        assert!(!REJECTED_REQUEST_REASON.contains(SECRET));
+        assert!(REJECTED_REQUEST_REASON.starts_with("la solicitud de escaneo es inválida"));
     }
 
     #[test]
@@ -541,7 +631,7 @@ mod tests {
 
         let err = parse_scan_request(raw).expect_err("tipo incorrecto debe fallar");
 
-        assert!(matches!(err, ConsumeError::InvalidSchema(_)));
+        assert!(matches!(err, ConsumeError::RejectedRequest { .. }));
         assert!(
             !err.to_string().contains("9081726354"),
             "la credencial no debe filtrarse en el error: {err}"

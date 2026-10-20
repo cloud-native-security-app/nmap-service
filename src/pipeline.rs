@@ -46,6 +46,7 @@ use crate::domain::{CorrelationId, ScanCancellation, ScanRequest, ScanResult, Vu
 use crate::enrichment::VulnEnricher;
 use crate::messaging::consumer::{
     ConsumeError, IncomingScanRequest, ScanCancellationSource, ScanRequestSource,
+    REJECTED_REQUEST_REASON,
 };
 use crate::messaging::publisher::{ScanOutcome, ScanResultSink};
 use crate::parser;
@@ -463,6 +464,9 @@ impl ScanPipeline {
     /// Un `Err(ConsumeError::MalformedPayload | InvalidSchema)` en cualquiera de
     /// las dos fuentes se registra con `tracing::warn!` y **no** interrumpe su
     /// consumo (contrato de [`ScanRequestSource`]/[`ScanCancellationSource`]).
+    /// Una solicitud rechazada que conserva su `correlation_id`
+    /// (`ConsumeError::RejectedRequest`) además publica un
+    /// [`ScanOutcome::Failed`] con motivo fijo por `sink`.
     ///
     /// Antes de retornar, espera a que terminen ambos bucles y todas las tareas
     /// de escaneo en vuelo.
@@ -520,7 +524,7 @@ impl ScanPipeline {
         loop {
             let next = tokio::select! {
                 () = shutdown.cancelled() => break,
-                next = next_valid_request(source.as_ref()) => next,
+                next = next_valid_request(source.as_ref(), self.sink.as_ref()) => next,
             };
             let Some(request) = next else { break };
             let pipeline = self.clone();
@@ -588,12 +592,41 @@ async fn join_all(tasks: &mut JoinSet<()>) {
 /// ([`ConsumeError::Transport`]).
 ///
 /// Los mensajes malformados o con esquema inválido se descartan con
-/// `tracing::warn!` y no interrumpen el consumo.
-async fn next_valid_request(source: &dyn ScanRequestSource) -> Option<IncomingScanRequest> {
+/// `tracing::warn!` y no interrumpen el consumo. Si el rechazo conserva un
+/// `correlation_id` ([`ConsumeError::RejectedRequest`]), además se publica en
+/// `sink` un [`ScanOutcome::Failed`] con motivo fijo
+/// ([`REJECTED_REQUEST_REASON`], sin valores del payload) para que el Gateway
+/// cierre la solicitud en vez de dejarla pendiente. Sin `correlation_id`
+/// utilizable (no es JSON, falta o no es una cadena) sólo hay DLQ + log.
+async fn next_valid_request(
+    source: &dyn ScanRequestSource,
+    sink: &dyn ScanResultSink,
+) -> Option<IncomingScanRequest> {
     loop {
         match source.next_request().await {
             Ok(Some(incoming)) => return Some(incoming),
             Ok(None) => return None,
+            Err(ConsumeError::RejectedRequest {
+                correlation_id,
+                detail,
+            }) => {
+                tracing::warn!(
+                    correlation_id = %correlation_id,
+                    error = %detail,
+                    "solicitud del Broker rechazada por inválida; se publica su desenlace Failed \
+                     y se continúa"
+                );
+                // Best-effort: la fuente ya la envió a la DLQ y la borró; si el
+                // desenlace no sale, el Gateway la verá pendiente (como antes).
+                let outcome = ScanOutcome::failed(correlation_id.clone(), REJECTED_REQUEST_REASON);
+                if let Err(err) = sink.publish(&outcome).await {
+                    tracing::error!(
+                        correlation_id = %correlation_id,
+                        error = %err,
+                        "no se pudo publicar el desenlace Failed de la solicitud rechazada"
+                    );
+                }
+            }
             Err(err @ (ConsumeError::MalformedPayload(_) | ConsumeError::InvalidSchema(_))) => {
                 tracing::warn!(error = %err, "solicitud del Broker descartada; se continúa");
             }
@@ -620,7 +653,11 @@ async fn next_valid_cancellation(source: &dyn ScanCancellationSource) -> Option<
         match source.next_cancellation().await {
             Ok(Some(cancellation)) => return Some(cancellation),
             Ok(None) => return None,
-            Err(err @ (ConsumeError::MalformedPayload(_) | ConsumeError::InvalidSchema(_))) => {
+            Err(
+                err @ (ConsumeError::MalformedPayload(_)
+                | ConsumeError::InvalidSchema(_)
+                | ConsumeError::RejectedRequest { .. }),
+            ) => {
                 tracing::warn!(error = %err, "cancelación del Broker descartada; se continúa");
             }
             Err(err @ ConsumeError::Transport(_)) => {
@@ -706,14 +743,105 @@ mod tests {
             request_json("corr-2"),
         ]);
 
-        let first = next_valid_request(&source).await.expect("primera válida");
+        let first = next_valid_request(&source, &InMemoryScanResultSink::new())
+            .await
+            .expect("primera válida");
         assert_eq!(first.request.correlation_id.as_str(), "corr-1");
 
         // El mensaje envenenado se descarta y se entrega la siguiente válida.
-        let second = next_valid_request(&source).await.expect("segunda válida");
+        let second = next_valid_request(&source, &InMemoryScanResultSink::new())
+            .await
+            .expect("segunda válida");
         assert_eq!(second.request.correlation_id.as_str(), "corr-2");
 
-        assert!(next_valid_request(&source).await.is_none());
+        assert!(next_valid_request(&source, &InMemoryScanResultSink::new())
+            .await
+            .is_none());
+    }
+
+    fn invalid_ip_request_json(correlation_id: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+                "correlation_id": "{correlation_id}",
+                "ip": "172.31.86.37/32",
+                "network_user": "netops",
+                "ssh_credentials_ref": "{SECRET}",
+                "has_sudo": false,
+                "requested_by": "analyst@example.test"
+            }}"#
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn rejected_request_with_correlation_id_publishes_one_failed_outcome_and_continues() {
+        let source = InMemoryScanRequestSource::from_raw_messages([
+            invalid_ip_request_json("corr-bad-ip"),
+            request_json("corr-ok"),
+        ]);
+        let sink = InMemoryScanResultSink::new();
+
+        let next = next_valid_request(&source, &sink)
+            .await
+            .expect("continúa con la siguiente válida");
+
+        assert_eq!(next.request.correlation_id.as_str(), "corr-ok");
+        let published = sink.published();
+        assert_eq!(published.len(), 1, "un único desenlace: {published:?}");
+        match &published[0] {
+            ScanOutcome::Failed {
+                correlation_id,
+                reason,
+            } => {
+                assert_eq!(correlation_id.as_str(), "corr-bad-ip");
+                assert_eq!(reason, REJECTED_REQUEST_REASON);
+                assert!(!reason.contains("172.31.86.37") && !reason.contains(SECRET));
+            }
+            other => panic!("se esperaba Failed, se obtuvo {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_request_without_correlation_id_publishes_nothing() {
+        let source = InMemoryScanRequestSource::from_raw_messages([
+            br#"{"ip": "172.31.86.37/32"}"#.to_vec(),
+            b"{ not json".to_vec(),
+            request_json("corr-ok"),
+        ]);
+        let sink = InMemoryScanResultSink::new();
+
+        let next = next_valid_request(&source, &sink).await.expect("válida");
+
+        assert_eq!(next.request.correlation_id.as_str(), "corr-ok");
+        assert!(sink.published().is_empty(), "{:?}", sink.published());
+    }
+
+    struct FailingSink;
+
+    #[async_trait::async_trait]
+    impl ScanResultSink for FailingSink {
+        async fn publish(
+            &self,
+            _outcome: &ScanOutcome,
+        ) -> Result<(), crate::messaging::publisher::PublishError> {
+            Err(crate::messaging::publisher::PublishError::Transport(
+                "broker caído".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_request_keeps_consuming_when_the_failed_outcome_cannot_be_published() {
+        let source = InMemoryScanRequestSource::from_raw_messages([
+            invalid_ip_request_json("corr-bad-ip"),
+            request_json("corr-ok"),
+        ]);
+
+        let next = next_valid_request(&source, &FailingSink)
+            .await
+            .expect("el fallo de publicación no detiene el consumo");
+
+        assert_eq!(next.request.correlation_id.as_str(), "corr-ok");
     }
 
     struct TransportFailingSource {
@@ -741,7 +869,9 @@ mod tests {
         };
 
         assert!(
-            next_valid_request(&source).await.is_none(),
+            next_valid_request(&source, &InMemoryScanResultSink::new())
+                .await
+                .is_none(),
             "un fallo de transporte detiene el consumo en la primera vuelta"
         );
         // No consumió las 3: paró en la primera.
