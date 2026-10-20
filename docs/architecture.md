@@ -143,6 +143,18 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
    (documento en `scan_results`) republica su `Completed` sin reescanear;
    `MongoRepository::save` es un upsert con índice único sobre `correlation_id`
    (creado de forma idempotente en `connect`).
+
+   **Solicitudes rechazadas con `correlation_id`**: si el cuerpo es JSON pero no
+   pasa la validación de `ScanRequest` (p. ej. IP con máscara `/32`),
+   `parse_scan_request` devuelve la variante nueva
+   `ConsumeError::RejectedRequest { correlation_id, detail }` (antes
+   `InvalidSchema`, que se conserva cuando no hay `correlation_id` utilizable).
+   La fuente sigue enviando el mensaje a la DLQ y borrándolo; el pipeline
+   (`next_valid_request`) además publica por `ServicePorts.sink` un
+   `ScanOutcome::Failed` con el motivo fijo `REJECTED_REQUEST_REASON` (sin IP ni
+   credenciales) para que el Gateway cierre el escaneo. Sin `correlation_id`
+   (no es JSON, falta o no es cadena) queda sólo la DLQ y el log. Los puertos
+   siguen neutrales al transporte; la publicación es best-effort.
 9. **`pipeline` (`src/pipeline.rs`)** — orquesta
    `consumer -> ssh -> scanner -> parser -> enrichment -> repository -> publisher`
    en `ScanPipeline`, construido a partir de los puertos inyectados

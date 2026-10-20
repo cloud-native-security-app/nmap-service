@@ -273,3 +273,115 @@ async fn queued_scan_request_ends_in_a_published_completed_outcome_and_shutdown_
         .expect("run debe volver de inmediato tras el apagado")
         .expect("sin panic");
 }
+
+/// Una solicitud con JSON válido pero que no pasa la validación de
+/// `ScanRequest` (IP con máscara `/32`) va a la DLQ **y** el servicio publica
+/// un `Failed` con su `correlation_id`, para que el Gateway cierre el escaneo
+/// en vez de dejarlo pendiente. No hace falta sshd: nunca se llega a escanear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requiere Docker"]
+async fn rejected_scan_request_goes_to_the_dlq_and_publishes_a_failed_outcome() {
+    set_aws_test_env();
+    let ls = LocalStack::start().await;
+    let mongo = start_mongo().await;
+
+    let (requests_queue, requests_dlq, _) = ls.queue_with_dlqs("ms-nmap-scan-requests").await;
+    let (cancellations_queue, cancellations_dlq, _) =
+        ls.queue_with_dlqs("ms-nmap-scan-cancellations").await;
+    let (topic_arn, verify_queue) = ls
+        .topic_with_raw_queue("scan-outcomes", "e2e-outcomes-rejected", None)
+        .await;
+
+    let (mongo_host, mongo_port) = host_and_port(&mongo, MONGO_PORT).await;
+    let config = Config {
+        mongo_uri: format!(
+            "mongodb://{mongo_host}:{mongo_port}/?directConnection=true&serverSelectionTimeoutMS=5000"
+        ),
+        mongo_db: TEST_DB.to_owned(),
+        ssh_port: SSH_PORT,
+        ssh_connect_timeout: Duration::from_secs(5),
+        ssh_command_timeout: Duration::from_secs(5),
+        exploitdb_csv: EXPLOITDB_SAMPLE_CSV.to_owned(),
+        nvd_enrichment_enabled: false,
+        nvd_api_key: None,
+        nvd_cache_ttl: None,
+        scan_timing: Timing::Polite,
+        aws_region: REGION.to_owned(),
+        aws_endpoint_url: Some(url(&ls.endpoint)),
+        scan_requests_queue_url: url(&requests_queue),
+        scan_cancellations_queue_url: url(&cancellations_queue),
+        scan_requests_dlq_url: url(&requests_dlq),
+        scan_cancellations_dlq_url: url(&cancellations_dlq),
+        scan_outcomes_topic_arn: topic_arn,
+    };
+    let (ports, source, cancellations) = wiring::service_ports_from_config(&config)
+        .await
+        .expect("el cableado real debe construirse contra LocalStack y Mongo");
+
+    let shutdown = CancellationToken::new();
+    let run_task = tokio::spawn({
+        let shutdown = shutdown.clone();
+        let pipeline_config = PipelineConfig {
+            ssh_port: config.ssh_port,
+            ssh_timeouts: SshTimeouts {
+                connect: config.ssh_connect_timeout,
+                command: config.ssh_command_timeout,
+            },
+            scan_options: ScanOptions::default(),
+        };
+        async move {
+            run(
+                ports,
+                pipeline_config,
+                Some(source),
+                Some(cancellations),
+                shutdown,
+            )
+            .await;
+        }
+    });
+
+    let correlation_id = "corr-e2e-rejected";
+    let payload = json!({
+        "correlation_id": correlation_id,
+        "ip": "172.31.86.37/32",
+        "network_user": SSH_USER,
+        "ssh_credentials_ref": SSH_PASS,
+        "has_sudo": false,
+        "requested_by": "analyst@example.test",
+    })
+    .to_string();
+    ls.send(&requests_queue, &payload, &[]).await;
+
+    let dead = ls
+        .receive_and_delete(&requests_dlq, 30)
+        .await
+        .expect("la solicitud inválida debe quedar en la DLQ para diagnóstico");
+    assert_eq!(dead.body(), Some(payload.as_str()));
+
+    let message = ls
+        .receive_and_delete(&verify_queue, 30)
+        .await
+        .expect("debe publicarse un desenlace failed");
+    let routing_key = message
+        .message_attributes()
+        .and_then(|attrs| attrs.get("routing_key"))
+        .and_then(|value| value.string_value())
+        .expect("el desenlace debe traer el atributo routing_key");
+    assert_eq!(routing_key, "scan.outcome.failed");
+    let body: Value =
+        serde_json::from_str(message.body().expect("cuerpo")).expect("el cuerpo es JSON");
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["correlation_id"], correlation_id);
+    let printed = body.to_string();
+    assert!(
+        !printed.contains("172.31.86.37") && !printed.contains(SSH_PASS),
+        "el desenlace no debe incluir valores del payload: {printed}"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), run_task)
+        .await
+        .expect("run debe volver de inmediato tras el apagado")
+        .expect("sin panic");
+}
