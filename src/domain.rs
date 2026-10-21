@@ -266,6 +266,20 @@ pub enum VulnSource {
     Nvd,
 }
 
+/// Confianza de un [`VulnFinding`]. Se serializa en `snake_case`.
+///
+/// Un hallazgo sin confianza (`None`) es de confianza desconocida: no implica
+/// ni confirmación ni coincidencia sólo por versión.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    /// El script NSE verificó la vulnerabilidad (estado `VULNERABLE`).
+    Confirmed,
+    /// Coincidencia por versión/CPE (p. ej. `vulners`); no verificada y puede
+    /// ser falso positivo (parches portados por la distribución).
+    VersionMatch,
+}
+
 /// Un hallazgo de vulnerabilidad: de un script NSE de categoría `vuln`
 /// ([`VulnSource::NmapNse`]) o de un enriquecedor posterior como Exploit-DB
 /// ([`VulnSource::ExploitDb`], ver [`crate::enrichment`]).
@@ -288,6 +302,10 @@ pub struct VulnFinding {
     /// Vacío si no hay ninguna.
     #[serde(default)]
     pub references: Vec<String>,
+    /// Qué tan firme es el hallazgo. `None` = desconocido (se omite al
+    /// serializar). Ver [`Confidence`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<Confidence>,
 }
 
 /// Origen por defecto al deserializar un [`VulnFinding`] persistido antes de
@@ -359,6 +377,7 @@ mod tests {
                     nse_script: "ssh-vuln-cve2023-38408".to_owned(),
                     source: VulnSource::NmapNse,
                     references: vec!["https://www.openssh.com/txt/release-9.3p2".to_owned()],
+                    confidence: None,
                 },
                 VulnFinding {
                     id: Some("CVE-2011-2523".to_owned()),
@@ -368,6 +387,7 @@ mod tests {
                     nse_script: String::new(),
                     source: VulnSource::ExploitDb,
                     references: vec!["https://www.exploit-db.com/exploits/49757".to_owned()],
+                    confidence: None,
                 },
             ],
             scanned_at: datetime!(2026-08-27 12:30:00 UTC),
@@ -527,5 +547,32 @@ mod tests {
 
         assert_eq!(finding.source, VulnSource::NmapNse);
         assert!(finding.references.is_empty());
+    }
+
+    #[test]
+    fn vuln_finding_omits_confidence_when_none_and_uses_snake_case_otherwise() {
+        let mut finding = VulnFinding {
+            id: Some("CVE-2011-2523".to_owned()),
+            severity: Severity::High,
+            description: "d".to_owned(),
+            nse_script: "vulners".to_owned(),
+            source: VulnSource::NmapNse,
+            references: Vec::new(),
+            confidence: None,
+        };
+
+        let json = serde_json::to_value(&finding).expect("serializa");
+        assert!(json.get("confidence").is_none(), "{json}");
+
+        finding.confidence = Some(Confidence::VersionMatch);
+        let json = serde_json::to_value(&finding).expect("serializa");
+        assert_eq!(json["confidence"], "version_match");
+
+        finding.confidence = Some(Confidence::Confirmed);
+        let json = serde_json::to_value(&finding).expect("serializa");
+        assert_eq!(json["confidence"], "confirmed");
+
+        let restored: VulnFinding = serde_json::from_value(json).expect("deserializa");
+        assert_eq!(restored, finding);
     }
 }

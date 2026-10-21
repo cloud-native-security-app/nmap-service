@@ -88,6 +88,7 @@ fn sample_result() -> ScanResult {
             nse_script: "ssh-vuln-cve2023-38408".to_owned(),
             source: VulnSource::NmapNse,
             references: vec!["https://www.openssh.com/txt/release-9.3p2".to_owned()],
+            confidence: None,
         }],
         scanned_at: datetime!(2026-08-27 12:30:00 UTC),
     }
@@ -300,6 +301,7 @@ fn sample_nvd_findings() -> Vec<VulnFinding> {
         nse_script: String::new(),
         source: VulnSource::Nvd,
         references: vec!["https://example.test/advisory".to_owned()],
+        confidence: None,
     }]
 }
 

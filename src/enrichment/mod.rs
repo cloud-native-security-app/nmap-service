@@ -127,6 +127,7 @@ mod tests {
             nse_script: String::new(),
             source: VulnSource::ExploitDb,
             references: Vec::new(),
+            confidence: None,
         }
     }
 
