@@ -395,6 +395,7 @@ mod tests {
                 nse_script: "ssh-vuln-cve2023-38408".to_owned(),
                 source: VulnSource::NmapNse,
                 references: Vec::new(),
+                confidence: None,
             }],
             scanned_at: datetime!(2026-08-27 12:30:00 UTC),
         }

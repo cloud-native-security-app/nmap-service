@@ -40,6 +40,10 @@
 //!   `description` es el `output` del script recortado a
 //!   [`MAX_DESCRIPTION_LEN`] caracteres. Scripts que reportan una debilidad sin
 //!   estado NSE ni CVE (p. ej. `http-trace`) no se clasifican como hallazgos.
+//!   `confidence`: `version_match` para los CVE por entrada de `vulners`
+//!   (coincidencia por versión/CPE, posibles falsos positivos por parches
+//!   portados); `confirmed` si el script reporta estado `VULNERABLE`; ausente
+//!   para `LIKELY VULNERABLE` y CVE sólo mencionados en texto libre.
 //! - **host caído** (`<host><status state="down">`): se devuelve un
 //!   [`ScanResult`] con `ports` y `vulnerabilities` vacíos.
 //! - **sin ningún `<host>`** en el `<nmaprun>` (objetivo caído sin `-v`, o
@@ -55,7 +59,7 @@ use roxmltree::{Document, Node, ParsingOptions};
 use time::OffsetDateTime;
 
 use crate::domain::{
-    PortFinding, PortState, Protocol, ScanResult, Severity, VulnFinding, VulnSource,
+    Confidence, PortFinding, PortState, Protocol, ScanResult, Severity, VulnFinding, VulnSource,
 };
 
 /// Número máximo de caracteres que se conservan de la salida de un script NSE
@@ -377,6 +381,7 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
     let mut haystack = String::from(output);
     let mut max_cvss: Option<f64> = None;
     let mut state_is_vulnerable = false;
+    let mut state_is_confirmed = false;
 
     for elem in script
         .descendants()
@@ -397,6 +402,9 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
                 if t.starts_with("VULNERABLE") || t.starts_with("LIKELY VULNERABLE") {
                     state_is_vulnerable = true;
                 }
+                if t.starts_with("VULNERABLE") {
+                    state_is_confirmed = true;
+                }
             }
             _ => {}
         }
@@ -405,6 +413,12 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
     let vulnerable = state_is_vulnerable || haystack.contains("State: VULNERABLE");
     let cves = extract_cves(&haystack);
     let says_not_vulnerable = haystack.contains("NOT VULNERABLE");
+    // Confirmado sólo si el script verificó el estado `VULNERABLE` (incluye
+    // `VULNERABLE (Exploitable)`). `LIKELY VULNERABLE` y los CVE sólo
+    // mencionados en texto libre quedan sin confianza (desconocida).
+    let confidence = (!says_not_vulnerable
+        && (state_is_confirmed || haystack.contains("State: VULNERABLE")))
+    .then_some(Confidence::Confirmed);
 
     let is_finding = vulnerable || (!cves.is_empty() && !says_not_vulnerable);
     if !is_finding {
@@ -422,6 +436,7 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
             nse_script,
             source: VulnSource::NmapNse,
             references: Vec::new(),
+            confidence,
         }]
     } else {
         cves.into_iter()
@@ -432,6 +447,7 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
                 nse_script: nse_script.clone(),
                 source: VulnSource::NmapNse,
                 references: Vec::new(),
+                confidence,
             })
             .collect()
     }
@@ -498,6 +514,7 @@ fn vulns_from_cvss_entries(script: &Node, nse_script: &str) -> Vec<VulnFinding> 
                 nse_script: nse_script.to_owned(),
                 source: VulnSource::NmapNse,
                 references: Vec::new(),
+                confidence: Some(Confidence::VersionMatch),
             }
         })
         .collect()
@@ -787,6 +804,80 @@ mod tests {
                 v.description
             );
         }
+    }
+
+    #[test]
+    fn vulners_findings_are_version_match() {
+        let result = parse(VULNERS_MULTI_CVE_XML).expect("fixture parsea");
+
+        assert!(!result.vulnerabilities.is_empty());
+        assert!(
+            result
+                .vulnerabilities
+                .iter()
+                .all(|v| v.confidence == Some(Confidence::VersionMatch)),
+            "{:?}",
+            result.vulnerabilities
+        );
+    }
+
+    #[test]
+    fn vulnerable_state_script_is_confirmed_and_vulners_is_version_match() {
+        let result = parse(VULN_FINDINGS_XML).expect("fixture parsea");
+
+        let backdoor = result
+            .vulnerabilities
+            .iter()
+            .find(|v| v.nse_script == "ftp-vsftpd-backdoor")
+            .expect("hallazgo de ftp-vsftpd-backdoor");
+        assert_eq!(backdoor.confidence, Some(Confidence::Confirmed));
+
+        let vulners = result
+            .vulnerabilities
+            .iter()
+            .find(|v| v.nse_script == "vulners")
+            .expect("hallazgo de vulners");
+        assert_eq!(vulners.confidence, Some(Confidence::VersionMatch));
+    }
+
+    #[test]
+    fn likely_vulnerable_state_has_unknown_confidence() {
+        let xml = VULN_FINDINGS_XML
+            .replace(
+                "State: VULNERABLE (Exploitable)",
+                "State: LIKELY VULNERABLE",
+            )
+            .replace(
+                "<elem key=\"state\">VULNERABLE (Exploitable)</elem>",
+                "<elem key=\"state\">LIKELY VULNERABLE</elem>",
+            );
+        let result = parse(&xml).expect("parsea");
+
+        let backdoor = result
+            .vulnerabilities
+            .iter()
+            .find(|v| v.nse_script == "ftp-vsftpd-backdoor")
+            .expect("hallazgo de ftp-vsftpd-backdoor");
+        assert_eq!(backdoor.confidence, None);
+    }
+
+    #[test]
+    fn free_text_cve_without_vulnerable_state_has_unknown_confidence() {
+        let xml = VULN_FINDINGS_XML
+            .replace("State: VULNERABLE (Exploitable)", "State: unknown")
+            .replace(
+                "<elem key=\"state\">VULNERABLE (Exploitable)</elem>",
+                "<elem key=\"state\">unknown</elem>",
+            );
+        let result = parse(&xml).expect("parsea");
+
+        let backdoor = result
+            .vulnerabilities
+            .iter()
+            .find(|v| v.nse_script == "ftp-vsftpd-backdoor")
+            .expect("el CVE en texto libre sigue siendo un hallazgo");
+        assert_eq!(backdoor.id.as_deref(), Some("CVE-2011-2523"));
+        assert_eq!(backdoor.confidence, None);
     }
 
     #[test]

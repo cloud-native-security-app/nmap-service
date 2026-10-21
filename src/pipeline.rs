@@ -988,6 +988,7 @@ mod tests {
             nse_script: String::new(),
             source,
             references: Vec::new(),
+            confidence: None,
         }
     }
 

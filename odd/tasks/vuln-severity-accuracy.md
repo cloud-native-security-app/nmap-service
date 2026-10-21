@@ -1,7 +1,7 @@
 # vuln-severity-accuracy
 
 - Engram topic: `odd/vuln-severity-accuracy/tasks` (project: `nmap-service`)
-- Branch: `fix/vuln_severity_per_cve` (VSA-01); VSA-02 not started
+- Branch: `fix/vuln_severity_per_cve` (VSA-01); VSA-02 done (branch `feature/vuln_confidence`)
 - Status: VSA-01 done (2026-10-21), uncommitted
 
 ## Objective
@@ -18,7 +18,7 @@ A scan of a fresh Amazon Linux 2023 EC2 (only port 22/ssh) returned dozens of fi
 ## Tasks
 
 - [x] VSA-01 Per-CVE severity: when a script output carries per-entry CVSS values (vulners `<table>` entries with `id`/`cvss`), classify each CVE with its own score; keep the script-level rules (risk factor / state VULNERABLE) for single-finding scripts. Update the test that encodes the old behavior.
-- [ ] VSA-02 Version-based confidence: mark findings that come only from version matching (vulners) as `confidence: "version_match"` (additive, optional field in the outcome JSON) so the front can show them as "posible"; document the backport caveat. Cross-repo: gateway passes the field through untouched (ScanResult is relayed as JSON), user-service stores it verbatim, front `report-readability` RRD-06 displays it.
+- [x] VSA-02 Version-based confidence: mark findings that come only from version matching (vulners) as `confidence: "version_match"` (additive, optional field in the outcome JSON) so the front can show them as "posible"; document the backport caveat. Cross-repo: gateway passes the field through untouched (ScanResult is relayed as JSON), user-service stores it verbatim, front `report-readability` RRD-06 displays it.
 
 ## Acceptance criteria
 
@@ -38,3 +38,13 @@ Strict TDD with real nmap XML fixtures (`cargo test`), `make verify`.
 - Fixture: `tests/fixtures/vulners_multi_cve.xml` (CVSS 9.8, 7.5, 5.0, 2.1, a duplicate CVE at 4.3, one PACKETSTORM entry). Single-finding behavior covered by the existing `vuln_findings.xml` test (ftp-vsftpd-backdoor High; vulners CVE-2011-2523 Critical at its own 10.0).
 - Decision on non-CVE entries: skipped as separate findings (no `PACKETSTORM:`/`EDB-ID:`/`1337DAY` findings) and not attached as references, because nmap data does not link them to a specific CVE. Duplicates by CVE id keep the highest CVSS.
 - Per-entry findings get a short description (`<CVE>: CVSS x.y, reportado por <script> (<cpe/product>)`) instead of the full dump. Scripts without per-entry `id`+`cvss` tables use the unchanged script-level path.
+
+### VSA-02
+- Route: delegated writer (single bounded writer), Strict TDD. Runner: `cargo test --lib`.
+- RED: `cargo test --lib` -> 180 passed, 2 failed (`vulners_findings_are_version_match`, `vulnerable_state_script_is_confirmed_and_vulners_is_version_match`). The unknown-confidence cases (LIKELY VULNERABLE, free-text CVE) and the domain serialization test passed from the start as regression guards once the field existed as `None`.
+- GREEN: `make verify` -> exit 0; lib 182 passed, 0 failed; integration suites (Docker ones included) all passed; fmt-check, clippy and cargo doc clean.
+- Contract: `VulnFinding.confidence: Option<Confidence>` (`confirmed` | `version_match`, snake_case), `#[serde(default, skip_serializing_if = "Option::is_none")]`; absent = unknown. Old documents deserialize unchanged.
+- Rules: vulners per-entry CVE findings -> `version_match`. Script-level findings with state `VULNERABLE` (incl. `VULNERABLE (Exploitable)`, e.g. ftp-vsftpd-backdoor) -> `confirmed`. `LIKELY VULNERABLE` -> None (no clearer mapping: nmap itself says it is not verified). CVEs only in free text, without a VULNERABLE state -> None. Output that says `NOT VULNERABLE` never confirms.
+- Enrichment (Exploit-DB, NVD): these create findings (they do not modify existing ones) from a database lookup by product/CPE, so they stay `None`. A database lookup must never be upgraded to `confirmed`; it is also not tagged `version_match` to keep the change minimal (decision: revisit if the front needs to flag them).
+- Deploy order: gateway first (its types deny unknown fields and must accept `confidence`), then nmap-service, then front (RRD-06). user-service stores it verbatim. Deploying nmap-service before the gateway makes the gateway reject scan results.
+- Backport caveat: `vulners` matches CVEs by product version (CPE). Distributions such as Amazon Linux or RHEL backport security fixes without raising the upstream version, so a `version_match` finding can already be fixed in the installed package. It is a "posible" finding to verify against the distro advisory, not a confirmed vulnerability; only `confirmed` means a script verified the issue.
