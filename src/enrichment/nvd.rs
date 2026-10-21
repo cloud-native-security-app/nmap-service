@@ -341,6 +341,7 @@ fn finding_from_cve(vulnerability: &NvdVulnerability) -> VulnFinding {
         nse_script: String::new(),
         source: VulnSource::Nvd,
         references,
+        confidence: None,
     }
 }
 
