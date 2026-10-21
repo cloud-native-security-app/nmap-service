@@ -51,3 +51,10 @@ No contract change (reuses `VulnFinding` + `confidence`). The gateway, user-serv
   - Empty output, "NOT VULNERABLE", "ERROR", "Couldn't", "unable to test" yield nothing.
 - Fixtures: `http-git` block is the REAL shape from the spike. `http-trace` ("TRACE is enabled") and `http-cookie-flags` ("httponly flag not set") are ASSUMED from the NSE script docs (`nmap --script-help` / `.nse` @output), not captured from a live scan.
 - Follow-up (not implemented): `ftp-anon` is category `auth/default/safe`, not `vuln`. The scanner runs `-sV --script vuln` (`src/scanner.rs`), so it never executes. Surfacing it needs the scan flags to also request `ftp-anon` (a separate config decision).
+
+## Severity floor for confirmed findings (2026-10-21)
+
+- Ruta: writer delegado único; cambios en `src/parser.rs` (sin archivos nuevos).
+- Causa: en un reporte real, `ssl-dh-params` y `http-vuln-cve2011-3192` (ambos `State: VULNERABLE`, sin CVSS ni "Risk factor") salieron con `severity: "unknown"` porque `classify_severity` devolvía `Unknown` sin señal.
+- Fix: en `vulns_from_script` (único llamador con contexto confirmado/CVE) un `Unknown` se convierte en `Medium` como piso conservador. `classify_severity` no cambia y sigue devolviendo `Unknown`; el otro llamador (vulners por entrada, siempre con CVSS) no se ve afectado. "Risk factor"/CVSS explícitos siguen ganando.
+- TDD: RED = 2 failed (ssl-dh-params, cve2011-3192) de 5 tests nuevos (3 guardas ya en verde). GREEN = 5 nuevos pasan; `make verify` OK, 194 tests unitarios.

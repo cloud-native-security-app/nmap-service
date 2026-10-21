@@ -36,7 +36,8 @@
 //!   encontrado (en el `output` o en los `<elem>`), o uno solo con `id: None`
 //!   si el script reporta vulnerabilidad sin CVE. `severity` se infiere de
 //!   `risk factor:`/`severity:`, del `cvss` más alto de los `<elem>`, o del
-//!   marcador `VULNERABLE (Exploitable)`; si no hay señal, [`Severity::Unknown`].
+//!   marcador `VULNERABLE (Exploitable)`; si no hay señal, `Medium` como piso conservador
+//!   para hallazgos confirmados o con CVE (nunca `Unknown`).
 //!   `description` es el `output` del script recortado a
 //!   [`MAX_DESCRIPTION_LEN`] caracteres. Scripts que reportan una debilidad sin
 //!   estado NSE ni CVE (p. ej. `http-trace`) no se clasifican como hallazgos.
@@ -427,7 +428,13 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
             .collect();
     }
 
-    let severity = classify_severity(&haystack, max_cvss);
+    // Todo hallazgo que llega aquí es `VULNERABLE` o trae un CVE: nunca debe
+    // quedar como `Unknown`. Sin CVSS ni texto de severidad se usa `Medium`
+    // como piso conservador. `classify_severity` sigue devolviendo `Unknown`.
+    let severity = match classify_severity(&haystack, max_cvss) {
+        Severity::Unknown => Severity::Medium,
+        precise => precise,
+    };
     let description = truncate(output.trim(), MAX_DESCRIPTION_LEN);
 
     if cves.is_empty() {
@@ -969,6 +976,53 @@ mod tests {
         parse(&xml_with_scripts(scripts))
             .expect("parsea")
             .vulnerabilities
+    }
+
+    const DH_PARAMS_SCRIPT: &str = r#"<script id="ssl-dh-params" output="&#xa;  VULNERABLE:&#xa;  Diffie-Hellman Key Exchange Insufficient Group Strength&#xa;    State: VULNERABLE&#xa;      Transport Layer Security (TLS) services that use Diffie-Hellman groups of insufficient strength are vulnerable.&#xa;"/>"#;
+    const BYTERANGE_SCRIPT: &str = r#"<script id="http-vuln-cve2011-3192" output="&#xa;  VULNERABLE:&#xa;  Apache byterange filter DoS&#xa;    State: VULNERABLE&#xa;    IDs:  CVE:CVE-2011-3192  BID:49303&#xa;      The Apache web server is vulnerable to a denial of service attack.&#xa;"/>"#;
+
+    #[test]
+    fn confirmed_finding_without_cvss_or_text_severity_floors_to_medium() {
+        let found = vulns_for(DH_PARAMS_SCRIPT);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].severity, Severity::Medium);
+        assert_eq!(found[0].confidence, Some(Confidence::Confirmed));
+    }
+
+    #[test]
+    fn confirmed_cve_without_cvss_floors_to_medium_keeping_id() {
+        let found = vulns_for(BYTERANGE_SCRIPT);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id.as_deref(), Some("CVE-2011-3192"));
+        assert_eq!(found[0].severity, Severity::Medium);
+        assert_eq!(found[0].confidence, Some(Confidence::Confirmed));
+    }
+
+    #[test]
+    fn confirmed_finding_with_explicit_risk_factor_keeps_it() {
+        let scripts = DH_PARAMS_SCRIPT.replace(
+            "State: VULNERABLE&#xa;",
+            "State: VULNERABLE&#xa;    Risk factor: High&#xa;",
+        );
+        let found = vulns_for(&scripts);
+        assert_eq!(found[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn vulners_entry_with_low_cvss_stays_low_floor_does_not_leak() {
+        let scripts = r#"<script id="vulners" output="x"><table key="cpe:/a:x:y:1"><table><elem key="id">CVE-2020-0001</elem><elem key="cvss">2.1</elem><elem key="type">cve</elem></table></table></script>"#;
+        let found = vulns_for(scripts);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].severity, Severity::Low);
+        assert_eq!(found[0].confidence, Some(Confidence::VersionMatch));
+    }
+
+    #[test]
+    fn classify_severity_itself_still_returns_unknown_without_signal() {
+        assert_eq!(
+            classify_severity("State: VULNERABLE", None),
+            Severity::Unknown
+        );
     }
 
     #[test]
