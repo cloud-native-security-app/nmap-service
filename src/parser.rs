@@ -369,6 +369,11 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
     };
     let output = script.attribute("output").unwrap_or_default();
 
+    let per_entry = vulns_from_cvss_entries(script, &nse_script);
+    if !per_entry.is_empty() {
+        return per_entry;
+    }
+
     let mut haystack = String::from(output);
     let mut max_cvss: Option<f64> = None;
     let mut state_is_vulnerable = false;
@@ -430,6 +435,72 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
             })
             .collect()
     }
+}
+
+/// Convierte las entradas estructuradas `id` + `cvss` de un script (p. ej.
+/// `vulners`) en un hallazgo por CVE, cada uno con la severidad de su propio
+/// CVSS. Un CVE repetido conserva el CVSS más alto.
+///
+/// Las entradas cuyo `id` no es un CVE (`PACKETSTORM:...`, `EDB-ID:...`,
+/// `1337DAY-...`) no generan hallazgo propio: los datos de nmap no las enlazan
+/// a un CVE concreto, así que no se inventa esa relación. Si el script no tiene
+/// ninguna entrada CVE con CVSS se devuelve un vector vacío y el llamador aplica
+/// la clasificación a nivel de script.
+fn vulns_from_cvss_entries(script: &Node, nse_script: &str) -> Vec<VulnFinding> {
+    let mut best: Vec<(String, f64, Option<String>)> = Vec::new();
+
+    for entry in script
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "table")
+    {
+        let elem_text = |key: &str| {
+            children(&entry, "elem")
+                .find(|e| e.attribute("key") == Some(key))
+                .and_then(|e| e.text())
+                .map(str::trim)
+        };
+        let (Some(id), Some(cvss)) = (elem_text("id"), elem_text("cvss")) else {
+            continue;
+        };
+        let Ok(score) = cvss.parse::<f64>() else {
+            continue;
+        };
+        let cves = extract_cves(id);
+        if cves.len() != 1 || cves[0] != id {
+            continue;
+        }
+
+        let product = entry
+            .parent()
+            .and_then(|p| p.attribute("key"))
+            .map(str::to_owned);
+        match best.iter_mut().find(|(known, _, _)| known == id) {
+            Some(known) => {
+                if score > known.1 {
+                    known.1 = score;
+                    known.2 = product;
+                }
+            }
+            None => best.push((id.to_owned(), score, product)),
+        }
+    }
+
+    best.into_iter()
+        .map(|(cve, score, product)| {
+            let origin = product.map_or_else(String::new, |p| format!(" ({p})"));
+            VulnFinding {
+                severity: classify_severity("", Some(score)),
+                description: truncate(
+                    &format!("{cve}: CVSS {score:.1}, reportado por {nse_script}{origin}"),
+                    MAX_DESCRIPTION_LEN,
+                ),
+                id: Some(cve),
+                nse_script: nse_script.to_owned(),
+                source: VulnSource::NmapNse,
+                references: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 fn extract_cves(text: &str) -> Vec<String> {
@@ -518,6 +589,7 @@ mod tests {
     const MULTIPLE_HOSTS_XML: &str = include_str!("../tests/fixtures/multiple_hosts.xml");
     const NO_HOST_ELEMENT_XML: &str = include_str!("../tests/fixtures/no_host_element.xml");
     const FILTERED_PORTS_XML: &str = include_str!("../tests/fixtures/filtered_ports.xml");
+    const VULNERS_MULTI_CVE_XML: &str = include_str!("../tests/fixtures/vulners_multi_cve.xml");
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("IP de prueba válida")
@@ -668,6 +740,71 @@ mod tests {
             "irc-unrealircd-backdoor no debe generar hallazgos: {:?}",
             result.vulnerabilities
         );
+    }
+
+    #[test]
+    fn vulners_classifies_each_cve_with_its_own_cvss() {
+        let result = parse(VULNERS_MULTI_CVE_XML).expect("fixture parsea");
+        let sev = |id: &str| {
+            let found: Vec<_> = result
+                .vulnerabilities
+                .iter()
+                .filter(|v| v.id.as_deref() == Some(id))
+                .collect();
+            assert_eq!(found.len(), 1, "un solo hallazgo para {id}");
+            found[0].severity
+        };
+
+        assert_eq!(sev("CVE-2023-38408"), Severity::Critical);
+        assert_eq!(sev("CVE-2021-41617"), Severity::High);
+        assert_eq!(sev("CVE-2020-14145"), Severity::Medium);
+        assert_eq!(sev("CVE-2016-20012"), Severity::Low);
+    }
+
+    #[test]
+    fn vulners_dedupes_cves_keeping_highest_cvss_and_skips_non_cve_entries() {
+        let result = parse(VULNERS_MULTI_CVE_XML).expect("fixture parsea");
+
+        // CVE-2020-14145 aparece con 5.0 y 4.3 -> un solo hallazgo (5.0).
+        // PACKETSTORM:173661 no es CVE -> no genera hallazgo propio.
+        assert_eq!(
+            result.vulnerabilities.len(),
+            4,
+            "{:?}",
+            result.vulnerabilities
+        );
+        assert!(result
+            .vulnerabilities
+            .iter()
+            .all(|v| v.id.as_deref().is_some_and(|id| id.starts_with("CVE-"))));
+        for v in &result.vulnerabilities {
+            assert!(v.description.chars().count() <= MAX_DESCRIPTION_LEN + 3);
+            let id = v.id.as_deref().unwrap();
+            assert!(v.description.contains(id));
+            assert!(
+                !v.description.contains("CVE-2016-20012") || id == "CVE-2016-20012",
+                "la descripción no debe repetir el volcado completo: {}",
+                v.description
+            );
+        }
+    }
+
+    #[test]
+    fn script_without_cvss_keeps_text_based_classification() {
+        let xml = VULNERS_MULTI_CVE_XML
+            .replace("cvss", "score_unused")
+            .replace(
+                "output=\"&#xa;  cpe",
+                "output=\"Risk factor: Medium&#xa;  cpe",
+            );
+        let result = parse(&xml).expect("parsea");
+        // Sin entradas con cvss se conserva el flujo clásico: todos los CVE
+        // heredan la severidad textual del script.
+        assert!(!result.vulnerabilities.is_empty());
+        assert!(result
+            .vulnerabilities
+            .iter()
+            .all(|v| v.severity == Severity::Medium));
     }
 
     #[test]
