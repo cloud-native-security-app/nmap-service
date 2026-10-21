@@ -422,7 +422,9 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
 
     let is_finding = vulnerable || (!cves.is_empty() && !says_not_vulnerable);
     if !is_finding {
-        return Vec::new();
+        return misconfig_finding(&nse_script, output, &haystack)
+            .into_iter()
+            .collect();
     }
 
     let severity = classify_severity(&haystack, max_cvss);
@@ -451,6 +453,52 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
             })
             .collect()
     }
+}
+
+/// Hallazgo por mala configuración observada directamente por nmap. Sólo para
+/// scripts de una lista explícita cuya mera presencia (con salida real) ya es el
+/// hallazgo, sin `State: VULNERABLE` ni CVE. Devuelve `None` si el script no
+/// está en la lista o si la salida está vacía / es un error / no concluyente.
+fn misconfig_finding(nse_script: &str, output: &str, haystack: &str) -> Option<VulnFinding> {
+    let (severity, label) = match nse_script {
+        "http-git" => (Severity::Medium, "Repositorio Git expuesto"),
+        "http-trace" => (Severity::Low, "Método HTTP TRACE habilitado"),
+        "http-cookie-flags" => {
+            let lower = haystack.to_lowercase();
+            let missing_flag = lower
+                .lines()
+                .any(|l| l.contains("not set") && (l.contains("httponly") || l.contains("secure")));
+            if !missing_flag {
+                return None;
+            }
+            (
+                Severity::Low,
+                "Cookie sin flags de seguridad (HttpOnly/Secure)",
+            )
+        }
+        _ => return None,
+    };
+
+    let text = output.trim();
+    let upper = text.to_uppercase();
+    if text.is_empty()
+        || upper.contains("NOT VULNERABLE")
+        || upper.contains("ERROR")
+        || upper.contains("COULDN'T")
+        || upper.contains("UNABLE TO TEST")
+    {
+        return None;
+    }
+
+    Some(VulnFinding {
+        id: None,
+        severity,
+        description: truncate(&format!("{label}: {text}"), MAX_DESCRIPTION_LEN),
+        nse_script: nse_script.to_owned(),
+        source: VulnSource::NmapNse,
+        references: Vec::new(),
+        confidence: Some(Confidence::Confirmed),
+    })
 }
 
 /// Convierte las entradas estructuradas `id` + `cvss` de un script (p. ej.
@@ -896,6 +944,103 @@ mod tests {
             .vulnerabilities
             .iter()
             .all(|v| v.severity == Severity::Medium));
+    }
+
+    /// Envuelve bloques `<script>` en un `nmaprun` mínimo con el puerto 80 abierto.
+    fn xml_with_scripts(scripts: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --script vuln" start="1787873894" startstr="Wed Oct 21 2026" version="7.98" xmloutputversion="1.05">
+<host starttime="1787873905" endtime="1787873919"><status state="up" reason="syn-ack" reason_ttl="0"/>
+<address addr="172.17.0.3" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="http" method="probed" conf="10"/>{scripts}</port></ports>
+</host>
+</nmaprun>"#
+        )
+    }
+
+    // Forma real de la spike del 2026-10-21 (nginx débil).
+    const HTTP_GIT_SCRIPT: &str = r#"<script id="http-git" output="&#xa;  172.17.0.3:80/.git/&#xa;    Potential Git repository found (found 2/6 expected files)&#xa;"/>"#;
+    // Supuesto: la salida documentada por nmap es "TRACE is enabled".
+    const HTTP_TRACE_SCRIPT: &str = r#"<script id="http-trace" output="TRACE is enabled"/>"#;
+    const COOKIE_FLAGS_SCRIPT: &str = r#"<script id="http-cookie-flags" output="&#xa;  /: &#xa;    session: &#xa;      httponly flag not set&#xa;"/>"#;
+
+    fn vulns_for(scripts: &str) -> Vec<VulnFinding> {
+        parse(&xml_with_scripts(scripts))
+            .expect("parsea")
+            .vulnerabilities
+    }
+
+    #[test]
+    fn http_git_yields_one_medium_confirmed_finding() {
+        let v = vulns_for(HTTP_GIT_SCRIPT);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, None);
+        assert_eq!(v[0].severity, Severity::Medium);
+        assert_eq!(v[0].confidence, Some(Confidence::Confirmed));
+        assert_eq!(v[0].nse_script, "http-git");
+        assert!(v[0].description.contains("Repositorio Git expuesto"));
+        assert!(v[0].description.contains("Potential Git repository found"));
+    }
+
+    #[test]
+    fn http_trace_yields_one_low_confirmed_finding() {
+        let v = vulns_for(HTTP_TRACE_SCRIPT);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].severity, Severity::Low);
+        assert_eq!(v[0].confidence, Some(Confidence::Confirmed));
+        assert!(v[0].description.contains("TRACE"));
+    }
+
+    #[test]
+    fn http_cookie_flags_with_missing_flag_yields_one_low_finding() {
+        let v = vulns_for(COOKIE_FLAGS_SCRIPT);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].severity, Severity::Low);
+        assert_eq!(v[0].confidence, Some(Confidence::Confirmed));
+        assert_eq!(v[0].nse_script, "http-cookie-flags");
+    }
+
+    #[test]
+    fn http_cookie_flags_without_missing_flag_yields_nothing() {
+        let v = vulns_for(
+            r#"<script id="http-cookie-flags" output="&#xa;  /: &#xa;    session: &#xa;      secure flag set&#xa;"/>"#,
+        );
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn allowlisted_script_with_unknown_or_error_state_yields_nothing() {
+        for out in [
+            "&#xa;  State: UNKNOWN (unable to test)&#xa;",
+            "ERROR: Script execution failed",
+            "Couldn&apos;t find a TRACE response",
+            "&#xa;  NOT VULNERABLE&#xa;",
+            "",
+        ] {
+            for id in ["http-git", "http-trace", "http-cookie-flags"] {
+                let v = vulns_for(&format!(r#"<script id="{id}" output="{out}"/>"#));
+                assert!(v.is_empty(), "{id} / {out:?} -> {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn allowlisted_script_with_existing_finding_is_not_duplicated() {
+        let v = vulns_for(
+            r#"<script id="http-git" output="&#xa;  VULNERABLE:&#xa;  Git exposure&#xa;    State: VULNERABLE&#xa;"/>"#,
+        );
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].confidence, Some(Confidence::Confirmed));
+        let v =
+            vulns_for(r#"<script id="http-trace" output="TRACE is enabled, ver CVE-2004-2320"/>"#);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id.as_deref(), Some("CVE-2004-2320"));
+    }
+
+    #[test]
+    fn non_allowlisted_script_without_state_is_still_ignored() {
+        assert!(vulns_for(r#"<script id="http-title" output="Welcome"/>"#).is_empty());
     }
 
     #[test]
