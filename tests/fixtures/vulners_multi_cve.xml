@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="/usr/bin/nmap -sV --script vulners -p 22 -oX - ssh-host" start="1787873894" startstr="Thu Aug 27 23:38:14 2026" version="7.98" xmloutputversion="1.05">
+<host starttime="1787873905" endtime="1787873919"><status state="up" reason="syn-ack" reason_ttl="64"/>
+<address addr="172.18.0.9" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="22"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ssh" product="OpenSSH" version="8.7" method="probed" conf="10"><cpe>cpe:/a:openbsd:openssh:8.7</cpe></service><script id="vulners" output="&#xa;  cpe:/a:openbsd:openssh:8.7: &#xa;    &#x9;CVE-2023-38408&#x9;9.8&#x9;https://vulners.com/cve/CVE-2023-38408&#xa;    &#x9;CVE-2021-41617&#x9;7.5&#x9;https://vulners.com/cve/CVE-2021-41617&#xa;    &#x9;CVE-2020-14145&#x9;5.0&#x9;https://vulners.com/cve/CVE-2020-14145&#xa;    &#x9;CVE-2016-20012&#x9;2.1&#x9;https://vulners.com/cve/CVE-2016-20012&#xa;    &#x9;PACKETSTORM:173661&#x9;9.8&#x9;https://vulners.com/packetstorm/PACKETSTORM:173661&#x9;*EXPLOIT*"><table key="cpe:/a:openbsd:openssh:8.7">
+<table>
+<elem key="is_exploit">false</elem>
+<elem key="cvss">9.8</elem>
+<elem key="id">CVE-2023-38408</elem>
+<elem key="type">cve</elem>
+</table>
+<table>
+<elem key="is_exploit">false</elem>
+<elem key="cvss">7.5</elem>
+<elem key="id">CVE-2021-41617</elem>
+<elem key="type">cve</elem>
+</table>
+<table>
+<elem key="is_exploit">false</elem>
+<elem key="cvss">5.0</elem>
+<elem key="id">CVE-2020-14145</elem>
+<elem key="type">cve</elem>
+</table>
+<table>
+<elem key="is_exploit">false</elem>
+<elem key="cvss">2.1</elem>
+<elem key="id">CVE-2016-20012</elem>
+<elem key="type">cve</elem>
+</table>
+<table>
+<elem key="is_exploit">false</elem>
+<elem key="cvss">4.3</elem>
+<elem key="id">CVE-2020-14145</elem>
+<elem key="type">cve</elem>
+</table>
+<table>
+<elem key="is_exploit">true</elem>
+<elem key="cvss">9.8</elem>
+<elem key="id">PACKETSTORM:173661</elem>
+<elem key="type">packetstorm</elem>
+</table>
+</table>
+</script></port>
+</ports>
+</host>
+</nmaprun>
