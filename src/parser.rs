@@ -446,6 +446,7 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
             source: VulnSource::NmapNse,
             references: Vec::new(),
             confidence,
+            patch_state: None,
         }]
     } else {
         cves.into_iter()
@@ -457,6 +458,7 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
                 source: VulnSource::NmapNse,
                 references: Vec::new(),
                 confidence,
+                patch_state: None,
             })
             .collect()
     }
@@ -470,6 +472,8 @@ fn misconfig_finding(nse_script: &str, output: &str, haystack: &str) -> Option<V
     let (severity, label) = match nse_script {
         "http-git" => (Severity::Medium, "Repositorio Git expuesto"),
         "http-trace" => (Severity::Low, "Método HTTP TRACE habilitado"),
+        // ftp-anon sólo emite salida cuando el login anónimo ES permitido.
+        "ftp-anon" => (Severity::Medium, "Acceso FTP anónimo permitido"),
         "http-cookie-flags" => {
             let lower = haystack.to_lowercase();
             let missing_flag = lower
@@ -505,6 +509,7 @@ fn misconfig_finding(nse_script: &str, output: &str, haystack: &str) -> Option<V
         source: VulnSource::NmapNse,
         references: Vec::new(),
         confidence: Some(Confidence::Confirmed),
+        patch_state: None,
     })
 }
 
@@ -570,6 +575,7 @@ fn vulns_from_cvss_entries(script: &Node, nse_script: &str) -> Vec<VulnFinding> 
                 source: VulnSource::NmapNse,
                 references: Vec::new(),
                 confidence: Some(Confidence::VersionMatch),
+                patch_state: None,
             }
         })
         .collect()
@@ -1072,7 +1078,7 @@ mod tests {
             "&#xa;  NOT VULNERABLE&#xa;",
             "",
         ] {
-            for id in ["http-git", "http-trace", "http-cookie-flags"] {
+            for id in ["http-git", "http-trace", "http-cookie-flags", "ftp-anon"] {
                 let v = vulns_for(&format!(r#"<script id="{id}" output="{out}"/>"#));
                 assert!(v.is_empty(), "{id} / {out:?} -> {v:?}");
             }
@@ -1090,6 +1096,66 @@ mod tests {
             vulns_for(r#"<script id="http-trace" output="TRACE is enabled, ver CVE-2004-2320"/>"#);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].id.as_deref(), Some("CVE-2004-2320"));
+    }
+
+    /// Forma modelada desde la documentación del NSE `ftp-anon` (no es una
+    /// captura en vivo): sólo emite salida cuando el login anónimo es permitido.
+    const FTP_ANON_SCRIPT: &str = r#"<script id="ftp-anon" output="Anonymous FTP login allowed (FTP code 230)&#xa;drwxr-xr-x   2 ftp      ftp          4096 Oct 21 12:00 pub"/>"#;
+
+    fn ftp_xml(scripts: &str) -> String {
+        xml_with_scripts("").replace(
+            r#"<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="http" method="probed" conf="10"/></port>"#,
+            &format!(
+                r#"<port protocol="tcp" portid="21"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ftp" method="probed" conf="10"/>{scripts}</port>"#
+            ),
+        )
+    }
+
+    #[test]
+    fn ftp_anon_login_allowed_yields_one_medium_confirmed_finding() {
+        let v = parse(&ftp_xml(FTP_ANON_SCRIPT))
+            .expect("parsea")
+            .vulnerabilities;
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].id, None);
+        assert_eq!(v[0].severity, Severity::Medium);
+        assert_eq!(v[0].confidence, Some(Confidence::Confirmed));
+        assert_eq!(v[0].nse_script, "ftp-anon");
+        assert!(v[0].description.contains("Acceso FTP anónimo permitido"));
+        assert!(v[0].description.contains("Anonymous FTP login allowed"));
+    }
+
+    #[test]
+    fn ftp_anon_with_empty_output_yields_nothing() {
+        let v = parse(&ftp_xml(r#"<script id="ftp-anon" output=""/>"#))
+            .expect("parsea")
+            .vulnerabilities;
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn ftp_anon_does_not_duplicate_an_existing_vuln_finding() {
+        let scripts = format!(
+            "{FTP_ANON_SCRIPT}{}",
+            r#"<script id="ftp-vsftpd-backdoor" output="&#xa;  VULNERABLE:&#xa;  vsFTPd backdoor&#xa;    State: VULNERABLE&#xa;    IDs:  CVE:CVE-2011-2523&#xa;"/>"#
+        );
+        let v = parse(&ftp_xml(&scripts)).expect("parsea").vulnerabilities;
+        let cve: Vec<_> = v
+            .iter()
+            .filter(|f| f.nse_script == "ftp-vsftpd-backdoor")
+            .collect();
+        assert_eq!(cve.len(), 1, "{v:?}");
+        assert_eq!(cve[0].id.as_deref(), Some("CVE-2011-2523"));
+        // ftp-anon es un hallazgo distinto (otro script), no un duplicado del CVE.
+        assert_eq!(v.iter().filter(|f| f.nse_script == "ftp-anon").count(), 1);
+        // Un mismo script con VULNERABLE gana sobre la rama de misconfig.
+        let same = parse(&ftp_xml(
+            r#"<script id="ftp-anon" output="Anonymous FTP login allowed&#xa;  State: VULNERABLE"/>"#,
+        ))
+        .expect("parsea")
+        .vulnerabilities;
+        assert_eq!(same.len(), 1, "{same:?}");
+        assert!(!same[0].description.contains("Acceso FTP anónimo permitido"));
     }
 
     #[test]

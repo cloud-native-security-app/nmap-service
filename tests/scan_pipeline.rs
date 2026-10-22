@@ -215,6 +215,7 @@ fn build_pipeline(
         scanner: Arc::new(NmapCliScanner) as Arc<dyn NmapScanner>,
         repository: Arc::new(repo.clone()) as Arc<dyn ScanResultRepository>,
         enricher,
+        patch_verifier: Arc::new(nmap_service::patch_verify::RpmPatchVerifier),
         host_key_store: Arc::new(repo.host_key_store()) as Arc<dyn HostKeyStore>,
         sink: sink.clone() as Arc<dyn ScanResultSink>,
     };

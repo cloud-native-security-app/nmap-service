@@ -342,6 +342,7 @@ fn finding_from_cve(vulnerability: &NvdVulnerability) -> VulnFinding {
         source: VulnSource::Nvd,
         references,
         confidence: None,
+        patch_state: None,
     }
 }
 
