@@ -62,15 +62,17 @@ impl Timing {
 /// `nmap`.
 ///
 /// [`ScanOptions::default`] devuelve la configuración estándar de `ms-nmap`:
-/// `-sV --script vuln` y `-T2`. Estos defaults están autorizados por
+/// `-sV --script vuln,ftp-anon` y `-T2`. Estos defaults están autorizados por
 /// `docs/security-scope.md`. Si se personaliza `detection_flags`, sigue siendo
 /// responsabilidad de quien llama mantenerse dentro de la **detección**
-/// permitida (`-sV`, `--script vuln`): nunca scripts NSE de categoría
-/// `exploit`/`intrusive`.
+/// permitida (`-sV`, `--script vuln,ftp-anon`): nunca scripts NSE de categoría
+/// `exploit`/`intrusive`. `ftp-anon` es de categoría `auth`/`default`/`safe`
+/// (sólo prueba el login anónimo, no intrusivo) y por eso está dentro de la
+/// política autorizada.
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     /// Flags de detección que se pasan a `nmap`, en orden. Default:
-    /// `["-sV", "--script", "vuln"]`.
+    /// `["-sV", "--script", "vuln,ftp-anon"]`.
     pub detection_flags: Vec<String>,
     /// Plantilla de temporización (`-T`). Default: [`Timing::Polite`] (`-T2`).
     pub timing: Timing,
@@ -79,7 +81,11 @@ pub struct ScanOptions {
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
-            detection_flags: vec!["-sV".to_owned(), "--script".to_owned(), "vuln".to_owned()],
+            detection_flags: vec![
+                "-sV".to_owned(),
+                "--script".to_owned(),
+                "vuln,ftp-anon".to_owned(),
+            ],
             timing: Timing::Polite,
         }
     }
@@ -331,7 +337,7 @@ mod tests {
             let cmd = build_command(ip(), has_sudo, &ScanOptions::default());
 
             assert!(cmd.contains("-sV"), "{cmd}");
-            assert!(cmd.contains("--script vuln"), "{cmd}");
+            assert!(cmd.contains("--script vuln,ftp-anon"), "{cmd}");
             assert!(cmd.contains("-oX -"), "{cmd}");
             assert!(cmd.contains("-T2"), "{cmd}");
             assert!(cmd.contains("198.51.100.7"), "{cmd}");

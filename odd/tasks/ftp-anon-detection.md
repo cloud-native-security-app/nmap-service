@@ -21,9 +21,9 @@ This is a scan-configuration decision, not just a parser change: the scan has to
 
 ## Tasks
 
-- [ ] FAD-01 Decide and apply the scan-flag change (likely Option A).
-- [ ] FAD-02 Enable the `ftp-anon` branch in `misconfig_finding` (allowlist entry already designed in `misconfig-findings.md`) and cover it with a real `ftp-anon` XML fixture.
-- [ ] FAD-03 Confirm no duplicate finding when a target also triggers a `vuln`-category FTP script.
+- [x] FAD-01 Decide and apply the scan-flag change (likely Option A).
+- [x] FAD-02 Enable the `ftp-anon` branch in `misconfig_finding` (allowlist entry already designed in `misconfig-findings.md`) and cover it with a real `ftp-anon` XML fixture.
+- [x] FAD-03 Confirm no duplicate finding when a target also triggers a `vuln`-category FTP script.
 
 ## Acceptance criteria
 
@@ -33,3 +33,11 @@ This is a scan-configuration decision, not just a parser change: the scan has to
 ## Checks
 
 Strict TDD with a real `ftp-anon` XML fixture; `make verify`.
+
+## Evidence
+
+- RED: scanner `--script vuln,ftp-anon` test and 2 of 3 new parser ftp-anon tests failed before implementation (the empty-output test passed trivially).
+- GREEN: `make verify` exit 0; lib 197 passed, 0 failed. Docker-based integration tests are `#[ignore]` (requiere Docker) and were skipped in this environment.
+- Fixture provenance: ftp-anon XML is MODELED from the ftp-anon NSE docs, not a captured live scan.
+- No double count: misconfig_finding is only called when the CVE / State:VULNERABLE paths yield nothing (parser.rs call site); test covers a VULNERABLE+CVE ftp script alongside ftp-anon and a VULNERABLE ftp-anon.
+- Change: default `--script vuln,ftp-anon`; `"ftp-anon"` => Medium "Acceso FTP anónimo permitido". Not committed.
