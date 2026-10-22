@@ -53,9 +53,9 @@ fields), then nmap-service, then front; user-service stores it verbatim.
 - [x] AVC-01 (nmap-service, CORE) `patch_state: Option<PatchState>` on `VulnFinding` (`Unpatched` | `Fixed`, snake_case, additive/optional). Old documents deserialize unchanged.
 - [x] AVC-02 (nmap-service, CORE) A `PatchVerifier` port + an RPM adapter: detect distro via `/etc/os-release`, run `dnf updateinfo list cves` once, parse the pending-CVE set, and reconcile the `version_match` findings per the decision above. Pure parsing/classification unit-tested against recorded command outputs (AL2023/RHEL shapes); the distro-detect + command orchestration tested with a fake `RemoteSession`.
 - [x] AVC-03 (nmap-service, CORE) Wire it as a best-effort stage in `run_stages` AFTER parse+enrichment and BEFORE save, reusing the open `session`. A failure/timeout logs (no credentials) and leaves findings untouched; never turns the scan into `Failed`. Save/publish carries the reconciled findings.
-- [ ] AVC-04 (gateway) Accept `patch_state` on its `VulnFinding` (deny_unknown_fields) and relay it untouched. Deploy BEFORE nmap-service.
-- [ ] AVC-05 (user-service) Confirm it stores the reconciled result verbatim (JSONB) — likely no code change; add a guard test if cheap.
-- [ ] AVC-06 (front) Hide `patch_state == "fixed"` findings from the report lists, show a "N descartadas por backport" count (expandable or a note); show `patch_state == "unpatched"` confirmed findings with a "sin parche" note. Export keeps everything.
+- [x] AVC-04 (gateway) Accept `patch_state` on its `VulnFinding` (deny_unknown_fields) and relay it untouched. Deploy BEFORE nmap-service. DONE: commit 07a196b (domain.rs field + PatchState enum + OpenAPI; 3 tests incl. unknown-value rejection). Branch feature/patch_state_plumbing.
+- [x] AVC-05 (user-service) Confirm it stores the reconciled result verbatim (JSONB) — likely no code change; add a guard test if cheap. DONE: commit 37937c0. Verbatim JSONB (StoredScanResult.result = serde_json::Value), no prod change; added testcontainers round-trip guard.
+- [x] AVC-06 (front) Hide `patch_state == "fixed"` findings from the report lists, show a "N descartadas por backport" count (expandable or a note); show `patch_state == "unpatched"` confirmed findings with a "sin parche" note. Export keeps everything. DONE: commit d1d2480. Filter before dedupe/counts; dismissedByBackportNote; "· sin parche" qualifier; export untouched; 64 report+guard tests green.
 
 ## Acceptance criteria
 
