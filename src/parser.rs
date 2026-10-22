@@ -446,6 +446,7 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
             source: VulnSource::NmapNse,
             references: Vec::new(),
             confidence,
+            patch_state: None,
         }]
     } else {
         cves.into_iter()
@@ -457,6 +458,7 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
                 source: VulnSource::NmapNse,
                 references: Vec::new(),
                 confidence,
+                patch_state: None,
             })
             .collect()
     }
@@ -507,6 +509,7 @@ fn misconfig_finding(nse_script: &str, output: &str, haystack: &str) -> Option<V
         source: VulnSource::NmapNse,
         references: Vec::new(),
         confidence: Some(Confidence::Confirmed),
+        patch_state: None,
     })
 }
 
@@ -572,6 +575,7 @@ fn vulns_from_cvss_entries(script: &Node, nse_script: &str) -> Vec<VulnFinding> 
                 source: VulnSource::NmapNse,
                 references: Vec::new(),
                 confidence: Some(Confidence::VersionMatch),
+                patch_state: None,
             }
         })
         .collect()

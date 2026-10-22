@@ -89,6 +89,7 @@ fn sample_result() -> ScanResult {
             source: VulnSource::NmapNse,
             references: vec!["https://www.openssh.com/txt/release-9.3p2".to_owned()],
             confidence: None,
+            patch_state: None,
         }],
         scanned_at: datetime!(2026-08-27 12:30:00 UTC),
     }
@@ -302,6 +303,7 @@ fn sample_nvd_findings() -> Vec<VulnFinding> {
         source: VulnSource::Nvd,
         references: vec!["https://example.test/advisory".to_owned()],
         confidence: None,
+        patch_state: None,
     }]
 }
 

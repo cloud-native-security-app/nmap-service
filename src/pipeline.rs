@@ -50,6 +50,7 @@ use crate::messaging::consumer::{
 };
 use crate::messaging::publisher::{ScanOutcome, ScanResultSink};
 use crate::parser;
+use crate::patch_verify::PatchVerifier;
 use crate::repository::ScanResultRepository;
 use crate::scanner::{NmapScanner, ScanOptions};
 use crate::ssh::{HostKeyStore, RemoteExecutor, SshTimeouts};
@@ -156,6 +157,12 @@ pub struct ServicePorts {
     /// [`crate::enrichment::NvdApiEnricher`] sólo si el enriquecimiento NVD
     /// está habilitado, ver `docs/security-scope.md`).
     pub enricher: Arc<dyn VulnEnricher>,
+    /// Puerto de verificación de parches: se ejecuta tras el enriquecimiento y
+    /// antes de `repository`, reutilizando la sesión SSH del escaneo, para
+    /// reconciliar los hallazgos `version_match` contra el estado real del
+    /// objetivo (adaptador real [`crate::patch_verify::RpmPatchVerifier`]).
+    /// Best-effort: nunca falla el escaneo.
+    pub patch_verifier: Arc<dyn PatchVerifier>,
     /// Almacén de host keys TOFU. En producción es el respaldado por Mongo
     /// ([`crate::repository::MongoHostKeyStore`]), para que sobreviva reinicios
     /// y se comparta entre réplicas.
@@ -188,6 +195,7 @@ pub struct ScanPipeline {
     scanner: Arc<dyn NmapScanner>,
     repository: Arc<dyn ScanResultRepository>,
     enricher: Arc<dyn VulnEnricher>,
+    patch_verifier: Arc<dyn PatchVerifier>,
     host_key_store: Arc<dyn HostKeyStore>,
     sink: Arc<dyn ScanResultSink>,
     config: PipelineConfig,
@@ -208,6 +216,7 @@ impl ScanPipeline {
             scanner: ports.scanner,
             repository: ports.repository,
             enricher: ports.enricher,
+            patch_verifier: ports.patch_verifier,
             host_key_store: ports.host_key_store,
             sink: ports.sink,
             config,
@@ -434,6 +443,30 @@ impl ScanPipeline {
                 Vec::new()
             });
         merge_enrichment_findings(&mut result.vulnerabilities, extra);
+
+        // Verificación de parches best-effort sobre la sesión ya abierta: un
+        // fallo (error SSH, timeout) NUNCA convierte el escaneo en `Failed`; se
+        // registra sin credenciales ni salida de comandos y los hallazgos
+        // quedan intactos (sin verificar).
+        match self
+            .patch_verifier
+            .verify(session.as_ref(), &mut result.vulnerabilities)
+            .await
+        {
+            Ok(summary) => tracing::info!(
+                correlation_id = %request.correlation_id,
+                unpatched = summary.unpatched,
+                fixed = summary.fixed,
+                unverified = summary.unverified,
+                skipped = ?summary.skipped,
+                "verificación de parches completada"
+            ),
+            Err(err) => tracing::warn!(
+                error = %err,
+                correlation_id = %request.correlation_id,
+                "verificación de parches falló; los hallazgos quedan sin verificar"
+            ),
+        }
 
         self.repository
             .save(&result, &request.correlation_id)
@@ -707,7 +740,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::domain::{CorrelationId, PortFinding, Severity, SshCredentialsRef, VulnSource};
+    use crate::domain::{
+        CorrelationId, PatchState, PortFinding, Severity, SshCredentialsRef, VulnSource,
+    };
     use crate::enrichment::EnrichError;
     use crate::messaging::consumer::{
         AckError, Acknowledger, InMemoryScanCancellationSource, InMemoryScanRequestSource,
@@ -715,6 +750,7 @@ mod tests {
     };
     use crate::messaging::publisher::InMemoryScanResultSink;
     use crate::parser::ParseError;
+    use crate::patch_verify::{PatchVerifyError, PatchVerifySummary};
     use crate::repository::{RepoError, ScanId};
     use crate::scanner::ScanError;
     use crate::ssh::{InMemoryHostKeyStore, RemoteSession, SshError};
@@ -989,6 +1025,7 @@ mod tests {
             source,
             references: Vec::new(),
             confidence: None,
+            patch_state: None,
         }
     }
 
@@ -1112,6 +1149,185 @@ mod tests {
         }
     }
 
+    /// Verificador falso: aplica `Fixed` a todo `version_match` o falla.
+    struct StubPatchVerifier {
+        fail: bool,
+    }
+
+    impl StubPatchVerifier {
+        fn noop() -> Self {
+            Self { fail: false }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PatchVerifier for StubPatchVerifier {
+        async fn verify(
+            &self,
+            _session: &dyn RemoteSession,
+            findings: &mut [VulnFinding],
+        ) -> Result<PatchVerifySummary, PatchVerifyError> {
+            if self.fail {
+                return Err(PatchVerifyError::Session(SshError::Timeout));
+            }
+            for f in findings.iter_mut() {
+                f.patch_state = Some(PatchState::Fixed);
+            }
+            Ok(PatchVerifySummary {
+                skipped: None,
+                unpatched: 0,
+                fixed: 0,
+                unverified: 0,
+            })
+        }
+    }
+
+    struct NoopSession;
+
+    #[async_trait::async_trait]
+    impl RemoteSession for NoopSession {
+        async fn run_command(&self, _cmd: &str) -> Result<crate::ssh::CommandOutput, SshError> {
+            unreachable!("el verificador falso no ejecuta comandos")
+        }
+    }
+
+    struct OkExecutor;
+
+    #[async_trait::async_trait]
+    impl RemoteExecutor for OkExecutor {
+        async fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            _user: &str,
+            _credentials: &SshCredentialsRef,
+            _store: &Arc<dyn HostKeyStore>,
+            _timeouts: SshTimeouts,
+        ) -> Result<Box<dyn RemoteSession>, SshError> {
+            Ok(Box::new(NoopSession))
+        }
+    }
+
+    struct XmlScanner;
+
+    #[async_trait::async_trait]
+    impl NmapScanner for XmlScanner {
+        async fn run_scan(
+            &self,
+            _session: &dyn RemoteSession,
+            _target_ip: IpAddr,
+            _has_sudo: bool,
+            _options: &ScanOptions,
+        ) -> Result<String, ScanError> {
+            Ok(include_str!("../tests/fixtures/open_ports_service_version.xml").to_owned())
+        }
+    }
+
+    /// Repositorio que captura lo guardado.
+    #[derive(Default)]
+    struct CapturingRepository(Mutex<Vec<ScanResult>>);
+
+    #[async_trait::async_trait]
+    impl ScanResultRepository for CapturingRepository {
+        async fn save(
+            &self,
+            result: &ScanResult,
+            _correlation_id: &CorrelationId,
+        ) -> Result<ScanId, RepoError> {
+            self.0.lock().expect("lock").push(result.clone());
+            Ok(ScanId::new("scan-1"))
+        }
+
+        async fn find_by_id(&self, _id: &ScanId) -> Result<Option<ScanResult>, RepoError> {
+            unreachable!()
+        }
+
+        async fn find_by_correlation_id(
+            &self,
+            _correlation_id: &CorrelationId,
+        ) -> Result<Option<ScanResult>, RepoError> {
+            Ok(None)
+        }
+    }
+
+    fn version_match_finding() -> VulnFinding {
+        VulnFinding {
+            id: Some("CVE-2024-6387".to_owned()),
+            severity: Severity::High,
+            description: "d".to_owned(),
+            nse_script: "vulners".to_owned(),
+            source: VulnSource::NmapNse,
+            references: Vec::new(),
+            confidence: Some(crate::domain::Confidence::VersionMatch),
+            patch_state: None,
+        }
+    }
+
+    fn pipeline_with_verifier(
+        verifier: StubPatchVerifier,
+        repository: Arc<CapturingRepository>,
+    ) -> ScanPipeline {
+        ScanPipeline::new(
+            ServicePorts {
+                executor: Arc::new(OkExecutor),
+                scanner: Arc::new(XmlScanner),
+                repository,
+                enricher: Arc::new(StubEnricher(vec![version_match_finding()])),
+                patch_verifier: Arc::new(verifier),
+                host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+                sink: Arc::new(InMemoryScanResultSink::new()),
+            },
+            test_config(),
+        )
+    }
+
+    #[tokio::test]
+    async fn patch_verification_runs_after_enrichment_and_the_saved_result_carries_it() {
+        let repo = Arc::new(CapturingRepository::default());
+        let pipeline = pipeline_with_verifier(StubPatchVerifier::noop(), repo.clone());
+
+        let result = pipeline
+            .run_stages(&test_request("corr-patch-ok"))
+            .await
+            .expect("el escaneo termina");
+
+        let finding = result
+            .vulnerabilities
+            .iter()
+            .find(|v| v.id.as_deref() == Some("CVE-2024-6387"))
+            .expect("hallazgo enriquecido presente");
+        assert_eq!(finding.patch_state, Some(PatchState::Fixed));
+        let saved = repo.0.lock().expect("lock");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0], result,
+            "lo guardado lleva los hallazgos reconciliados"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_verification_failure_never_fails_the_scan_and_leaves_findings_untouched() {
+        let repo = Arc::new(CapturingRepository::default());
+        let pipeline = pipeline_with_verifier(StubPatchVerifier { fail: true }, repo.clone());
+
+        let result = pipeline
+            .run_stages(&test_request("corr-patch-fail"))
+            .await
+            .expect("un fallo del verificador no falla el escaneo");
+
+        let finding = result
+            .vulnerabilities
+            .iter()
+            .find(|v| v.id.as_deref() == Some("CVE-2024-6387"))
+            .expect("hallazgo enriquecido presente");
+        assert_eq!(finding.patch_state, None);
+        assert_eq!(
+            finding.confidence,
+            Some(crate::domain::Confidence::VersionMatch)
+        );
+        assert_eq!(repo.0.lock().expect("lock").len(), 1, "igual se persiste");
+    }
+
     fn test_request(correlation_id: &str) -> ScanRequest {
         ScanRequest {
             correlation_id: CorrelationId::from(correlation_id),
@@ -1142,6 +1358,7 @@ mod tests {
             scanner: Arc::new(UnusedScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
+            patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
         };
@@ -1230,6 +1447,7 @@ mod tests {
             scanner: Arc::new(UnusedScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
+            patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
         };
@@ -1328,6 +1546,7 @@ mod tests {
             scanner: Arc::new(UnusedScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
+            patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
         };
@@ -1416,6 +1635,7 @@ mod tests {
             scanner: Arc::new(UnusedScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
+            patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
         };
@@ -1470,6 +1690,7 @@ mod tests {
             scanner: Arc::new(UnusedScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
+            patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
         };
@@ -1504,6 +1725,7 @@ mod tests {
             scanner: Arc::new(UnusedScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
+            patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
         };
@@ -1638,6 +1860,7 @@ mod tests {
                 scanner: Arc::new(UnusedScanner),
                 repository,
                 enricher: Arc::new(StubEnricher(Vec::new())),
+                patch_verifier: Arc::new(StubPatchVerifier::noop()),
                 host_key_store: Arc::new(InMemoryHostKeyStore::new()),
                 sink,
             },

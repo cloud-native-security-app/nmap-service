@@ -18,6 +18,7 @@ pub mod domain;
 pub mod enrichment;
 pub mod messaging;
 pub mod parser;
+pub mod patch_verify;
 pub mod pipeline;
 pub mod repository;
 pub mod scanner;
