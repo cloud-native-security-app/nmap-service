@@ -128,6 +128,7 @@ mod tests {
             source: VulnSource::ExploitDb,
             references: Vec::new(),
             confidence: None,
+            patch_state: None,
         }
     }
 

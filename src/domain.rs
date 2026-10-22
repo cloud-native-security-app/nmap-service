@@ -280,6 +280,20 @@ pub enum Confidence {
     VersionMatch,
 }
 
+/// Estado de parche de un [`VulnFinding`] tras la verificación autenticada
+/// contra el objetivo (ver [`crate::patch_verify`]). Se serializa en
+/// `snake_case`. Un hallazgo sin estado (`None`) no fue verificado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchState {
+    /// El objetivo informa una actualización de seguridad pendiente para el
+    /// CVE: sigue sin parchear.
+    Unpatched,
+    /// El objetivo no informa actualización pendiente para el CVE: corregido
+    /// (p. ej. por un backport de la distribución).
+    Fixed,
+}
+
 /// Un hallazgo de vulnerabilidad: de un script NSE de categoría `vuln`
 /// ([`VulnSource::NmapNse`]) o de un enriquecedor posterior como Exploit-DB
 /// ([`VulnSource::ExploitDb`], ver [`crate::enrichment`]).
@@ -306,6 +320,10 @@ pub struct VulnFinding {
     /// serializar). Ver [`Confidence`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
+    /// Resultado de la verificación de parches contra el objetivo. `None` = no
+    /// verificado (se omite al serializar). Ver [`PatchState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_state: Option<PatchState>,
 }
 
 /// Origen por defecto al deserializar un [`VulnFinding`] persistido antes de
@@ -378,6 +396,7 @@ mod tests {
                     source: VulnSource::NmapNse,
                     references: vec!["https://www.openssh.com/txt/release-9.3p2".to_owned()],
                     confidence: None,
+                    patch_state: None,
                 },
                 VulnFinding {
                     id: Some("CVE-2011-2523".to_owned()),
@@ -388,6 +407,7 @@ mod tests {
                     source: VulnSource::ExploitDb,
                     references: vec!["https://www.exploit-db.com/exploits/49757".to_owned()],
                     confidence: None,
+                    patch_state: None,
                 },
             ],
             scanned_at: datetime!(2026-08-27 12:30:00 UTC),
@@ -559,6 +579,7 @@ mod tests {
             source: VulnSource::NmapNse,
             references: Vec::new(),
             confidence: None,
+            patch_state: None,
         };
 
         let json = serde_json::to_value(&finding).expect("serializa");
@@ -574,5 +595,42 @@ mod tests {
 
         let restored: VulnFinding = serde_json::from_value(json).expect("deserializa");
         assert_eq!(restored, finding);
+    }
+
+    #[test]
+    fn vuln_finding_omits_patch_state_when_none_and_uses_snake_case_otherwise() {
+        let mut finding = VulnFinding {
+            id: Some("CVE-2011-2523".to_owned()),
+            severity: Severity::High,
+            description: "d".to_owned(),
+            nse_script: "vulners".to_owned(),
+            source: VulnSource::NmapNse,
+            references: Vec::new(),
+            confidence: None,
+            patch_state: None,
+        };
+
+        let json = serde_json::to_value(&finding).expect("serializa");
+        assert!(json.get("patch_state").is_none(), "{json}");
+
+        finding.patch_state = Some(PatchState::Unpatched);
+        let json = serde_json::to_value(&finding).expect("serializa");
+        assert_eq!(json["patch_state"], "unpatched");
+
+        finding.patch_state = Some(PatchState::Fixed);
+        let json = serde_json::to_value(&finding).expect("serializa");
+        assert_eq!(json["patch_state"], "fixed");
+
+        let restored: VulnFinding = serde_json::from_value(json).expect("deserializa");
+        assert_eq!(restored, finding);
+    }
+
+    #[test]
+    fn vuln_finding_persisted_before_patch_state_deserializes_with_none() {
+        let json = r#"{"id":"CVE-1","severity":"high","description":"d","nse_script":"vulners","confidence":"version_match"}"#;
+
+        let finding: VulnFinding = serde_json::from_str(json).expect("deserializa");
+
+        assert_eq!(finding.patch_state, None);
     }
 }

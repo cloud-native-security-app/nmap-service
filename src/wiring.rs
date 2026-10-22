@@ -16,6 +16,8 @@
 //!   [`NvdApiEnricher`] (egress de red opt-in, ver `docs/security-scope.md`). Si
 //!   está deshabilitado, este módulo no construye `NvdApiEnricher` en absoluto:
 //!   no hay ninguna posibilidad de llamada de red hacia NVD.
+//! - [`PatchVerifier`] -> [`RpmPatchVerifier`] (comandos de sólo lectura sobre la
+//!   sesión SSH del escaneo, best-effort).
 //! - [`ScanRequestSource`] -> [`SqsScanRequestSource`],
 //!   [`ScanCancellationSource`] -> [`SqsScanCancellationSource`],
 //!   [`ScanResultSink`] -> [`SnsScanResultSink`]: SQS/SNS vía el SDK de AWS, con
@@ -35,6 +37,7 @@ use crate::messaging::consumer::{ScanCancellationSource, ScanRequestSource};
 use crate::messaging::publisher::ScanResultSink;
 use crate::messaging::sns::SnsScanResultSink;
 use crate::messaging::sqs::{SqsScanCancellationSource, SqsScanRequestSource};
+use crate::patch_verify::{PatchVerifier, RpmPatchVerifier};
 use crate::repository::{MongoRepository, RepoError, ScanResultRepository};
 use crate::scanner::{NmapCliScanner, NmapScanner};
 use crate::ssh::{HostKeyStore, RemoteExecutor, RusshExecutor};
@@ -142,6 +145,7 @@ pub async fn service_ports_from_config(
     }
 
     let enricher: Arc<dyn VulnEnricher> = Arc::new(CompositeVulnEnricher::new(enrichers));
+    let patch_verifier: Arc<dyn PatchVerifier> = Arc::new(RpmPatchVerifier);
     let repository: Arc<dyn ScanResultRepository> = Arc::new(repo);
 
     // Mensajería: los tres adaptadores reales del SDK de AWS. Credenciales de la
@@ -177,6 +181,7 @@ pub async fn service_ports_from_config(
             scanner,
             repository,
             enricher,
+            patch_verifier,
             host_key_store,
             sink,
         },
