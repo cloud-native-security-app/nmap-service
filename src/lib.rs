@@ -22,6 +22,7 @@ pub mod patch_verify;
 pub mod pipeline;
 pub mod repository;
 pub mod scanner;
+pub mod security_events;
 pub mod ssh;
 pub mod wiring;
 
