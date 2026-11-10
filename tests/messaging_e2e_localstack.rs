@@ -169,6 +169,7 @@ async fn queued_scan_request_ends_in_a_published_completed_outcome_and_shutdown_
         scan_requests_dlq_url: url(&requests_dlq),
         scan_cancellations_dlq_url: url(&cancellations_dlq),
         scan_outcomes_topic_arn: topic_arn,
+        security_events_stream_name: None,
     };
     let (ports, source, cancellations) = wiring::service_ports_from_config(&config)
         .await
@@ -313,6 +314,7 @@ async fn rejected_scan_request_goes_to_the_dlq_and_publishes_a_failed_outcome() 
         scan_requests_dlq_url: url(&requests_dlq),
         scan_cancellations_dlq_url: url(&cancellations_dlq),
         scan_outcomes_topic_arn: topic_arn,
+        security_events_stream_name: None,
     };
     let (ports, source, cancellations) = wiring::service_ports_from_config(&config)
         .await

@@ -53,6 +53,7 @@ use crate::parser;
 use crate::patch_verify::PatchVerifier;
 use crate::repository::ScanResultRepository;
 use crate::scanner::{NmapScanner, ScanOptions};
+use crate::security_events::SecurityEventPublisher;
 use crate::ssh::{HostKeyStore, RemoteExecutor, SshTimeouts};
 
 /// Motivo publicado en [`ScanOutcome::Failed`] cuando un escaneo se detuvo por
@@ -169,6 +170,10 @@ pub struct ServicePorts {
     pub host_key_store: Arc<dyn HostKeyStore>,
     /// Destino de los desenlaces de escaneo hacia el Broker.
     pub sink: Arc<dyn ScanResultSink>,
+    /// Destino de los eventos de seguridad (Kinesis `security-events`,
+    /// feature `security_event_publisher`). Los fallos de publicación nunca
+    /// afectan al escaneo (ver [`crate::security_events::emit`]).
+    pub security_events: Arc<dyn SecurityEventPublisher>,
 }
 
 /// Parámetros de despliegue del pipeline que no son puertos ni viajan en el
@@ -198,6 +203,9 @@ pub struct ScanPipeline {
     patch_verifier: Arc<dyn PatchVerifier>,
     host_key_store: Arc<dyn HostKeyStore>,
     sink: Arc<dyn ScanResultSink>,
+    // Se lee en los puntos de emisión del pipeline (SEP-04).
+    #[allow(dead_code)]
+    security_events: Arc<dyn SecurityEventPublisher>,
     config: PipelineConfig,
     cancellations: CancellationRegistry,
 }
@@ -219,6 +227,7 @@ impl ScanPipeline {
             patch_verifier: ports.patch_verifier,
             host_key_store: ports.host_key_store,
             sink: ports.sink,
+            security_events: ports.security_events,
             config,
             cancellations: CancellationRegistry::default(),
         }
@@ -753,6 +762,7 @@ mod tests {
     use crate::patch_verify::{PatchVerifyError, PatchVerifySummary};
     use crate::repository::{RepoError, ScanId};
     use crate::scanner::ScanError;
+    use crate::security_events::NoopSecurityEventPublisher;
     use crate::ssh::{InMemoryHostKeyStore, RemoteSession, SshError};
 
     const SECRET: &str = "hunter2-super-secret-token";
@@ -1276,6 +1286,7 @@ mod tests {
                 patch_verifier: Arc::new(verifier),
                 host_key_store: Arc::new(InMemoryHostKeyStore::new()),
                 sink: Arc::new(InMemoryScanResultSink::new()),
+                security_events: Arc::new(NoopSecurityEventPublisher),
             },
             test_config(),
         )
@@ -1361,6 +1372,7 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
+            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
 
@@ -1450,6 +1462,7 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
+            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
 
@@ -1549,6 +1562,7 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
+            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
         let correlation_id = CorrelationId::from("corr-cancel-mid-flight");
@@ -1638,6 +1652,7 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
+            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
         let correlation_id = CorrelationId::from("corr-cancel-during-started-publish");
@@ -1693,6 +1708,7 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
+            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
         let correlation_id = CorrelationId::from("corr-cancel-late");
@@ -1728,6 +1744,7 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
+            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
 
@@ -1863,6 +1880,7 @@ mod tests {
                 patch_verifier: Arc::new(StubPatchVerifier::noop()),
                 host_key_store: Arc::new(InMemoryHostKeyStore::new()),
                 sink,
+                security_events: Arc::new(NoopSecurityEventPublisher),
             },
             test_config(),
         )
