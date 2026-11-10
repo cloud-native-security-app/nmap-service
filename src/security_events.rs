@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::domain::{Confidence, Protocol, Severity};
+use crate::domain::{Confidence, PatchState, Protocol, ScanResult, Severity};
 
 /// Tiempo máximo que la tarea de [`emit`]/[`emit_all`] espera a que el
 /// adaptador publique cada evento antes de soltarlo.
@@ -50,6 +50,13 @@ pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_CHARS: usize = 128;
 /// Máximo de caracteres de un `reason_code`.
 const MAX_REASON_CODE_CHARS: usize = 64;
+
+/// Tope de eventos `finding.critical` por escaneo. El stream `security-events`
+/// tiene un solo shard (1000 registros/s, 1 MiB/s): un host con cientos de CVE
+/// altos no debe saturarlo. Los hallazgos por encima del tope se conservan
+/// (en el resultado persistido y en los contadores de `scan.completed`) pero no
+/// emiten evento propio; se emiten primero los críticos y luego los altos.
+pub const MAX_FINDING_CRITICAL_EVENTS: usize = 50;
 
 /// Tipo de un [`SecurityEvent`]; cubre los 11 valores del contrato aunque
 /// ms-nmap solo produce algunos.
@@ -378,6 +385,58 @@ impl SecurityEvent {
             .or(self.actor_sub.as_deref())
             .unwrap_or(&self.event_id)
     }
+}
+
+/// Eventos que deja un escaneo terminado: primero `scan.completed` (con
+/// `duration_ms` y los contadores de **todos** los hallazgos por severidad) y
+/// luego un `finding.critical` por hallazgo alto o crítico, hasta
+/// [`MAX_FINDING_CRITICAL_EVENTS`] (los críticos primero).
+///
+/// Un hallazgo no emite `finding.critical` si:
+///
+/// - su `patch_state` es [`PatchState::Fixed`] (el objetivo ya no es
+///   vulnerable: sería una falsa alarma); o
+/// - no tiene `confidence` (el schema exige `confirmed` o `version_match` y
+///   afirmar cualquiera de los dos sería inventar un dato).
+///
+/// `port` y `protocol` son `0` y `tcp`: el dominio no asocia un
+/// [`crate::domain::VulnFinding`] a un puerto (ver `docs/architecture.md`).
+/// `cve_id` es `None` si el id del hallazgo no tiene forma de CVE.
+pub fn completion_events(
+    scan_id: &str,
+    duration_ms: u64,
+    result: &ScanResult,
+) -> Vec<Result<SecurityEvent, InvalidSecurityEvent>> {
+    let mut counts = FindingCounts::default();
+    for finding in &result.vulnerabilities {
+        counts.record(finding.severity);
+    }
+    let mut events = vec![SecurityEvent::scan_completed(scan_id, duration_ms, counts)];
+
+    let candidates = |severity: Severity| {
+        result.vulnerabilities.iter().filter(move |finding| {
+            finding.severity == severity && finding.patch_state != Some(PatchState::Fixed)
+        })
+    };
+    let ordered = candidates(Severity::Critical).chain(candidates(Severity::High));
+    for (finding, confidence) in ordered.filter_map(|f| f.confidence.map(|c| (f, c))) {
+        if events.len() > MAX_FINDING_CRITICAL_EVENTS {
+            tracing::info!(
+                cap = MAX_FINDING_CRITICAL_EVENTS,
+                "hallazgos altos/críticos por encima del tope: solo cuentan en scan.completed"
+            );
+            break;
+        }
+        events.push(SecurityEvent::finding_critical(
+            scan_id,
+            0,
+            Protocol::Tcp,
+            finding.id.as_deref().filter(|id| is_cve_id(id)),
+            finding.severity,
+            confidence,
+        ));
+    }
+    events
 }
 
 /// `true` si `value` tiene la forma de un CVE que acepta el schema
@@ -791,6 +850,164 @@ mod tests {
             1,
             "la tarea debe haberse soltado"
         );
+    }
+
+    fn vuln(
+        id: Option<&str>,
+        severity: Severity,
+        confidence: Option<Confidence>,
+        patch_state: Option<crate::domain::PatchState>,
+    ) -> crate::domain::VulnFinding {
+        crate::domain::VulnFinding {
+            id: id.map(str::to_owned),
+            severity,
+            description: "d".to_owned(),
+            nse_script: "vulners".to_owned(),
+            source: crate::domain::VulnSource::NmapNse,
+            references: Vec::new(),
+            confidence,
+            patch_state,
+        }
+    }
+
+    fn result_with(vulnerabilities: Vec<crate::domain::VulnFinding>) -> crate::domain::ScanResult {
+        crate::domain::ScanResult {
+            host: "198.51.100.7".parse().unwrap(),
+            ports: Vec::new(),
+            vulnerabilities,
+            scanned_at: time::macros::datetime!(2026-11-09 12:30:00 UTC),
+        }
+    }
+
+    fn types(events: &[Result<SecurityEvent, InvalidSecurityEvent>]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|e| e.as_ref().unwrap().event_type_str())
+            .collect()
+    }
+
+    #[test]
+    fn completion_events_start_with_scan_completed_counting_every_finding() {
+        let result = result_with(vec![
+            vuln(
+                Some("CVE-2023-38408"),
+                Severity::Critical,
+                Some(Confidence::Confirmed),
+                None,
+            ),
+            vuln(None, Severity::Medium, None, None),
+            vuln(None, Severity::Unknown, None, None),
+        ]);
+        let events = completion_events("s", 1_500, &result);
+        assert_eq!(types(&events), ["scan.completed", "finding.critical"]);
+        let completed = events[0].as_ref().unwrap();
+        assert_eq!(completed.payload()["duration_ms"], 1_500);
+        assert_eq!(completed.payload()["finding_counts"]["critical"], 1);
+        assert_eq!(completed.payload()["finding_counts"]["medium"], 1);
+        assert_eq!(completed.payload()["finding_counts"]["unknown"], 1);
+    }
+
+    #[test]
+    fn finding_events_are_ordered_critical_first_and_use_port_zero_tcp() {
+        let result = result_with(vec![
+            vuln(
+                Some("CVE-2024-6387"),
+                Severity::High,
+                Some(Confidence::VersionMatch),
+                None,
+            ),
+            vuln(
+                Some("CVE-2023-38408"),
+                Severity::Critical,
+                Some(Confidence::Confirmed),
+                None,
+            ),
+        ]);
+        let events = completion_events("s", 1, &result);
+        let payloads: Vec<_> = events[1..]
+            .iter()
+            .map(|e| e.as_ref().unwrap().payload().clone())
+            .collect();
+        assert_eq!(payloads[0]["severity"], "critical");
+        assert_eq!(payloads[1]["severity"], "high");
+        assert_eq!(payloads[0]["port"], 0);
+        assert_eq!(payloads[0]["protocol"], "tcp");
+    }
+
+    #[test]
+    fn findings_without_confidence_or_already_fixed_get_no_event_but_are_counted() {
+        let result = result_with(vec![
+            vuln(None, Severity::High, None, None),
+            vuln(
+                Some("CVE-2024-6387"),
+                Severity::High,
+                Some(Confidence::VersionMatch),
+                Some(crate::domain::PatchState::Fixed),
+            ),
+            vuln(
+                Some("CVE-2024-1111"),
+                Severity::High,
+                Some(Confidence::Confirmed),
+                Some(crate::domain::PatchState::Unpatched),
+            ),
+        ]);
+        let events = completion_events("s", 1, &result);
+        assert_eq!(types(&events), ["scan.completed", "finding.critical"]);
+        assert_eq!(
+            events[0].as_ref().unwrap().payload()["finding_counts"]["high"],
+            3
+        );
+    }
+
+    #[test]
+    fn a_finding_id_that_is_not_a_cve_is_reported_as_null() {
+        let result = result_with(vec![vuln(
+            Some("EDB-12345"),
+            Severity::High,
+            Some(Confidence::Confirmed),
+            None,
+        )]);
+        let events = completion_events("s", 1, &result);
+        assert!(events[1].as_ref().unwrap().payload()["cve_id"].is_null());
+    }
+
+    #[test]
+    fn finding_events_are_capped_and_the_rest_only_count_in_scan_completed() {
+        let findings = (0..MAX_FINDING_CRITICAL_EVENTS + 7)
+            .map(|_| vuln(None, Severity::High, Some(Confidence::Confirmed), None))
+            .collect();
+        let events = completion_events("s", 1, &result_with(findings));
+        assert_eq!(events.len(), 1 + MAX_FINDING_CRITICAL_EVENTS);
+        assert_eq!(MAX_FINDING_CRITICAL_EVENTS, 50);
+        assert_eq!(
+            events[0].as_ref().unwrap().payload()["finding_counts"]["high"],
+            MAX_FINDING_CRITICAL_EVENTS as u64 + 7
+        );
+    }
+
+    #[test]
+    fn the_cap_keeps_the_most_severe_findings() {
+        let mut findings: Vec<_> = (0..MAX_FINDING_CRITICAL_EVENTS)
+            .map(|_| vuln(None, Severity::High, Some(Confidence::Confirmed), None))
+            .collect();
+        findings.push(vuln(
+            None,
+            Severity::Critical,
+            Some(Confidence::Confirmed),
+            None,
+        ));
+        let events = completion_events("s", 1, &result_with(findings));
+        assert_eq!(
+            events[1].as_ref().unwrap().payload()["severity"],
+            "critical"
+        );
+    }
+
+    #[test]
+    fn an_invalid_scan_id_yields_only_invalid_results_without_panicking() {
+        let events = completion_events("", 1, &result_with(Vec::new()));
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_err());
     }
 
     #[derive(Default)]
