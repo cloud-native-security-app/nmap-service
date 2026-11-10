@@ -24,6 +24,9 @@
 //!   la cadena de credenciales por defecto (rol de la tarea ECS) y los CA del
 //!   sistema para HTTPS; el endpoint alternativo (`AWS_ENDPOINT_URL`) existe
 //!   sólo para LocalStack (ver `src/messaging/sqs.rs`, `src/messaging/sns.rs`).
+//! - [`SecurityEventPublisher`] -> [`KinesisSecurityEventPublisher`] si
+//!   `SECURITY_EVENTS_STREAM_NAME` está definida; si no,
+//!   [`NoopSecurityEventPublisher`] y un único log informativo de arranque.
 
 use std::sync::Arc;
 
@@ -34,12 +37,14 @@ use crate::enrichment::{
     CompositeVulnEnricher, EnrichError, ExploitDbEnricher, NvdApiEnricher, NvdCache, VulnEnricher,
 };
 use crate::messaging::consumer::{ScanCancellationSource, ScanRequestSource};
+use crate::messaging::kinesis::KinesisSecurityEventPublisher;
 use crate::messaging::publisher::ScanResultSink;
 use crate::messaging::sns::SnsScanResultSink;
 use crate::messaging::sqs::{SqsScanCancellationSource, SqsScanRequestSource};
 use crate::patch_verify::{PatchVerifier, RpmPatchVerifier};
 use crate::repository::{MongoRepository, RepoError, ScanResultRepository};
 use crate::scanner::{NmapCliScanner, NmapScanner};
+use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
 use crate::ssh::{HostKeyStore, RemoteExecutor, RusshExecutor};
 use crate::ServicePorts;
 
@@ -175,6 +180,31 @@ pub async fn service_ports_from_config(
         SnsScanResultSink::connect(region, endpoint, config.scan_outcomes_topic_arn.clone()).await,
     );
 
+    // Sin `SECURITY_EVENTS_STREAM_NAME` no se publican eventos (no-op): las
+    // instalaciones locales anteriores a esta feature siguen funcionando.
+    let security_events: Arc<dyn SecurityEventPublisher> = match config
+        .security_events_stream_name
+        .as_deref()
+    {
+        Some(stream_name) => {
+            tracing::info!(
+                stream_name,
+                "publicando eventos de seguridad en el stream de Kinesis"
+            );
+            Arc::new(
+                KinesisSecurityEventPublisher::connect(region, endpoint, stream_name.to_owned())
+                    .await,
+            )
+        }
+        None => {
+            tracing::info!(
+                "SECURITY_EVENTS_STREAM_NAME no está definida: no se publican eventos de \
+                     seguridad"
+            );
+            Arc::new(NoopSecurityEventPublisher)
+        }
+    };
+
     Ok((
         ServicePorts {
             executor,
@@ -184,6 +214,7 @@ pub async fn service_ports_from_config(
             patch_verifier,
             host_key_store,
             sink,
+            security_events,
         },
         source,
         cancellations,
