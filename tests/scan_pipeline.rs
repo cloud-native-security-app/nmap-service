@@ -31,6 +31,7 @@ use nmap_service::parser;
 use nmap_service::pipeline::{PipelineConfig, ScanPipeline, ServicePorts};
 use nmap_service::repository::{MongoRepository, ScanResultRepository};
 use nmap_service::scanner::{NmapCliScanner, NmapScanner, ScanOptions};
+use nmap_service::security_events::NoopSecurityEventPublisher;
 use nmap_service::ssh::{self, HostKeyStore, RemoteExecutor, RusshExecutor, SshTimeouts};
 
 const SSHD_IMAGE: &str = "lscr.io/linuxserver/openssh-server";
@@ -218,6 +219,7 @@ fn build_pipeline(
         patch_verifier: Arc::new(nmap_service::patch_verify::RpmPatchVerifier),
         host_key_store: Arc::new(repo.host_key_store()) as Arc<dyn HostKeyStore>,
         sink: sink.clone() as Arc<dyn ScanResultSink>,
+        security_events: Arc::new(NoopSecurityEventPublisher),
     };
     ScanPipeline::new(
         ports,

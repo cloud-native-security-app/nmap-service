@@ -129,6 +129,8 @@ mod tests {
             references: Vec::new(),
             confidence: None,
             patch_state: None,
+            port: None,
+            protocol: None,
         }
     }
 

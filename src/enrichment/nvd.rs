@@ -343,6 +343,8 @@ fn finding_from_cve(vulnerability: &NvdVulnerability) -> VulnFinding {
         references,
         confidence: None,
         patch_state: None,
+        port: None,
+        protocol: None,
     }
 }
 

@@ -25,6 +25,13 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
   aísla detrás de los traits `ScanRequestSource`, `ScanCancellationSource` y
   `ScanResultSink`: el resto del servicio no conoce la tecnología concreta, sólo
   los adaptadores reales de `messaging::sqs`, `messaging::sns` (y el `wiring`).
+- **Eventos de seguridad en Kinesis** (feature `security_event_publisher`,
+  KAP-07; contrato `broker/contracts/security-event.schema.json`, stream
+  `security-events`). Además del desenlace SNS, el pipeline publica hechos
+  inmutables (`scan.started`, `scan.completed`, `scan.failed`,
+  `finding.critical`) detrás del puerto `SecurityEventPublisher`, para que el
+  panel de administración los lea sin acoplarse a ms-nmap. Es el espejo del
+  puerto homónimo del Gateway (KAP-06). Ver "Eventos de seguridad".
 - **Persistencia en MongoDB** (`db-nmap`) vía el driver oficial `mongodb`
   (async). Los resultados de escaneo son documentos de estructura variable
   (número de puertos/servicios/vulnerabilidades no es fijo), lo que encaja
@@ -115,8 +122,9 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
    `ScanOutcome::Failed`); esto aplica tanto al composite (un enricher que falla
    no tumba a los demás) como, dentro de `NvdApiEnricher`, a un CPE individual
    (un CPE que falla no aborta los demás CPEs de la misma llamada). Los
-   `VulnFinding` añadidos se deduplican por CVE contra los que ya trajo `nmap` y
-   entre sí.
+   `VulnFinding` añadidos se deduplican por CVE contra los que ya trajo `nmap` (en
+   cualquier puerto) y entre sí; los hallazgos de `nmap` en puertos distintos no
+   se fusionan.
 7. **`repository`** — persistencia del `ScanResult` en MongoDB, del trust store
    TOFU (`MongoHostKeyStore`) y de la caché de NVD con TTL (`MongoNvdCache`,
    colección `nvd_cache`, índice `expireAfterSeconds` sobre `cached_at`).
@@ -155,6 +163,9 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
    credenciales) para que el Gateway cierre el escaneo. Sin `correlation_id`
    (no es JSON, falta o no es cadena) queda sólo la DLQ y el log. Los puertos
    siguen neutrales al transporte; la publicación es best-effort.
+   El submódulo `kinesis` implementa `SecurityEventPublisher`
+   (`KinesisSecurityEventPublisher`, `aws-sdk-kinesis`): ver "Eventos de
+   seguridad".
 9. **`pipeline` (`src/pipeline.rs`)** — orquesta
    `consumer -> ssh -> scanner -> parser -> enrichment -> repository -> publisher`
    en `ScanPipeline`, construido a partir de los puertos inyectados
@@ -182,6 +193,76 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
     tracing y config, llama a `wiring::service_ports_from_config` y a
     `lib::run(...)`, y cancela el token de apagado al recibir `SIGTERM` o
     `Ctrl-C`. Sin lógica de negocio propia.
+
+### Eventos de seguridad
+
+`src/security_events.rs` define el puerto `SecurityEventPublisher`, el sobre
+`SecurityEvent` (`source: nmap-service`, clave de partición `scan_id`, sin
+`schema_version`) y los adaptadores no-op y en memoria; `messaging::kinesis`
+aporta el real. `ServicePorts.security_events` lo inyecta; `wiring` elige el
+adaptador según `SECURITY_EVENTS_STREAM_NAME` (ausente o en blanco: no-op y un
+log informativo de arranque; nombre inválido: error de configuración al
+arrancar). `AWS_ENDPOINT_URL` se respeta como en SNS/SQS.
+
+**Aislamiento de fallos.** Publicar nunca falla ni retrasa el escaneo ni el
+publish SNS: `emit`/`emit_all` lanzan una tarea `tokio` desacoplada con tope de
+5 s por evento y solo loggean el tipo de evento. Al primer fallo del lote se
+descarta el resto. Un evento puede perderse si el proceso muere antes de que la
+tarea corra (aceptado: el estado del escaneo en Mongo/SNS es la fuente de
+verdad; no hay reintentos ni outbox).
+
+**Puntos de emisión** (junto al publish SNS, en los mismos momentos):
+
+| Evento | Dónde | Condición |
+|---|---|---|
+| `scan.started` | `pipeline::ScanPipeline::process_one` | antes del publish SNS de `Started` |
+| `scan.completed` | `process_one`, vía `security_events::completion_events` | etapas terminadas con éxito; `duration_ms` desde el arranque del escaneo |
+| `finding.critical` | `completion_events` | uno por hallazgo alto o crítico, tras `scan.completed` |
+| `scan.failed` | `process_one` | fallo de etapa o cancelación, con `reason_code` |
+| `scan.failed` | `pipeline::next_valid_request` | solicitud rechazada con `correlation_id` (`rejected_request`) |
+
+El camino de idempotencia (republicar un escaneo ya terminado) no emite
+eventos: no hubo escaneo nuevo.
+
+**Mapeo de severidad** (`scan.completed.finding_counts`): 1:1 con `Severity`
+(`critical`, `high`, `medium`, `low`, `info`, `unknown`); cada `VulnFinding`
+suma en el contador de su severidad, incluidos los `patch_state: fixed`. Los
+puertos abiertos no tienen severidad y no se cuentan.
+
+**Mapeo de fallos** (`scan.failed.reason_code`, nunca texto de error):
+
+| Fallo | `reason_code` |
+|---|---|
+| `SshError::AuthFailed` / `Timeout` / `Unreachable` | `ssh_auth_failed` / `ssh_timeout` / `ssh_unreachable` |
+| `SshError::HostKeyMismatch` / `HostKeyStore` | `ssh_host_key_mismatch` / `ssh_host_key_store` |
+| `SshError::Protocol` / `Io` | `ssh_protocol_error` / `ssh_io_error` |
+| `ScanError::ToolNotAvailable` / `InsufficientPrivileges` / `NmapFailed` | `nmap_not_available` / `nmap_insufficient_privileges` / `nmap_failed` |
+| `ScanError::Ssh(e)` | el slug `ssh_*` de `e` |
+| `ParseError` | `parse_failed` |
+| `RepoError` al guardar | `persistence_failed` |
+| cancelación explícita | `scan_cancelled` |
+| solicitud inválida | `rejected_request` |
+
+**`finding.critical`.** Solo para hallazgos `high`/`critical` con `confidence`
+(`confirmed` o `version_match`); sin `confidence` el schema no admite el evento
+y afirmar una sería inventar un dato (el hallazgo sí cuenta en
+`scan.completed`). Los `patch_state: fixed` no emiten (el objetivo ya no es
+vulnerable). `cve_id` es `null` si el id no tiene forma de CVE. **Tope: 50
+eventos por escaneo** (`MAX_FINDING_CRITICAL_EVENTS`, para proteger el stream
+de 1 shard), los críticos primero; el resto solo cuenta en `scan.completed`.
+**Puerto del hallazgo (`finding-port`).** `VulnFinding` lleva `port` y
+`protocol` opcionales: el parser los rellena para los scripts NSE de un
+`<port>` y los deja en `None` para los de `<hostscript>`, los de enriquecimiento
+(Exploit-DB/NVD) y los de la verificación autenticada de parches (que solo
+modifica `confidence`/`patch_state` y conserva el puerto). `finding.critical`
+usa esos valores y emite `null` en `port`/`protocol` para un hallazgo a nivel de
+host (ya no existe el `port: 0` provisional). Se omiten al serializar cuando son
+`None`, así los documentos antiguos de MongoDB y los consumidores que no los
+conocen siguen funcionando. Deduplicación: el parser nunca fusiona hallazgos
+de distintos puertos, de modo que un mismo CVE en dos puertos produce dos
+hallazgos y dos eventos; solo `merge_enrichment_findings` deduplica por CVE y
+descarta un hallazgo de enriquecimiento (sin puerto) cuando ese CVE ya existe en
+cualquier puerto.
 
 ### Apagado ordenado
 

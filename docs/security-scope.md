@@ -43,6 +43,17 @@
 - La configuración (`src/config.rs`) lee credenciales/tokens desde variables
   de entorno o un gestor de secretos — nunca hardcodeadas en el repo.
 
+## Eventos de seguridad (Kinesis)
+
+- Los eventos que `ms-nmap` publica en el stream `security-events` (feature
+  `security_event_publisher`) llevan solo el `scan_id` (`correlation_id`),
+  contadores por severidad, duración, y por hallazgo alto/crítico el CVE, la
+  severidad y la confianza. Nunca llevan credenciales, la IP del objetivo, texto
+  de errores ni salida de `nmap`: los motivos de fallo son slugs fijos.
+- Los logs de un fallo de publicación incluyen solo el tipo de evento.
+- Es egress hacia el endpoint público de Kinesis con el rol de la tarea ECS
+  (sin claves estáticas); el rol necesita `kinesis:PutRecord` sobre el stream.
+
 ## Identidad del objetivo (host key SSH)
 
 - La conexión SSH usa Trust On First Use (TOFU): la primera vez que se
