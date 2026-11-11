@@ -122,8 +122,9 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
    `ScanOutcome::Failed`); esto aplica tanto al composite (un enricher que falla
    no tumba a los demás) como, dentro de `NvdApiEnricher`, a un CPE individual
    (un CPE que falla no aborta los demás CPEs de la misma llamada). Los
-   `VulnFinding` añadidos se deduplican por CVE contra los que ya trajo `nmap` y
-   entre sí.
+   `VulnFinding` añadidos se deduplican por CVE contra los que ya trajo `nmap` (en
+   cualquier puerto) y entre sí; los hallazgos de `nmap` en puertos distintos no
+   se fusionan.
 7. **`repository`** — persistencia del `ScanResult` en MongoDB, del trust store
    TOFU (`MongoHostKeyStore`) y de la caché de NVD con TTL (`MongoNvdCache`,
    colección `nvd_cache`, índice `expireAfterSeconds` sobre `cached_at`).
@@ -249,10 +250,19 @@ y afirmar una sería inventar un dato (el hallazgo sí cuenta en
 vulnerable). `cve_id` es `null` si el id no tiene forma de CVE. **Tope: 50
 eventos por escaneo** (`MAX_FINDING_CRITICAL_EVENTS`, para proteger el stream
 de 1 shard), los críticos primero; el resto solo cuenta en `scan.completed`.
-**Limitación conocida:** `VulnFinding` no asocia el hallazgo a un puerto, así que
-`port` es `0` y `protocol` `tcp` en todos los eventos. Resolverlo exige un campo
-nuevo en el contrato `scan-outcome` (Gateway, `user-service`, front); queda
-fuera de esta tarea.
+**Puerto del hallazgo (`finding-port`).** `VulnFinding` lleva `port` y
+`protocol` opcionales: el parser los rellena para los scripts NSE de un
+`<port>` y los deja en `None` para los de `<hostscript>`, los de enriquecimiento
+(Exploit-DB/NVD) y los de la verificación autenticada de parches (que solo
+modifica `confidence`/`patch_state` y conserva el puerto). `finding.critical`
+usa esos valores y emite `null` en `port`/`protocol` para un hallazgo a nivel de
+host (ya no existe el `port: 0` provisional). Se omiten al serializar cuando son
+`None`, así los documentos antiguos de MongoDB y los consumidores que no los
+conocen siguen funcionando. Deduplicación: el parser nunca fusiona hallazgos
+de distintos puertos, de modo que un mismo CVE en dos puertos produce dos
+hallazgos y dos eventos; solo `merge_enrichment_findings` deduplica por CVE y
+descarta un hallazgo de enriquecimiento (sin puerto) cuando ese CVE ya existe en
+cualquier puerto.
 
 ### Apagado ordenado
 

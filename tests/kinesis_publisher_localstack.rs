@@ -51,8 +51,8 @@ async fn publishes_the_four_nmap_events_that_read_back_valid_with_scan_id_as_par
         SecurityEvent::scan_completed("corr-42", 1_500, counts).unwrap(),
         SecurityEvent::finding_critical(
             "corr-42",
-            22,
-            Protocol::Tcp,
+            Some(22),
+            Some(Protocol::Tcp),
             Some("CVE-2023-38408"),
             Severity::Critical,
             Confidence::Confirmed,
