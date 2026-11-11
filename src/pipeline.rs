@@ -51,92 +51,13 @@ use crate::messaging::consumer::{
 use crate::messaging::publisher::{ScanOutcome, ScanResultSink};
 use crate::parser;
 use crate::patch_verify::PatchVerifier;
-use crate::repository::{RepoError, ScanResultRepository};
-use crate::scanner::{NmapScanner, ScanError, ScanOptions};
-use crate::security_events::{
-    completion_events, emit, emit_all, SecurityEvent, SecurityEventPublisher,
-};
-use crate::ssh::{HostKeyStore, RemoteExecutor, SshError, SshTimeouts};
+use crate::repository::ScanResultRepository;
+use crate::scanner::{NmapScanner, ScanOptions};
+use crate::ssh::{HostKeyStore, RemoteExecutor, SshTimeouts};
 
 /// Motivo publicado en [`ScanOutcome::Failed`] cuando un escaneo se detuvo por
 /// una cancelación explícita (en vez de un fallo técnico de alguna etapa).
 const CANCELLATION_REASON: &str = "escaneo cancelado por solicitud explícita";
-
-/// `reason_code` de `scan.failed` cuando el escaneo se detuvo por una
-/// cancelación explícita.
-const CANCELLED_REASON_CODE: &str = "scan_cancelled";
-
-/// `reason_code` de `scan.failed` cuando la solicitud se rechazó por inválida
-/// antes de empezar.
-const REJECTED_REQUEST_REASON_CODE: &str = "rejected_request";
-
-/// Fallo de una etapa del pipeline: el texto legible que viaja en
-/// [`ScanOutcome::Failed`] y el slug estable de `scan.failed` (los eventos de
-/// seguridad nunca llevan el texto del error).
-///
-/// Mapeo de fallos a `reason_code`: SSH -> `ssh_auth_failed`, `ssh_timeout`,
-/// `ssh_unreachable`, `ssh_host_key_mismatch`, `ssh_host_key_store`,
-/// `ssh_protocol_error`, `ssh_io_error`; `nmap` -> `nmap_not_available`,
-/// `nmap_insufficient_privileges`, `nmap_failed` (un fallo SSH al lanzarlo
-/// conserva su slug `ssh_*`); parseo -> `parse_failed`; persistencia ->
-/// `persistence_failed`; cancelación -> `scan_cancelled`; solicitud inválida
-/// -> `rejected_request`.
-#[derive(Debug)]
-struct StageFailure {
-    /// Texto del error de la etapa (sin credenciales), para el desenlace SNS.
-    reason: String,
-    /// Slug de `scan.failed`.
-    code: &'static str,
-}
-
-impl StageFailure {
-    fn from_ssh(err: &SshError) -> Self {
-        Self {
-            reason: err.to_string(),
-            code: ssh_reason_code(err),
-        }
-    }
-
-    fn from_scan(err: &ScanError) -> Self {
-        let code = match err {
-            ScanError::ToolNotAvailable => "nmap_not_available",
-            ScanError::InsufficientPrivileges => "nmap_insufficient_privileges",
-            ScanError::Ssh(ssh) => ssh_reason_code(ssh),
-            ScanError::NmapFailed { .. } => "nmap_failed",
-        };
-        Self {
-            reason: err.to_string(),
-            code,
-        }
-    }
-
-    fn from_parse(err: &parser::ParseError) -> Self {
-        Self {
-            reason: err.to_string(),
-            code: "parse_failed",
-        }
-    }
-
-    fn from_repo(err: &RepoError) -> Self {
-        Self {
-            reason: err.to_string(),
-            code: "persistence_failed",
-        }
-    }
-}
-
-/// Slug de `scan.failed` para un fallo SSH.
-fn ssh_reason_code(err: &SshError) -> &'static str {
-    match err {
-        SshError::AuthFailed => "ssh_auth_failed",
-        SshError::Timeout => "ssh_timeout",
-        SshError::Unreachable(_) => "ssh_unreachable",
-        SshError::HostKeyMismatch { .. } => "ssh_host_key_mismatch",
-        SshError::HostKeyStore(_) => "ssh_host_key_store",
-        SshError::Protocol(_) => "ssh_protocol_error",
-        SshError::Io(_) => "ssh_io_error",
-    }
-}
 
 /// Registro de [`CancellationToken`] por `correlation_id` de las tareas de
 /// escaneo en vuelo.
@@ -248,10 +169,6 @@ pub struct ServicePorts {
     pub host_key_store: Arc<dyn HostKeyStore>,
     /// Destino de los desenlaces de escaneo hacia el Broker.
     pub sink: Arc<dyn ScanResultSink>,
-    /// Destino de los eventos de seguridad (Kinesis `security-events`,
-    /// feature `security_event_publisher`). Los fallos de publicación nunca
-    /// afectan al escaneo (ver [`crate::security_events::emit`]).
-    pub security_events: Arc<dyn SecurityEventPublisher>,
 }
 
 /// Parámetros de despliegue del pipeline que no son puertos ni viajan en el
@@ -281,7 +198,6 @@ pub struct ScanPipeline {
     patch_verifier: Arc<dyn PatchVerifier>,
     host_key_store: Arc<dyn HostKeyStore>,
     sink: Arc<dyn ScanResultSink>,
-    security_events: Arc<dyn SecurityEventPublisher>,
     config: PipelineConfig,
     cancellations: CancellationRegistry,
 }
@@ -303,7 +219,6 @@ impl ScanPipeline {
             patch_verifier: ports.patch_verifier,
             host_key_store: ports.host_key_store,
             sink: ports.sink,
-            security_events: ports.security_events,
             config,
             cancellations: CancellationRegistry::default(),
         }
@@ -323,16 +238,6 @@ impl ScanPipeline {
     /// publica como [`ScanOutcome::Failed`] con el `correlation_id` de la
     /// solicitud. Si la propia publicación del desenlace terminal falla, se
     /// registra con `tracing::error!` y se termina (sin reintentos).
-    ///
-    /// ## Eventos de seguridad
-    ///
-    /// En los mismos momentos que el publish SNS emite, sin esperar ni poder
-    /// fallar (ver [`crate::security_events::emit_all`]), `scan.started`, y al
-    /// terminar `scan.completed` + hasta
-    /// [`crate::security_events::MAX_FINDING_CRITICAL_EVENTS`] `finding.critical`
-    /// o `scan.failed` con un `reason_code` (ver `StageFailure`). El camino de
-    /// idempotencia (republicación de un escaneo ya terminado) no emite eventos:
-    /// no hubo escaneo nuevo.
     ///
     /// Registra un [`CancellationToken`] bajo el `correlation_id` de la
     /// solicitud **al arrancar**, antes de publicar
@@ -410,14 +315,6 @@ impl ScanPipeline {
             ),
         }
 
-        // Evento de seguridad `scan.started`: se emite en una tarea desacoplada,
-        // antes del publish SNS, para que ni Kinesis dependa de SNS ni al revés.
-        emit(
-            &self.security_events,
-            SecurityEvent::scan_started(correlation_id.as_str()),
-        );
-
-        let started_at = std::time::Instant::now();
         if let Err(err) = self
             .sink
             .publish(&ScanOutcome::started(correlation_id.clone()))
@@ -430,25 +327,16 @@ impl ScanPipeline {
             );
         }
 
-        let (outcome, events) = tokio::select! {
+        let outcome = tokio::select! {
             result = self.run_stages(&request) => match result {
-                Ok(result) => {
-                    let duration_ms =
-                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let events = completion_events(correlation_id.as_str(), duration_ms, &result);
-                    (ScanOutcome::completed(correlation_id.clone(), result), events)
-                }
-                Err(failure) => {
+                Ok(result) => ScanOutcome::completed(correlation_id.clone(), result),
+                Err(reason) => {
                     tracing::warn!(
                         correlation_id = %correlation_id,
-                        reason = %failure.reason,
+                        reason = %reason,
                         "una etapa del pipeline falló; se publicará un desenlace de error"
                     );
-                    let events = vec![SecurityEvent::scan_failed(
-                        correlation_id.as_str(),
-                        failure.code,
-                    )];
-                    (ScanOutcome::failed(correlation_id.clone(), failure.reason), events)
+                    ScanOutcome::failed(correlation_id.clone(), reason)
                 }
             },
             () = token.cancelled() => {
@@ -456,23 +344,11 @@ impl ScanPipeline {
                     correlation_id = %correlation_id,
                     "escaneo cancelado por solicitud explícita; se detiene antes de completarse"
                 );
-                let events = vec![SecurityEvent::scan_failed(
-                    correlation_id.as_str(),
-                    CANCELLED_REASON_CODE,
-                )];
-                (
-                    ScanOutcome::failed(correlation_id.clone(), CANCELLATION_REASON),
-                    events,
-                )
+                ScanOutcome::failed(correlation_id.clone(), CANCELLATION_REASON)
             }
         };
 
         self.cancellations.unregister(&correlation_id);
-
-        // Eventos de seguridad del desenlace (`scan.completed` + `finding.critical`
-        // o `scan.failed`): desacoplados y sin esperar, así que no retrasan el
-        // publish SNS de abajo ni pueden hacerlo fallar.
-        emit_all(&self.security_events, events);
 
         self.publish_terminal(&outcome).await
     }
@@ -522,10 +398,9 @@ impl ScanPipeline {
     }
 
     /// Ejecuta las etapas SSH -> `nmap` -> parseo -> persistencia. Devuelve el
-    /// [`ScanResult`] o, ante el primer `Err`, un [`StageFailure`] con el
-    /// `reason` legible (`err.to_string()` de la etapa, sin credenciales) y el
-    /// slug de `scan.failed`.
-    async fn run_stages(&self, request: &ScanRequest) -> Result<ScanResult, StageFailure> {
+    /// [`ScanResult`] o, ante el primer `Err`, el `reason` legible ya
+    /// formateado (`err.to_string()` de la etapa, sin credenciales).
+    async fn run_stages(&self, request: &ScanRequest) -> Result<ScanResult, String> {
         let session = self
             .executor
             .connect(
@@ -537,7 +412,7 @@ impl ScanPipeline {
                 self.config.ssh_timeouts,
             )
             .await
-            .map_err(|err| StageFailure::from_ssh(&err))?;
+            .map_err(|err| err.to_string())?;
 
         let xml = self
             .scanner
@@ -548,9 +423,9 @@ impl ScanPipeline {
                 &self.config.scan_options,
             )
             .await
-            .map_err(|err| StageFailure::from_scan(&err))?;
+            .map_err(|err| err.to_string())?;
 
-        let mut result = parser::parse(&xml).map_err(|err| StageFailure::from_parse(&err))?;
+        let mut result = parser::parse(&xml).map_err(|err| err.to_string())?;
 
         // Enriquecimiento best-effort: un fallo aquí NUNCA convierte el escaneo
         // en `ScanOutcome::Failed`; se registra y se continúa con los hallazgos
@@ -596,7 +471,7 @@ impl ScanPipeline {
         self.repository
             .save(&result, &request.correlation_id)
             .await
-            .map_err(|err| StageFailure::from_repo(&err))?;
+            .map_err(|err| err.to_string())?;
 
         Ok(result)
     }
@@ -682,7 +557,7 @@ impl ScanPipeline {
         loop {
             let next = tokio::select! {
                 () = shutdown.cancelled() => break,
-                next = next_valid_request(source.as_ref(), self.sink.as_ref(), &self.security_events) => next,
+                next = next_valid_request(source.as_ref(), self.sink.as_ref()) => next,
             };
             let Some(request) = next else { break };
             let pipeline = self.clone();
@@ -754,13 +629,11 @@ async fn join_all(tasks: &mut JoinSet<()>) {
 /// `correlation_id` ([`ConsumeError::RejectedRequest`]), además se publica en
 /// `sink` un [`ScanOutcome::Failed`] con motivo fijo
 /// ([`REJECTED_REQUEST_REASON`], sin valores del payload) para que el Gateway
-/// cierre la solicitud en vez de dejarla pendiente, y se emite el evento de
-/// seguridad `scan.failed` con `reason_code` `rejected_request`. Sin `correlation_id`
+/// cierre la solicitud en vez de dejarla pendiente. Sin `correlation_id`
 /// utilizable (no es JSON, falta o no es una cadena) sólo hay DLQ + log.
 async fn next_valid_request(
     source: &dyn ScanRequestSource,
     sink: &dyn ScanResultSink,
-    events: &Arc<dyn SecurityEventPublisher>,
 ) -> Option<IncomingScanRequest> {
     loop {
         match source.next_request().await {
@@ -778,13 +651,6 @@ async fn next_valid_request(
                 );
                 // Best-effort: la fuente ya la envió a la DLQ y la borró; si el
                 // desenlace no sale, el Gateway la verá pendiente (como antes).
-                emit(
-                    events,
-                    SecurityEvent::scan_failed(
-                        correlation_id.as_str(),
-                        REJECTED_REQUEST_REASON_CODE,
-                    ),
-                );
                 let outcome = ScanOutcome::failed(correlation_id.clone(), REJECTED_REQUEST_REASON);
                 if let Err(err) = sink.publish(&outcome).await {
                     tracing::error!(
@@ -887,10 +753,6 @@ mod tests {
     use crate::patch_verify::{PatchVerifyError, PatchVerifySummary};
     use crate::repository::{RepoError, ScanId};
     use crate::scanner::ScanError;
-    use crate::security_events::{
-        NoopSecurityEventPublisher, RecordingSecurityEventPublisher, SecurityEvent,
-        SecurityEventError,
-    };
     use crate::ssh::{InMemoryHostKeyStore, RemoteSession, SshError};
 
     const SECRET: &str = "hunter2-super-secret-token";
@@ -917,22 +779,20 @@ mod tests {
             request_json("corr-2"),
         ]);
 
-        let first = next_valid_request(&source, &InMemoryScanResultSink::new(), &noop_events())
+        let first = next_valid_request(&source, &InMemoryScanResultSink::new())
             .await
             .expect("primera válida");
         assert_eq!(first.request.correlation_id.as_str(), "corr-1");
 
         // El mensaje envenenado se descarta y se entrega la siguiente válida.
-        let second = next_valid_request(&source, &InMemoryScanResultSink::new(), &noop_events())
+        let second = next_valid_request(&source, &InMemoryScanResultSink::new())
             .await
             .expect("segunda válida");
         assert_eq!(second.request.correlation_id.as_str(), "corr-2");
 
-        assert!(
-            next_valid_request(&source, &InMemoryScanResultSink::new(), &noop_events())
-                .await
-                .is_none()
-        );
+        assert!(next_valid_request(&source, &InMemoryScanResultSink::new())
+            .await
+            .is_none());
     }
 
     fn invalid_ip_request_json(correlation_id: &str) -> Vec<u8> {
@@ -957,7 +817,7 @@ mod tests {
         ]);
         let sink = InMemoryScanResultSink::new();
 
-        let next = next_valid_request(&source, &sink, &noop_events())
+        let next = next_valid_request(&source, &sink)
             .await
             .expect("continúa con la siguiente válida");
 
@@ -986,9 +846,7 @@ mod tests {
         ]);
         let sink = InMemoryScanResultSink::new();
 
-        let next = next_valid_request(&source, &sink, &noop_events())
-            .await
-            .expect("válida");
+        let next = next_valid_request(&source, &sink).await.expect("válida");
 
         assert_eq!(next.request.correlation_id.as_str(), "corr-ok");
         assert!(sink.published().is_empty(), "{:?}", sink.published());
@@ -1015,7 +873,7 @@ mod tests {
             request_json("corr-ok"),
         ]);
 
-        let next = next_valid_request(&source, &FailingSink, &noop_events())
+        let next = next_valid_request(&source, &FailingSink)
             .await
             .expect("el fallo de publicación no detiene el consumo");
 
@@ -1047,7 +905,7 @@ mod tests {
         };
 
         assert!(
-            next_valid_request(&source, &InMemoryScanResultSink::new(), &noop_events())
+            next_valid_request(&source, &InMemoryScanResultSink::new())
                 .await
                 .is_none(),
             "un fallo de transporte detiene el consumo en la primera vuelta"
@@ -1168,8 +1026,6 @@ mod tests {
             references: Vec::new(),
             confidence: None,
             patch_state: None,
-            port: None,
-            protocol: None,
         }
     }
 
@@ -1404,8 +1260,6 @@ mod tests {
             references: Vec::new(),
             confidence: Some(crate::domain::Confidence::VersionMatch),
             patch_state: None,
-            port: None,
-            protocol: None,
         }
     }
 
@@ -1422,7 +1276,6 @@ mod tests {
                 patch_verifier: Arc::new(verifier),
                 host_key_store: Arc::new(InMemoryHostKeyStore::new()),
                 sink: Arc::new(InMemoryScanResultSink::new()),
-                security_events: Arc::new(NoopSecurityEventPublisher),
             },
             test_config(),
         )
@@ -1508,7 +1361,6 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
-            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
 
@@ -1598,7 +1450,6 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
-            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
 
@@ -1698,7 +1549,6 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
-            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
         let correlation_id = CorrelationId::from("corr-cancel-mid-flight");
@@ -1788,7 +1638,6 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
-            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
         let correlation_id = CorrelationId::from("corr-cancel-during-started-publish");
@@ -1844,7 +1693,6 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
-            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
         let correlation_id = CorrelationId::from("corr-cancel-late");
@@ -1880,7 +1728,6 @@ mod tests {
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
             host_key_store: Arc::new(InMemoryHostKeyStore::new()),
             sink: sink.clone(),
-            security_events: Arc::new(NoopSecurityEventPublisher),
         };
         let pipeline = ScanPipeline::new(ports, test_config());
 
@@ -2016,7 +1863,6 @@ mod tests {
                 patch_verifier: Arc::new(StubPatchVerifier::noop()),
                 host_key_store: Arc::new(InMemoryHostKeyStore::new()),
                 sink,
-                security_events: Arc::new(NoopSecurityEventPublisher),
             },
             test_config(),
         )
@@ -2380,272 +2226,5 @@ mod tests {
         let incoming = IncomingScanRequest::new(test_request("corr-noop-ack"));
 
         incoming.ack().await.expect("el ack por defecto no falla");
-    }
-
-    // --- KAP-07: eventos de seguridad hacia Kinesis ---
-
-    fn noop_events() -> Arc<dyn SecurityEventPublisher> {
-        Arc::new(NoopSecurityEventPublisher)
-    }
-
-    /// Publicador de eventos que siempre falla (Kinesis caído).
-    struct FailingEvents;
-
-    #[async_trait::async_trait]
-    impl SecurityEventPublisher for FailingEvents {
-        async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
-            Err(SecurityEventError::PublishFailed("kinesis caído".into()))
-        }
-    }
-
-    fn event_types(events: &[SecurityEvent]) -> Vec<&'static str> {
-        events.iter().map(SecurityEvent::event_type_str).collect()
-    }
-
-    /// Pipeline que completa el escaneo (fixture sin hallazgos propios más el
-    /// hallazgo `version_match` alto que inyecta el enriquecedor).
-    fn completing_pipeline(
-        sink: Arc<InMemoryScanResultSink>,
-        events: Arc<dyn SecurityEventPublisher>,
-    ) -> ScanPipeline {
-        ScanPipeline::new(
-            ServicePorts {
-                executor: Arc::new(OkExecutor),
-                scanner: Arc::new(XmlScanner),
-                repository: Arc::new(CapturingRepository::default()),
-                enricher: Arc::new(StubEnricher(vec![version_match_finding()])),
-                // Falla a propósito: el hallazgo queda sin `patch_state`.
-                patch_verifier: Arc::new(StubPatchVerifier { fail: true }),
-                host_key_store: Arc::new(InMemoryHostKeyStore::new()),
-                sink,
-                security_events: events,
-            },
-            test_config(),
-        )
-    }
-
-    fn failing_ssh_pipeline(
-        sink: Arc<InMemoryScanResultSink>,
-        events: Arc<dyn SecurityEventPublisher>,
-    ) -> ScanPipeline {
-        ScanPipeline::new(
-            ServicePorts {
-                executor: Arc::new(FailingExecutor),
-                scanner: Arc::new(UnusedScanner),
-                repository: Arc::new(UnusedRepository),
-                enricher: Arc::new(StubEnricher(Vec::new())),
-                patch_verifier: Arc::new(StubPatchVerifier::noop()),
-                host_key_store: Arc::new(InMemoryHostKeyStore::new()),
-                sink,
-                security_events: events,
-            },
-            test_config(),
-        )
-    }
-
-    #[tokio::test]
-    async fn a_completed_scan_emits_started_completed_and_one_finding_critical() {
-        let recorder = Arc::new(RecordingSecurityEventPublisher::new());
-        let pipeline =
-            completing_pipeline(Arc::new(InMemoryScanResultSink::new()), recorder.clone());
-
-        assert!(pipeline.process_one(test_request("corr-ev-ok")).await);
-
-        let events = recorder.wait_for(3).await;
-        assert_eq!(
-            event_types(&events),
-            ["scan.started", "scan.completed", "finding.critical"]
-        );
-        assert!(events.iter().all(|e| e.scan_id() == Some("corr-ev-ok")));
-        assert_eq!(events[1].payload()["finding_counts"]["high"], 1);
-        assert!(events[1].payload()["duration_ms"].is_u64());
-        assert_eq!(events[2].payload()["cve_id"], "CVE-2024-6387");
-        assert_eq!(events[2].payload()["confidence"], "version_match");
-    }
-
-    #[tokio::test]
-    async fn a_failed_stage_emits_started_and_failed_with_a_slug_never_the_error_text() {
-        let recorder = Arc::new(RecordingSecurityEventPublisher::new());
-        let pipeline =
-            failing_ssh_pipeline(Arc::new(InMemoryScanResultSink::new()), recorder.clone());
-
-        pipeline.process_one(test_request("corr-ev-ssh")).await;
-
-        let events = recorder.wait_for(2).await;
-        assert_eq!(event_types(&events), ["scan.started", "scan.failed"]);
-        assert_eq!(events[1].payload()["reason_code"], "ssh_auth_failed");
-        let text = serde_json::to_string(&events).unwrap();
-        assert!(!text.contains(&SshError::AuthFailed.to_string()), "{text}");
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_scan_emits_failed_with_the_cancelled_reason_code() {
-        let started = Arc::new(Notify::new());
-        let recorder = Arc::new(RecordingSecurityEventPublisher::new());
-        let pipeline = ScanPipeline::new(
-            ServicePorts {
-                executor: Arc::new(SlowExecutor {
-                    started: started.clone(),
-                }),
-                scanner: Arc::new(UnusedScanner),
-                repository: Arc::new(UnusedRepository),
-                enricher: Arc::new(StubEnricher(Vec::new())),
-                patch_verifier: Arc::new(StubPatchVerifier::noop()),
-                host_key_store: Arc::new(InMemoryHostKeyStore::new()),
-                sink: Arc::new(InMemoryScanResultSink::new()),
-                security_events: recorder.clone(),
-            },
-            test_config(),
-        );
-        let id = CorrelationId::from("corr-ev-cancel");
-        let task = {
-            let pipeline = pipeline.clone();
-            let request = test_request(id.as_str());
-            tokio::spawn(async move { pipeline.process_one(request).await })
-        };
-        started.notified().await;
-        assert!(pipeline.cancellations.cancel(&id));
-        task.await.expect("sin panic");
-
-        let events = recorder.wait_for(2).await;
-        assert_eq!(event_types(&events), ["scan.started", "scan.failed"]);
-        assert_eq!(events[1].payload()["reason_code"], "scan_cancelled");
-    }
-
-    #[tokio::test]
-    async fn a_failing_event_publisher_neither_fails_the_scan_nor_the_sns_outcomes() {
-        for completes in [true, false] {
-            let sink = Arc::new(InMemoryScanResultSink::new());
-            let pipeline = if completes {
-                completing_pipeline(sink.clone(), Arc::new(FailingEvents))
-            } else {
-                failing_ssh_pipeline(sink.clone(), Arc::new(FailingEvents))
-            };
-
-            let published = pipeline.process_one(test_request("corr-ev-down")).await;
-
-            assert!(
-                published,
-                "el desenlace terminal se publicó (completes={completes})"
-            );
-            let outcomes = sink.published();
-            assert_eq!(outcomes.len(), 2, "started + terminal: {outcomes:?}");
-            assert!(matches!(outcomes[0], ScanOutcome::Started { .. }));
-            assert_eq!(
-                matches!(outcomes[1], ScanOutcome::Completed { .. }),
-                completes
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn republishing_an_already_finished_scan_emits_no_events() {
-        let recorder = Arc::new(RecordingSecurityEventPublisher::new());
-        let pipeline = ScanPipeline::new(
-            ServicePorts {
-                executor: Arc::new(FailingExecutor),
-                scanner: Arc::new(UnusedScanner),
-                repository: Arc::new(LookupRepository(Ok(Some(stored_result())))),
-                enricher: Arc::new(StubEnricher(Vec::new())),
-                patch_verifier: Arc::new(StubPatchVerifier::noop()),
-                host_key_store: Arc::new(InMemoryHostKeyStore::new()),
-                sink: Arc::new(InMemoryScanResultSink::new()),
-                security_events: recorder.clone(),
-            },
-            test_config(),
-        );
-
-        assert!(pipeline.process_one(test_request("corr-ev-again")).await);
-
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert!(recorder.events().is_empty(), "{:?}", recorder.events());
-    }
-
-    #[tokio::test]
-    async fn a_rejected_request_emits_scan_failed_with_the_rejected_request_code() {
-        let source = InMemoryScanRequestSource::from_raw_messages([
-            invalid_ip_request_json("corr-bad-ip"),
-            request_json("corr-ok"),
-        ]);
-        let recorder = Arc::new(RecordingSecurityEventPublisher::new());
-        let events: Arc<dyn SecurityEventPublisher> = recorder.clone();
-
-        next_valid_request(&source, &InMemoryScanResultSink::new(), &events)
-            .await
-            .expect("continúa con la siguiente válida");
-
-        let emitted = recorder.wait_for(1).await;
-        assert_eq!(event_types(&emitted), ["scan.failed"]);
-        assert_eq!(emitted[0].scan_id(), Some("corr-bad-ip"));
-        assert_eq!(emitted[0].payload()["reason_code"], "rejected_request");
-    }
-
-    #[test]
-    fn every_stage_error_maps_to_a_schema_valid_slug() {
-        use crate::parser::ParseError;
-        let ssh = [
-            (SshError::AuthFailed, "ssh_auth_failed"),
-            (SshError::Timeout, "ssh_timeout"),
-            (SshError::Unreachable("h".into()), "ssh_unreachable"),
-            (
-                SshError::HostKeyMismatch { host: "h".into() },
-                "ssh_host_key_mismatch",
-            ),
-            (SshError::Protocol("p".into()), "ssh_protocol_error"),
-            (SshError::Io("i".into()), "ssh_io_error"),
-        ];
-        for (error, code) in ssh {
-            assert_eq!(ssh_reason_code(&error), code);
-            assert_eq!(StageFailure::from_ssh(&error).code, code);
-        }
-        let scan = [
-            (ScanError::ToolNotAvailable, "nmap_not_available"),
-            (
-                ScanError::InsufficientPrivileges,
-                "nmap_insufficient_privileges",
-            ),
-            (
-                ScanError::NmapFailed {
-                    exit_code: 1,
-                    stderr: "secreto".into(),
-                },
-                "nmap_failed",
-            ),
-            (ScanError::Ssh(SshError::Timeout), "ssh_timeout"),
-        ];
-        for (error, code) in scan {
-            assert_eq!(StageFailure::from_scan(&error).code, code);
-        }
-        assert_eq!(
-            StageFailure::from_parse(&ParseError::MultipleHosts).code,
-            "parse_failed"
-        );
-        assert_eq!(
-            StageFailure::from_repo(&RepoError::Backend("b".into())).code,
-            "persistence_failed"
-        );
-        for code in [
-            "ssh_auth_failed",
-            "ssh_timeout",
-            "ssh_unreachable",
-            "ssh_host_key_mismatch",
-            "ssh_host_key_store",
-            "ssh_protocol_error",
-            "ssh_io_error",
-            "nmap_not_available",
-            "nmap_insufficient_privileges",
-            "nmap_failed",
-            "parse_failed",
-            "persistence_failed",
-            CANCELLED_REASON_CODE,
-            REJECTED_REQUEST_REASON_CODE,
-        ] {
-            assert!(
-                SecurityEvent::scan_failed("s", code).is_ok(),
-                "{code} no es un slug válido"
-            );
-        }
     }
 }
