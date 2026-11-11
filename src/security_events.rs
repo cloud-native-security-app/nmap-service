@@ -292,12 +292,13 @@ impl SecurityEvent {
 
     /// `finding.critical`: el escaneo `scan_id` encontró un hallazgo
     /// `severity` (solo `high` o `critical`) con `confidence` en
-    /// `port`/`protocol`. `cve_id` es `None` si el hallazgo no tiene un CVE
-    /// (ver [`is_cve_id`]).
+    /// `port`/`protocol`, que son `None` (`null` en el evento) para un hallazgo
+    /// a nivel de host. `cve_id` es `None` si el hallazgo no tiene un CVE (ver
+    /// [`is_cve_id`]).
     pub fn finding_critical(
         scan_id: &str,
-        port: u16,
-        protocol: Protocol,
+        port: Option<u16>,
+        protocol: Option<Protocol>,
         cve_id: Option<&str>,
         severity: Severity,
         confidence: Confidence,
@@ -314,10 +315,10 @@ impl SecurityEvent {
         if cve_id.is_some_and(|id| !is_cve_id(id)) {
             return Err(invalid("cve_id"));
         }
-        let protocol = match protocol {
+        let protocol = protocol.map(|protocol| match protocol {
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp",
-        };
+        });
         let confidence = match confidence {
             Confidence::Confirmed => "confirmed",
             Confidence::VersionMatch => "version_match",
@@ -399,8 +400,9 @@ impl SecurityEvent {
 /// - no tiene `confidence` (el schema exige `confirmed` o `version_match` y
 ///   afirmar cualquiera de los dos sería inventar un dato).
 ///
-/// `port` y `protocol` son `0` y `tcp`: el dominio no asocia un
-/// [`crate::domain::VulnFinding`] a un puerto (ver `docs/architecture.md`).
+/// `port` y `protocol` salen del hallazgo ([`crate::domain::VulnFinding::port`]);
+/// son `null` para un hallazgo a nivel de host. Un mismo CVE en dos puertos
+/// emite dos eventos, uno por puerto.
 /// `cve_id` es `None` si el id del hallazgo no tiene forma de CVE.
 pub fn completion_events(
     scan_id: &str,
@@ -429,8 +431,8 @@ pub fn completion_events(
         }
         events.push(SecurityEvent::finding_critical(
             scan_id,
-            0,
-            Protocol::Tcp,
+            finding.port,
+            finding.protocol,
             finding.id.as_deref().filter(|id| is_cve_id(id)),
             finding.severity,
             confidence,
@@ -674,8 +676,8 @@ mod tests {
         let with_cve = serde_json::to_value(
             SecurityEvent::finding_critical(
                 "s",
-                22,
-                Protocol::Tcp,
+                Some(22),
+                Some(Protocol::Tcp),
                 Some("CVE-2023-38408"),
                 Severity::Critical,
                 Confidence::Confirmed,
@@ -693,8 +695,8 @@ mod tests {
         let without_cve = serde_json::to_value(
             SecurityEvent::finding_critical(
                 "s",
-                0,
-                Protocol::Udp,
+                None,
+                None,
                 None,
                 Severity::High,
                 Confidence::VersionMatch,
@@ -702,6 +704,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        assert!(without_cve["payload"]["port"].is_null());
+        assert!(without_cve["payload"]["protocol"].is_null());
         assert!(without_cve["payload"]["cve_id"].is_null());
         assert_eq!(without_cve["payload"]["confidence"], "version_match");
     }
@@ -715,7 +719,14 @@ mod tests {
         assert!(SecurityEvent::scan_failed("s", "").is_err());
         assert!(SecurityEvent::scan_failed("s", &"a".repeat(65)).is_err());
         let finding = |sev, cve| {
-            SecurityEvent::finding_critical("s", 80, Protocol::Tcp, cve, sev, Confidence::Confirmed)
+            SecurityEvent::finding_critical(
+                "s",
+                Some(80),
+                Some(Protocol::Tcp),
+                cve,
+                sev,
+                Confidence::Confirmed,
+            )
         };
         assert!(finding(Severity::Medium, None).is_err());
         assert!(finding(Severity::Unknown, None).is_err());
@@ -867,6 +878,8 @@ mod tests {
             references: Vec::new(),
             confidence,
             patch_state,
+            port: None,
+            protocol: None,
         }
     }
 
@@ -908,21 +921,24 @@ mod tests {
     }
 
     #[test]
-    fn finding_events_are_ordered_critical_first_and_use_port_zero_tcp() {
-        let result = result_with(vec![
-            vuln(
-                Some("CVE-2024-6387"),
-                Severity::High,
-                Some(Confidence::VersionMatch),
-                None,
-            ),
-            vuln(
-                Some("CVE-2023-38408"),
-                Severity::Critical,
-                Some(Confidence::Confirmed),
-                None,
-            ),
-        ]);
+    fn finding_events_are_ordered_critical_first_and_use_the_finding_port() {
+        let mut high = vuln(
+            Some("CVE-2024-6387"),
+            Severity::High,
+            Some(Confidence::VersionMatch),
+            None,
+        );
+        high.port = Some(8080);
+        high.protocol = Some(Protocol::Udp);
+        let mut critical = vuln(
+            Some("CVE-2023-38408"),
+            Severity::Critical,
+            Some(Confidence::Confirmed),
+            None,
+        );
+        critical.port = Some(22);
+        critical.protocol = Some(Protocol::Tcp);
+        let result = result_with(vec![high, critical]);
         let events = completion_events("s", 1, &result);
         let payloads: Vec<_> = events[1..]
             .iter()
@@ -930,8 +946,46 @@ mod tests {
             .collect();
         assert_eq!(payloads[0]["severity"], "critical");
         assert_eq!(payloads[1]["severity"], "high");
-        assert_eq!(payloads[0]["port"], 0);
+        assert_eq!(payloads[0]["port"], 22);
         assert_eq!(payloads[0]["protocol"], "tcp");
+        assert_eq!(payloads[1]["port"], 8080);
+        assert_eq!(payloads[1]["protocol"], "udp");
+    }
+
+    #[test]
+    fn host_level_findings_emit_null_port_and_protocol() {
+        let result = result_with(vec![vuln(
+            Some("CVE-2024-6387"),
+            Severity::High,
+            Some(Confidence::Confirmed),
+            Some(crate::domain::PatchState::Unpatched),
+        )]);
+        let events = completion_events("s", 1, &result);
+        let payload = events[1].as_ref().unwrap().payload();
+        assert!(payload["port"].is_null(), "{payload}");
+        assert!(payload["protocol"].is_null(), "{payload}");
+    }
+
+    #[test]
+    fn the_same_cve_on_two_ports_emits_one_event_per_port() {
+        let on = |port| {
+            let mut f = vuln(
+                Some("CVE-2024-6387"),
+                Severity::High,
+                Some(Confidence::VersionMatch),
+                None,
+            );
+            f.port = Some(port);
+            f.protocol = Some(Protocol::Tcp);
+            f
+        };
+        let result = result_with(vec![on(22), on(2222)]);
+        let events = completion_events("s", 1, &result);
+        let ports: Vec<_> = events[1..]
+            .iter()
+            .map(|e| e.as_ref().unwrap().payload()["port"].clone())
+            .collect();
+        assert_eq!(ports, [serde_json::json!(22), serde_json::json!(2222)]);
     }
 
     #[test]

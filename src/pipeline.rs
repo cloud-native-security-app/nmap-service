@@ -1168,6 +1168,8 @@ mod tests {
             references: Vec::new(),
             confidence: None,
             patch_state: None,
+            port: None,
+            protocol: None,
         }
     }
 
@@ -1402,6 +1404,8 @@ mod tests {
             references: Vec::new(),
             confidence: Some(crate::domain::Confidence::VersionMatch),
             patch_state: None,
+            port: None,
+            protocol: None,
         }
     }
 
