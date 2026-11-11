@@ -257,7 +257,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::domain::{Severity, VulnSource};
+    use crate::domain::{Protocol, Severity, VulnSource};
     use crate::ssh::CommandOutput;
 
     // Procedencia de los fixtures: MODELADOS (no capturados en vivo) a partir de
@@ -304,6 +304,8 @@ CVE-2024-1234 Moderate/Sec. libfoo-1.2-3.amzn2023.x86_64
             references: Vec::new(),
             confidence,
             patch_state: None,
+            port: None,
+            protocol: None,
         }
     }
 
@@ -396,6 +398,30 @@ CVE-2024-1234 Moderate/Sec. libfoo-1.2-3.amzn2023.x86_64
         for i in [3, 4, 5, 6] {
             assert_eq!(findings[i], before[i], "finding {i} no debe tocarse");
         }
+    }
+
+    #[test]
+    fn reconcile_keeps_the_port_and_protocol_of_every_finding() {
+        let pending = parse_pending_cves(DNF_PENDING);
+        let mut on_port = vm("CVE-2024-6387");
+        on_port.port = Some(22);
+        on_port.protocol = Some(Protocol::Tcp);
+        let mut fixed_on_port = vm("CVE-2020-0001");
+        fixed_on_port.port = Some(443);
+        fixed_on_port.protocol = Some(Protocol::Tcp);
+        let mut findings = vec![on_port, fixed_on_port, vm("CVE-2023-38408")];
+
+        reconcile(&mut findings, &pending);
+
+        assert_eq!(
+            (findings[0].port, findings[0].protocol),
+            (Some(22), Some(Protocol::Tcp))
+        );
+        assert_eq!(
+            (findings[1].port, findings[1].protocol),
+            (Some(443), Some(Protocol::Tcp))
+        );
+        assert_eq!((findings[2].port, findings[2].protocol), (None, None));
     }
 
     // ---- orquestación con sesión falsa ------------------------------------

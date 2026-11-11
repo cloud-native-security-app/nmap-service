@@ -58,7 +58,14 @@ fn every_nmap_constructor_validates_against_the_broker_schema() {
     counts.record(Severity::Critical);
     counts.record(Severity::Unknown);
     let finding = |severity, cve, confidence| {
-        SecurityEvent::finding_critical("corr-42", 22, Protocol::Tcp, cve, severity, confidence)
+        SecurityEvent::finding_critical(
+            "corr-42",
+            Some(22),
+            Some(Protocol::Tcp),
+            cve,
+            severity,
+            confidence,
+        )
     };
     let events = [
         SecurityEvent::scan_started("corr-42"),
@@ -74,16 +81,25 @@ fn every_nmap_constructor_validates_against_the_broker_schema() {
         finding(Severity::High, None, Confidence::VersionMatch),
         SecurityEvent::finding_critical(
             "corr-42",
-            0,
-            Protocol::Udp,
+            Some(0),
+            Some(Protocol::Udp),
             None,
             Severity::High,
             Confidence::Confirmed,
         ),
+        // Hallazgo a nivel de host: sin puerto ni protocolo (null).
         SecurityEvent::finding_critical(
             "corr-42",
-            u16::MAX,
-            Protocol::Tcp,
+            None,
+            None,
+            Some("CVE-2024-6387"),
+            Severity::High,
+            Confidence::VersionMatch,
+        ),
+        SecurityEvent::finding_critical(
+            "corr-42",
+            Some(u16::MAX),
+            Some(Protocol::Tcp),
             Some("CVE-2011-2523"),
             Severity::Critical,
             Confidence::VersionMatch,
@@ -199,8 +215,8 @@ fn nmap_examples_have_the_same_shape_as_the_constructors_output() {
             "finding-critical.json",
             SecurityEvent::finding_critical(
                 "corr-42",
-                22,
-                Protocol::Tcp,
+                Some(22),
+                Some(Protocol::Tcp),
                 Some("CVE-2023-38408"),
                 Severity::Critical,
                 Confidence::Confirmed,

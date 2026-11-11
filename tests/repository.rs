@@ -90,6 +90,8 @@ fn sample_result() -> ScanResult {
             references: vec!["https://www.openssh.com/txt/release-9.3p2".to_owned()],
             confidence: None,
             patch_state: None,
+            port: None,
+            protocol: None,
         }],
         scanned_at: datetime!(2026-08-27 12:30:00 UTC),
     }
@@ -304,6 +306,8 @@ fn sample_nvd_findings() -> Vec<VulnFinding> {
         references: vec!["https://example.test/advisory".to_owned()],
         confidence: None,
         patch_state: None,
+        port: None,
+        protocol: None,
     }]
 }
 
