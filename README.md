@@ -140,8 +140,8 @@ docker build -t ms-nmap .
 
 `ms-nmap` lee **toda** su configuración de variables de entorno. La mayoría son
 obligatorias (si falta alguna, registra el error y termina sin arrancar); las
-excepciones son `AWS_ENDPOINT_URL`, `SECURITY_EVENTS_STREAM_NAME` y
-`MS_NMAP_NVD_API_KEY` (genuinamente opcionales) y `MS_NMAP_NVD_CACHE_TTL_SECS` (obligatoria sólo si el
+excepciones son `AWS_ENDPOINT_URL` y `MS_NMAP_NVD_API_KEY` (genuinamente
+opcionales) y `MS_NMAP_NVD_CACHE_TTL_SECS` (obligatoria sólo si el
 enriquecimiento NVD está habilitado):
 
 | Variable | Descripción |
@@ -156,7 +156,6 @@ enriquecimiento NVD está habilitado):
 | `MS_NMAP_SCAN_REQUESTS_DLQ_URL` | URL de la DLQ de solicitudes de escaneo (obligatoria) |
 | `MS_NMAP_SCAN_CANCELLATIONS_DLQ_URL` | URL de la DLQ de cancelaciones de escaneo (obligatoria) |
 | `MS_NMAP_SCAN_OUTCOMES_TOPIC_ARN` | ARN del topic SNS de desenlaces, `arn:<partición>:sns:<región>:<cuenta de 12 dígitos>:<nombre>` (obligatoria) |
-| `SECURITY_EVENTS_STREAM_NAME` | Nombre del Kinesis Data Stream de eventos de seguridad (`security-events`; `[a-zA-Z0-9_.-]`, hasta 128 caracteres). Opcional: ausente o en blanco, `ms-nmap` no publica eventos (adaptador no-op, un log informativo al arrancar); un nombre inválido impide arrancar |
 | `MS_NMAP_SSH_CONNECT_TIMEOUT_SECS` | Timeout en segundos para establecer la conexión SSH con el objetivo |
 | `MS_NMAP_SSH_COMMAND_TIMEOUT_SECS` | Timeout en segundos para la ejecución del comando `nmap` remoto |
 | `MS_NMAP_EXPLOITDB_CSV` | Ruta al CSV `files_exploits.csv` de Exploit-DB para el enriquecimiento offline de vulnerabilidades. En la imagen Docker ya viene fijada por `ENV` a `/opt/exploitdb/files_exploits.csv` (el CSV se bundlea en la build); sólo hay que definirla al ejecutar fuera del contenedor |

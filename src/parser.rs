@@ -351,33 +351,11 @@ fn collect_port_vulns(host: &Node) -> Vec<VulnFinding> {
 
     children(&ports_node, "port")
         .flat_map(|port| {
-            let (port_number, protocol) = port_scope(&port);
             children(&port, "script")
                 .flat_map(|script| vulns_from_script(&script))
-                .map(|mut finding| {
-                    finding.port = port_number;
-                    finding.protocol = protocol;
-                    finding
-                })
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-/// Puerto y protocolo de un `<port>`, para asociarlos a los hallazgos de sus
-/// scripts. Un valor ilegible da `None`; [`parse_ports`] ya rechaza esos
-/// casos antes de que esto importe.
-fn port_scope(port: &Node) -> (Option<u16>, Option<Protocol>) {
-    let number = port.attribute("portid").and_then(|id| id.parse().ok());
-    let protocol = match port.attribute("protocol") {
-        Some("tcp") => Some(Protocol::Tcp),
-        Some("udp") => Some(Protocol::Udp),
-        _ => None,
-    };
-    match (number, protocol) {
-        (Some(number), Some(protocol)) => (Some(number), Some(protocol)),
-        _ => (None, None),
-    }
 }
 
 fn collect_hostscript_vulns(host: &Node) -> Vec<VulnFinding> {
@@ -469,8 +447,6 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
             references: Vec::new(),
             confidence,
             patch_state: None,
-            port: None,
-            protocol: None,
         }]
     } else {
         cves.into_iter()
@@ -483,8 +459,6 @@ fn vulns_from_script(script: &Node) -> Vec<VulnFinding> {
                 references: Vec::new(),
                 confidence,
                 patch_state: None,
-                port: None,
-                protocol: None,
             })
             .collect()
     }
@@ -536,8 +510,6 @@ fn misconfig_finding(nse_script: &str, output: &str, haystack: &str) -> Option<V
         references: Vec::new(),
         confidence: Some(Confidence::Confirmed),
         patch_state: None,
-        port: None,
-        protocol: None,
     })
 }
 
@@ -604,8 +576,6 @@ fn vulns_from_cvss_entries(script: &Node, nse_script: &str) -> Vec<VulnFinding> 
                 references: Vec::new(),
                 confidence: Some(Confidence::VersionMatch),
                 patch_state: None,
-                port: None,
-                protocol: None,
             }
         })
         .collect()
@@ -1265,79 +1235,5 @@ mod tests {
             }
             other => panic!("se esperaba InvalidValue, se obtuvo {other:?}"),
         }
-    }
-
-    /// Envuelve `ports` y `hostscript` en un `nmaprun` mínimo.
-    fn xml_with_ports_and_hostscript(ports: &str, hostscript: &str) -> String {
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<nmaprun scanner="nmap" args="nmap -sV --script vuln" start="1787873894" startstr="Wed Oct 21 2026" version="7.98" xmloutputversion="1.05">
-<host starttime="1787873905" endtime="1787873919"><status state="up" reason="syn-ack" reason_ttl="0"/>
-<address addr="172.17.0.3" addrtype="ipv4"/>
-<ports>{ports}</ports>
-{hostscript}
-</host>
-</nmaprun>"#
-        )
-    }
-
-    const CVE_SCRIPT: &str = r#"<script id="http-vuln-cve2011-3192" output="&#xa;  VULNERABLE:&#xa;  Apache byterange filter DoS&#xa;    State: VULNERABLE&#xa;    IDs:  CVE:CVE-2011-3192&#xa;"/>"#;
-
-    #[test]
-    fn port_scoped_script_findings_carry_the_port_and_protocol_of_their_port() {
-        let result = parse(VULN_FINDINGS_XML).expect("fixture parsea");
-
-        assert!(!result.vulnerabilities.is_empty());
-        for v in &result.vulnerabilities {
-            assert_eq!(v.port, Some(21), "{v:?}");
-            assert_eq!(v.protocol, Some(Protocol::Tcp), "{v:?}");
-        }
-    }
-
-    #[test]
-    fn udp_port_scoped_finding_keeps_the_udp_protocol() {
-        let xml = xml_with_ports_and_hostscript(
-            &format!(
-                r#"<port protocol="udp" portid="161"><state state="open" reason="udp-response" reason_ttl="64"/>{CVE_SCRIPT}</port>"#
-            ),
-            "",
-        );
-
-        let found = parse(&xml).expect("parsea").vulnerabilities;
-
-        assert_eq!(found.len(), 1);
-        assert_eq!(
-            (found[0].port, found[0].protocol),
-            (Some(161), Some(Protocol::Udp))
-        );
-    }
-
-    #[test]
-    fn host_scoped_script_findings_have_no_port() {
-        let xml =
-            xml_with_ports_and_hostscript("", &format!("<hostscript>{CVE_SCRIPT}</hostscript>"));
-
-        let found = parse(&xml).expect("parsea").vulnerabilities;
-
-        assert_eq!(found.len(), 1);
-        assert_eq!((found[0].port, found[0].protocol), (None, None));
-    }
-
-    #[test]
-    fn the_same_cve_on_two_ports_yields_one_finding_per_port() {
-        let port = |id: u16| {
-            format!(
-                r#"<port protocol="tcp" portid="{id}"><state state="open" reason="syn-ack" reason_ttl="64"/>{CVE_SCRIPT}</port>"#
-            )
-        };
-        let xml = xml_with_ports_and_hostscript(&format!("{}{}", port(80), port(8080)), "");
-
-        let found = parse(&xml).expect("parsea").vulnerabilities;
-
-        let ports: Vec<_> = found.iter().map(|v| v.port).collect();
-        assert_eq!(ports, vec![Some(80), Some(8080)], "{found:?}");
-        assert!(found
-            .iter()
-            .all(|v| v.id.as_deref() == Some("CVE-2011-3192")));
     }
 }

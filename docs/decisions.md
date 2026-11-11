@@ -187,18 +187,3 @@ broker_adapter y configurable_scan_timing.
 - **Consecuencia:** `docker build .` funciona desde este repo solo, sin
   `--build-context`. El pipeline de build y la definición de tarea de `infra`
   dejan de necesitar el contexto `tls` y `SSL_CERT_FILE`.
-
-## ADR-18 — Puerto y protocolo opcionales en `VulnFinding`
-
-- **Contexto:** el puerto se conoce al parsear los scripts NSE por puerto, pero
-  se descartaba; `finding.critical` salía siempre con `port: 0` y `tcp`.
-- **Decisión:** `VulnFinding` gana `port: Option<u16>` y
-  `protocol: Option<Protocol>` (se omiten al serializar si son `None`).
-  `None` significa hallazgo a nivel de host o puerto desconocido. El contrato
-  es `broker/contracts/scan-outcome.schema.json` (D-15 del broker).
-- **Deduplicación:** los hallazgos de `nmap` en puertos distintos nunca se
-  fusionan (mismo CVE en dos puertos = dos hallazgos). Un hallazgo de
-  enriquecimiento (sin puerto) se descarta si su CVE ya existe en cualquier
-  puerto, porque no aporta información de ubicación.
-- **Consecuencia:** retrocompatible; Gateway, `user-service` y el front pueden
-  desplegarse en cualquier orden.

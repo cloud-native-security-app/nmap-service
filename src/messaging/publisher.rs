@@ -397,8 +397,6 @@ mod tests {
                 references: Vec::new(),
                 confidence: None,
                 patch_state: None,
-                port: None,
-                protocol: None,
             }],
             scanned_at: datetime!(2026-08-27 12:30:00 UTC),
         }

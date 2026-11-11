@@ -49,14 +49,6 @@ aws-sdk-sqs = "1.114.0"
 # Publicador de desenlaces en SNS (`src/messaging/sns.rs`, MSG-NM-03); misma
 # versión que `gateway/Cargo.toml`.
 aws-sdk-sns = "1.116.0"
-# Publicador de eventos de seguridad en Kinesis (`src/messaging/kinesis.rs`, KAP-07).
-# Se fija `1.125.0` (igual que `gateway/Cargo.toml`): es el último lanzamiento que
-# acepta el `aws-runtime` 1.10.0 / `aws-smithy-runtime` 1.16.0 ya fijados en el lock
-# para `aws-sdk-sns`/`-sqs` (versiones posteriores obligan a subirlos).
-aws-sdk-kinesis = "1.125.0"
-# Identificador único (UUID v4) de cada `SecurityEvent` (`src/security_events.rs`,
-# KAP-07); ya está resuelta transitivamente, se declara explícita para nombrarla.
-uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 testcontainers = "0.24"
@@ -64,9 +56,3 @@ time = { version = "0.3", features = ["macros"] }
 # Servidor HTTP mock local para testear `NvdApiEnricher` sin egress de red real
 # hacia `services.nvd.nist.gov` (ver `docs/security-scope.md`).
 wiremock = "0.6"
-# `start_paused`/`advance` para probar el tope de tiempo de `emit` sin esperas
-# de reloj (`src/security_events.rs`).
-tokio = { version = "1", features = ["test-util"] }
-# Valida cada evento emitido contra `../broker/contracts/security-event.schema.json`
-# (`tests/security_event_contract.rs`). Misma versión y features que `broker`.
-jsonschema = { version = "0.56", default-features = false }

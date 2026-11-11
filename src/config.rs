@@ -102,26 +102,9 @@ pub const SCAN_CANCELLATIONS_DLQ_URL_VAR: &str = "MS_NMAP_SCAN_CANCELLATIONS_DLQ
 /// Nombre de la variable de entorno con el ARN del topic SNS de desenlaces.
 pub const SCAN_OUTCOMES_TOPIC_ARN_VAR: &str = "MS_NMAP_SCAN_OUTCOMES_TOPIC_ARN";
 
-/// Nombre de la variable de entorno opcional con el nombre del Kinesis Data
-/// Stream de eventos de seguridad (`security-events`). Ausente o en blanco
-/// desactiva la publicación (adaptador no-op).
-pub const SECURITY_EVENTS_STREAM_NAME_VAR: &str = "SECURITY_EVENTS_STREAM_NAME";
-
-/// Largo máximo de un nombre de stream de Kinesis.
-const MAX_STREAM_NAME_CHARS: usize = 128;
-
 /// Errores posibles al construir la [`Config`] del servicio.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// Una variable que debe ser el nombre de un stream de Kinesis
-    /// (`[a-zA-Z0-9_.-]`, hasta 128 caracteres) no tiene esa forma. No incluye
-    /// el valor.
-    #[error("{var} no es un nombre de stream de Kinesis válido")]
-    InvalidStreamName {
-        /// Nombre de la variable de entorno inválida.
-        var: &'static str,
-    },
-
     /// Falta una variable de entorno requerida. Contiene el nombre de la variable.
     #[error("falta la variable de entorno requerida: {0}")]
     MissingVar(&'static str),
@@ -211,10 +194,6 @@ pub struct Config {
     pub scan_cancellations_dlq_url: url::Url,
     /// ARN del topic SNS donde se publican los desenlaces de escaneo.
     pub scan_outcomes_topic_arn: String,
-    /// Nombre del Kinesis Data Stream de eventos de seguridad. `None` (variable
-    /// ausente o en blanco) desactiva la publicación. Ver
-    /// [`SECURITY_EVENTS_STREAM_NAME_VAR`].
-    pub security_events_stream_name: Option<String>,
 }
 
 impl Config {
@@ -293,10 +272,6 @@ impl Config {
             SCAN_OUTCOMES_TOPIC_ARN_VAR,
             lookup(SCAN_OUTCOMES_TOPIC_ARN_VAR),
         )?;
-        let security_events_stream_name = optional_stream_name(
-            SECURITY_EVENTS_STREAM_NAME_VAR,
-            lookup(SECURITY_EVENTS_STREAM_NAME_VAR),
-        )?;
 
         Ok(Self {
             mongo_uri,
@@ -316,7 +291,6 @@ impl Config {
             scan_requests_dlq_url,
             scan_cancellations_dlq_url,
             scan_outcomes_topic_arn,
-            security_events_stream_name,
         })
     }
 }
@@ -341,26 +315,6 @@ fn optional_url(var: &'static str, raw: Option<String>) -> Result<Option<url::Ur
     raw.filter(|v| !v.trim().is_empty())
         .map(|v| parse_url(var, &v))
         .transpose()
-}
-
-/// Nombre de stream de Kinesis genuinamente opcional: ausente o en blanco es
-/// `None`; si no, se recorta y debe cumplir `[a-zA-Z0-9_.-]{1,128}`.
-fn optional_stream_name(
-    var: &'static str,
-    raw: Option<String>,
-) -> Result<Option<String>, ConfigError> {
-    let Some(value) = raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(None);
-    };
-    let valid = value.chars().count() <= MAX_STREAM_NAME_CHARS
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
-    if valid {
-        Ok(Some(value.to_owned()))
-    } else {
-        Err(ConfigError::InvalidStreamName { var })
-    }
 }
 
 fn required_sns_topic_arn(var: &'static str, raw: Option<String>) -> Result<String, ConfigError> {
@@ -1001,46 +955,5 @@ mod tests {
         let rendered = format!("{config:?}");
 
         assert!(!rendered.contains("nvd-super-secret-key"));
-    }
-
-    #[test]
-    fn security_events_stream_name_unset_or_blank_means_disabled() {
-        let config = config_from(&valid_vars()).expect("config válida");
-        assert_eq!(config.security_events_stream_name, None);
-        for blank in ["", "   ", "\t"] {
-            let mut vars = valid_vars();
-            vars.insert(SECURITY_EVENTS_STREAM_NAME_VAR, blank);
-            let config = config_from(&vars).expect("config válida");
-            assert_eq!(
-                config.security_events_stream_name, None,
-                "{blank:?} debe tratarse como no definida"
-            );
-        }
-    }
-
-    #[test]
-    fn security_events_stream_name_is_trimmed_and_loaded() {
-        let mut vars = valid_vars();
-        vars.insert(SECURITY_EVENTS_STREAM_NAME_VAR, " security-events ");
-        let config = config_from(&vars).expect("config válida");
-        assert_eq!(
-            config.security_events_stream_name.as_deref(),
-            Some("security-events")
-        );
-    }
-
-    #[test]
-    fn invalid_security_events_stream_name_is_a_startup_error_without_the_value() {
-        let too_long: &'static str = "a".repeat(129).leak();
-        for invalid in ["has space", "semi;colon", "ñandú", too_long] {
-            let mut vars = valid_vars();
-            vars.insert(SECURITY_EVENTS_STREAM_NAME_VAR, invalid);
-            let err = config_from(&vars).expect_err("nombre inválido");
-            assert!(
-                matches!(err, ConfigError::InvalidStreamName { var } if var == SECURITY_EVENTS_STREAM_NAME_VAR),
-                "esperaba InvalidStreamName para {invalid:?}, obtuve {err:?}"
-            );
-            assert!(!err.to_string().contains(invalid), "{err}");
-        }
     }
 }

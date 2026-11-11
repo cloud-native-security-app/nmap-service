@@ -324,14 +324,6 @@ pub struct VulnFinding {
     /// verificado (se omite al serializar). Ver [`PatchState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_state: Option<PatchState>,
-    /// Puerto donde se detectó el hallazgo. `None` = hallazgo a nivel de host
-    /// (p. ej. `hostscript` o la verificación autenticada de parches) o puerto
-    /// desconocido (se omite al serializar).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    /// Protocolo del [`VulnFinding::port`]; `None` cuando `port` es `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<Protocol>,
 }
 
 /// Origen por defecto al deserializar un [`VulnFinding`] persistido antes de
@@ -405,8 +397,6 @@ mod tests {
                     references: vec!["https://www.openssh.com/txt/release-9.3p2".to_owned()],
                     confidence: None,
                     patch_state: None,
-                    port: None,
-                    protocol: None,
                 },
                 VulnFinding {
                     id: Some("CVE-2011-2523".to_owned()),
@@ -418,8 +408,6 @@ mod tests {
                     references: vec!["https://www.exploit-db.com/exploits/49757".to_owned()],
                     confidence: None,
                     patch_state: None,
-                    port: None,
-                    protocol: None,
                 },
             ],
             scanned_at: datetime!(2026-08-27 12:30:00 UTC),
@@ -592,8 +580,6 @@ mod tests {
             references: Vec::new(),
             confidence: None,
             patch_state: None,
-            port: None,
-            protocol: None,
         };
 
         let json = serde_json::to_value(&finding).expect("serializa");
@@ -622,8 +608,6 @@ mod tests {
             references: Vec::new(),
             confidence: None,
             patch_state: None,
-            port: None,
-            protocol: None,
         };
 
         let json = serde_json::to_value(&finding).expect("serializa");
@@ -648,53 +632,5 @@ mod tests {
         let finding: VulnFinding = serde_json::from_str(json).expect("deserializa");
 
         assert_eq!(finding.patch_state, None);
-    }
-
-    #[test]
-    fn vuln_finding_port_and_protocol_are_omitted_when_none_and_round_trip() {
-        let mut finding = VulnFinding {
-            id: Some("CVE-2011-2523".to_owned()),
-            severity: Severity::High,
-            description: "d".to_owned(),
-            nse_script: "vulners".to_owned(),
-            source: VulnSource::NmapNse,
-            references: Vec::new(),
-            confidence: None,
-            patch_state: None,
-            port: None,
-            protocol: None,
-        };
-
-        let json = serde_json::to_value(&finding).expect("serializa");
-        assert!(json.get("port").is_none(), "{json}");
-        assert!(json.get("protocol").is_none(), "{json}");
-
-        finding.port = Some(21);
-        finding.protocol = Some(Protocol::Tcp);
-        let json = serde_json::to_value(&finding).expect("serializa");
-        assert_eq!(json["port"], 21);
-        assert_eq!(json["protocol"], "tcp");
-
-        let restored: VulnFinding = serde_json::from_value(json).expect("deserializa");
-        assert_eq!(restored, finding);
-    }
-
-    #[test]
-    fn vuln_finding_persisted_before_port_deserializes_with_none() {
-        let json = r#"{"id":"CVE-1","severity":"high","description":"d","nse_script":"vulners"}"#;
-
-        let finding: VulnFinding = serde_json::from_str(json).expect("deserializa");
-
-        assert_eq!(finding.port, None);
-        assert_eq!(finding.protocol, None);
-    }
-
-    #[test]
-    fn vuln_finding_accepts_explicit_null_port_from_other_services() {
-        let json = r#"{"id":null,"severity":"low","description":"d","nse_script":"","port":null,"protocol":null}"#;
-
-        let finding: VulnFinding = serde_json::from_str(json).expect("deserializa");
-
-        assert_eq!((finding.port, finding.protocol), (None, None));
     }
 }
