@@ -37,11 +37,11 @@
 
 | ID | Task | Done |
 |---|---|---|
-| FP-01 | Feature document | [x] |
+| FP-01 | Feature document | [x] cc599bd |
 | FP-02 | RED: tests for the domain fields, parser scoping, patch verification, event payload | [x] `cargo test --lib`: 39 compile errors (fields and signature missing) |
-| FP-03 | GREEN: domain, parser, event, contract parity tests | [x] `cargo test --lib`: 258 passed; parity tests pass against broker `feature/finding_port` |
+| FP-03 | GREEN: domain, parser, event, contract parity tests | [x] `cargo test --lib`: 258 passed; parity tests pass against broker `feature/finding_port`  09d902d |
 | FP-04 | Docs: architecture, ADR-18 | [x] |
-| FP-05 | `make verify` | [ ] |
+| FP-05 | `make verify` | [x] exit 0 |
 
 ## Compatibility note
 
