@@ -162,7 +162,8 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
    `ScanOutcome::Failed` con el motivo fijo `REJECTED_REQUEST_REASON` (sin IP ni
    credenciales) para que el Gateway cierre el escaneo. Sin `correlation_id`
    (no es JSON, falta o no es cadena) queda sólo la DLQ y el log. Los puertos
-   siguen neutrales al transporte; la publicación es best-effort.
+   siguen neutrales al transporte; la publicación es best-effort (hasta 3 intentos con backoff
+   y jitter dentro de 5 s; un fallo no descarta el resto del lote).
    El submódulo `kinesis` implementa `SecurityEventPublisher`
    (`KinesisSecurityEventPublisher`, `aws-sdk-kinesis`): ver "Eventos de
    seguridad".
