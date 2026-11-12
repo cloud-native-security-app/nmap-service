@@ -5,12 +5,13 @@
 # Multi-stage:
 #   - builder: toolchain Rust completa, compila el binario `ms-nmap` en release.
 #   - exploitdb: descarga `files_exploits.csv` de Exploit-DB (pineado a un commit).
-#   - runtime: distroless/cc (glibc + certificados CA + usuario `nonroot`),
-#     contiene el binario `ms-nmap` y el CSV `files_exploits.csv` (dato de sólo
-#     lectura para el enriquecimiento offline). Sin toolchain, sin código fuente,
-#     sin shell/coreutils, sin `searchsploit`, sin `nmap` (nmap se ejecuta en el
-#     objetivo vía SSH, no en este contenedor — ver docs/architecture.md
-#     §"SSH al objetivo, no escaneo local").
+#   - runtime: debian:bookworm-slim + el paquete `nmap` + certificados CA, con
+#     el usuario no-root `nonroot` (uid 65532). Contiene el binario `ms-nmap` y
+#     el CSV `files_exploits.csv` (dato de sólo lectura para el enriquecimiento
+#     offline). Sin toolchain y sin código fuente. `nmap` está en la imagen
+#     porque el modo `network` escanea desde este contenedor (`-sT`, sin
+#     privilegios, sin `-O`); el modo `ssh` sigue ejecutando `nmap` en el
+#     objetivo — ver docs/architecture.md §"Modos de escaneo".
 #
 # Las imágenes base se fijan por tag concreto Y por digest (`@sha256:...`) para
 # builds reproducibles. Al actualizar una base, refresca el digest con
@@ -64,15 +65,24 @@ ADD --chmod=0644 \
 # ---------------------------------------------------------------------------
 # Stage 3 — runtime
 # ---------------------------------------------------------------------------
-# distroless/cc-debian12: glibc + libgcc (para el binario Rust), paquete
-# ca-certificates (TLS a MongoDB y a los endpoints públicos de AWS SQS/SNS, que
-# usan CA públicas: no se hornea ninguna CA de laboratorio ni hace falta una
-# variable de CA custom) y el usuario no-root `nonroot` (uid 65532). No trae
-# shell ni gestor de paquetes. El build no necesita contextos de otros repos.
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+# debian:bookworm-slim (misma base glibc/bookworm que el builder, así que el
+# binario enlaza igual que antes). `nmap` (7.93) viene del repositorio de Debian;
+# `ca-certificates` hace falta para TLS a MongoDB, a los endpoints públicos de
+# AWS SQS/SNS/Kinesis y a la API NVD (CA públicas: no se hornea ninguna CA de
+# laboratorio). Se instala sin recomendados y se borran las listas de apt para
+# mantener la imagen pequeña. El usuario `nonroot` conserva el uid 65532 que
+# tenía la base distroless, así que el despliegue no cambia; nmap corre con él
+# sin capacidades extra (`-sT` no usa raw sockets, comprobado en NS-00 con
+# `--cap-drop ALL`). El build no necesita contextos de otros repos.
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nmap ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
 
 LABEL org.opencontainers.image.title="ms-nmap" \
-      org.opencontainers.image.description="Microservicio de escaneo remoto (SSH + nmap) de la plataforma blue/red team" \
+      org.opencontainers.image.description="Microservicio de escaneo (nmap vía SSH o desde el contenedor) de la plataforma blue/red team" \
       org.opencontainers.image.source="https://github.com/o-aguirre/nmap-service"
 
 COPY --from=builder /app/target/release/ms-nmap /usr/local/bin/ms-nmap
@@ -83,6 +93,6 @@ COPY --from=exploitdb /opt/exploitdb/files_exploits.csv /opt/exploitdb/files_exp
 # se inyectan en `docker run` (ver README.md).
 ENV MS_NMAP_EXPLOITDB_CSV=/opt/exploitdb/files_exploits.csv
 
-USER nonroot
+USER 65532:65532
 
 ENTRYPOINT ["/usr/local/bin/ms-nmap"]

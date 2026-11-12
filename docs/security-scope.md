@@ -23,6 +23,17 @@
   de producto que se discute con el usuario y se documenta como una feature
   nueva (registrada en `odd/tasks/` y `docs/decisions.md`) — no se improvisa dentro de otra feature.
 
+### Modo `network` (escaneo desde el contenedor)
+
+- Una solicitud `scan_mode: network` escanea la IP desde el propio contenedor de
+  `ms-nmap`, sin credenciales. La misma regla de autorización aguas arriba aplica
+  (en este modo el Gateway restringe quién puede pedirlo y a qué destinos);
+  `ms-nmap` sigue sin escanear nada que no llegue en un `ScanRequest`.
+- Se ejecuta sin privilegios: `nmap -sT -sV --script vuln -T<n> -oX - <ip>` (solo
+  detección, scripts de categoría `vuln`), sin `-O`, sin `sudo` y sin raw
+  sockets. El `ScanRequest` de este modo **no puede** llevar credenciales: la
+  deserialización rechaza `network_user`, `ssh_credentials_ref` y `has_sudo`.
+
 ## Desarrollo y tests
 
 - **Nunca** se escanea, ni en un test ni en un ejemplo, una IP real fuera de

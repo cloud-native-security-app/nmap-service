@@ -145,6 +145,9 @@ broker_adapter y configurable_scan_timing.
 
 ## ADR-15 — Imagen distroless multi-stage con bases pineadas
 
+> Parcialmente sustituido por ADR-19: la base del runtime y la ausencia de
+> `nmap` en la imagen ya no aplican.
+
 - **Decisión:** builder `rust` + stage `exploitdb` + runtime
   `gcr.io/distroless/cc-debian12:nonroot`, bases fijadas por tag y digest.
   Cacheo de dependencias con árbol de fuentes mínimo. `nmap` no está en la
@@ -202,3 +205,29 @@ broker_adapter y configurable_scan_timing.
   puerto, porque no aporta información de ubicación.
 - **Consecuencia:** retrocompatible; Gateway, `user-service` y el front pueden
   desplegarse en cualquier orden.
+
+## ADR-19 — Modo de escaneo `network`: `nmap` dentro de la imagen (sustituye parte del ADR-15)
+
+- **Contexto:** hasta ahora `ms-nmap` sólo escaneaba por SSH en el objetivo
+  ("SSH al objetivo, no escaneo local") y la imagen era distroless sin `nmap`.
+  El plan `network-scan-email-siem` añade un modo que escanea una IP sin
+  credenciales (decisión del usuario, 2026-11-12). NS-00 comprobó que una imagen
+  `debian:bookworm-slim` + `nmap` 7.93 como uid 65532 ejecuta
+  `nmap -sT -sV --script vuln -T4 -oX -` con `--cap-drop ALL` y 512 MB.
+- **Decisión:** `ScanRequest.scan_mode` (`ssh` por defecto | `network`; el modo
+  `network` prohíbe `network_user`, `ssh_credentials_ref` y `has_sudo`). El modo
+  `network` ejecuta `nmap` local (`local_scanner`) sin privilegios (`-sT`, sin
+  `-O`, sin `sudo`), con `argv` separado, timeout (`MS_NMAP_LOCAL_SCAN_TIMEOUT_SECS`,
+  default 900 s) y `kill_on_drop`. Reutiliza el parser y el enriquecimiento
+  (NVD/Exploit-DB); omite la verificación de parches. Un objetivo sin respuesta
+  falla con `reason_code` `target_unreachable`. La imagen runtime pasa a
+  `debian:bookworm-slim` (pineada por digest) con `nmap` y `ca-certificates`,
+  usuario `nonroot` uid 65532. Se rechazó un servicio escáner aparte siempre
+  encendido y una tarea Fargate por escaneo (arranque de 30-60 s, resultados por
+  S3).
+- **Consecuencia:** la imagen es mayor que la distroless y trae shell y
+  coreutils (que `ms-nmap` no usa; nada se ejecuta a través de un shell). El
+  resultado de un escaneo `network` no distingue «no verificado» de «sin
+  verificador» en el propio `ScanResult` (el contrato `scan-outcome` no tiene
+  un campo de resultado para ello): quien necesite mostrarlo debe usar el
+  `scan_mode` de la solicitud, que el Gateway ya conoce.
