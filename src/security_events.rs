@@ -18,7 +18,8 @@
 //!
 //! - **Un fallo de publicación nunca llega al escaneo**: los puntos de
 //!   emisión usan [`emit`]/[`emit_all`], que publican en una tarea `tokio`
-//!   desacoplada con un tope de [`PUBLISH_TIMEOUT`] por evento y solo loggean
+//!   desacoplada con un tope de [`PUBLISH_TIMEOUT`] por evento (con hasta 3
+//!   intentos con backoff y jitter, ver [`RetryPolicy`]) y solo loggean
 //!   el tipo de evento. El pipeline no espera a Kinesis ni puede fallar por
 //!   él. El costo es que un evento puede perderse si el proceso muere antes de
 //!   que la tarea corra; es aceptable porque el estado del escaneo (Mongo/SNS)
@@ -483,10 +484,10 @@ pub fn emit(
 }
 
 /// Emite `events` sin esperar ni propagar nada: los publica en orden desde una
-/// única tarea `tokio` desacoplada, con tope de [`PUBLISH_TIMEOUT`] por
-/// evento. Al primer fallo o timeout el resto del lote se descarta (si Kinesis
-/// está caído, no tiene sentido encadenar timeouts). Un evento inválido o la
-/// ausencia de runtime solo se loggean (tipo de evento y campo, nunca el
+/// única tarea `tokio` desacoplada. Cada evento se reintenta con backoff y
+/// jitter ([`RetryPolicy`]) dentro de un tope de [`PUBLISH_TIMEOUT`]; si agota
+/// los intentos se loggea y el resto del lote se publica igual. Un evento
+/// inválido o la ausencia de runtime solo se loggean (tipo de evento y campo, nunca el
 /// contenido). Es el único punto de emisión que debe usar el pipeline.
 pub fn emit_all(
     publisher: &Arc<dyn SecurityEventPublisher>,
@@ -515,26 +516,102 @@ pub fn emit_all(
     };
     let publisher = Arc::clone(publisher);
     runtime.spawn(async move {
-        for event in &events {
-            match tokio::time::timeout(PUBLISH_TIMEOUT, publisher.publish(event)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    tracing::error!(
-                        event_type = event.event_type_str(),
-                        "no se pudo publicar un evento de seguridad (el escaneo no se ve afectado)"
-                    );
-                    return;
-                }
-                Err(_) => {
-                    tracing::error!(
-                        event_type = event.event_type_str(),
-                        "se agotó el tiempo publicando un evento de seguridad (el escaneo no se ve afectado)"
-                    );
-                    return;
-                }
-            }
+        for event in events {
+            deliver(&publisher, event, RetryPolicy::default()).await;
         }
     });
+}
+
+/// Política de reintento de una publicación: intentos acotados con backoff
+/// exponencial y jitter completo, dentro del tope global [`PUBLISH_TIMEOUT`].
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Intentos totales por evento (el primero incluido).
+    pub max_attempts: u32,
+    /// Tope de espera antes del primer reintento; se duplica en cada uno.
+    pub base_delay: Duration,
+    /// Tiempo máximo de cada intento, para poder reintentar una llamada colgada.
+    pub attempt_timeout: Duration,
+    /// Elige la espera real dado su tope; inyectable para tests deterministas.
+    pub jitter: fn(Duration) -> Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(100),
+            attempt_timeout: Duration::from_millis(1500),
+            jitter: full_jitter,
+        }
+    }
+}
+
+/// Jitter completo: un valor uniforme en `[0, cap]` (bytes aleatorios de un
+/// UUID v4, sin añadir una dependencia).
+pub fn full_jitter(cap: Duration) -> Duration {
+    // Los 62 bits bajos de un UUID v4 son aleatorios (los altos llevan la
+    // versión y la variante, constantes).
+    let random = uuid::Uuid::new_v4().as_u128() & ((1u128 << 62) - 1);
+    cap.mul_f64(random as f64 / (1u128 << 62) as f64)
+}
+
+/// Publica `event` con la política dada; `true` si el destino lo aceptó.
+/// Cada intento tiene su propio tope; un fallo o timeout de un intento se
+/// loggea (tipo e id del evento, nunca el contenido) y se reintenta tras
+/// una espera con backoff exponencial y jitter. El tope global lo impone
+/// quien llama (ver `deliver`).
+pub async fn publish_with_retry(
+    publisher: &dyn SecurityEventPublisher,
+    event: &SecurityEvent,
+    policy: &RetryPolicy,
+) -> bool {
+    for attempt in 1..=policy.max_attempts {
+        let reason =
+            match tokio::time::timeout(policy.attempt_timeout, publisher.publish(event)).await {
+                Ok(Ok(())) => return true,
+                Ok(Err(_)) => "error",
+                Err(_) => "timeout",
+            };
+        tracing::warn!(
+            attempt,
+            max_attempts = policy.max_attempts,
+            reason,
+            event_type = event.event_type_str(),
+            event_id = event.event_id(),
+            "falló un intento de publicar un evento de seguridad"
+        );
+        if attempt < policy.max_attempts {
+            let cap = policy.base_delay.saturating_mul(1 << (attempt - 1).min(16));
+            tokio::time::sleep((policy.jitter)(cap)).await;
+        }
+    }
+    false
+}
+
+async fn deliver(
+    publisher: &Arc<dyn SecurityEventPublisher>,
+    event: SecurityEvent,
+    policy: RetryPolicy,
+) {
+    match tokio::time::timeout(
+        PUBLISH_TIMEOUT,
+        publish_with_retry(publisher.as_ref(), &event, &policy),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::error!(
+            event_type = event.event_type_str(),
+            event_id = event.event_id(),
+            "no se pudo publicar un evento de seguridad (el escaneo no se ve afectado)"
+        ),
+        Err(_) => tracing::error!(
+            event_type = event.event_type_str(),
+            event_id = event.event_id(),
+            "se agotó el tiempo publicando un evento de seguridad (el escaneo no se ve afectado)"
+        ),
+    }
 }
 
 /// Adaptador que descarta todo evento: se usa cuando
@@ -815,24 +892,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_all_stops_the_batch_after_the_first_failure() {
-        let failing = Arc::new(FailingPublisher::default());
-        let port: Arc<dyn SecurityEventPublisher> = failing.clone();
-        emit_all(
-            &port,
-            vec![
-                SecurityEvent::scan_started("a"),
-                SecurityEvent::scan_started("b"),
-                SecurityEvent::scan_started("c"),
-            ],
-        );
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(failing.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
     async fn emit_with_an_invalid_event_drops_it_without_publishing() {
         let recorder = Arc::new(RecordingSecurityEventPublisher::new());
         let port: Arc<dyn SecurityEventPublisher> = recorder.clone();
@@ -1062,6 +1121,195 @@ mod tests {
         let events = completion_events("", 1, &result_with(Vec::new()));
         assert_eq!(events.len(), 1);
         assert!(events[0].is_err());
+    }
+
+    #[derive(Clone, Copy)]
+    enum Step {
+        Fail,
+        Hang,
+        Ok,
+    }
+
+    /// Publicador con guion: cada intento consume un paso; sin pasos, falla.
+    struct Scripted {
+        steps: Mutex<std::collections::VecDeque<Step>>,
+        attempts: Mutex<u32>,
+        published: Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn new(steps: &[Step]) -> Arc<Self> {
+            Arc::new(Self {
+                steps: Mutex::new(steps.iter().copied().collect()),
+                attempts: Mutex::new(0),
+                published: Mutex::new(Vec::new()),
+            })
+        }
+        fn attempts(&self) -> u32 {
+            *self.attempts.lock().unwrap()
+        }
+        fn published(&self) -> Vec<String> {
+            self.published.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SecurityEventPublisher for Scripted {
+        async fn publish(&self, event: &SecurityEvent) -> Result<(), SecurityEventError> {
+            *self.attempts.lock().unwrap() += 1;
+            let step = self.steps.lock().unwrap().pop_front().unwrap_or(Step::Fail);
+            match step {
+                Step::Ok => {
+                    self.published
+                        .lock()
+                        .unwrap()
+                        .push(event.event_id().to_string());
+                    Ok(())
+                }
+                Step::Fail => Err(SecurityEventError::PublishFailed("boom".into())),
+                Step::Hang => std::future::pending().await,
+            }
+        }
+    }
+
+    fn max_jitter_policy() -> RetryPolicy {
+        RetryPolicy {
+            jitter: |cap| cap,
+            ..RetryPolicy::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_failure_then_success_publishes_once_after_retry() {
+        let publisher = Scripted::new(&[Step::Fail, Step::Ok]);
+        let event = SecurityEvent::scan_started("a").unwrap();
+        assert!(publish_with_retry(publisher.as_ref(), &event, &max_jitter_policy()).await);
+        assert_eq!(publisher.attempts(), 2);
+        assert_eq!(publisher.published(), [event.event_id()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_failure_makes_exactly_max_attempts_within_the_budget() {
+        let publisher = Scripted::new(&[]);
+        let event = SecurityEvent::scan_started("a").unwrap();
+        let start = tokio::time::Instant::now();
+        assert!(!publish_with_retry(publisher.as_ref(), &event, &max_jitter_policy()).await);
+        assert_eq!(publisher.attempts(), 3);
+        assert!(start.elapsed() <= PUBLISH_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_attempt_is_cut_by_the_attempt_timeout_and_retried() {
+        let publisher = Scripted::new(&[Step::Hang, Step::Ok]);
+        let event = SecurityEvent::scan_started("a").unwrap();
+        let start = tokio::time::Instant::now();
+        assert!(publish_with_retry(publisher.as_ref(), &event, &max_jitter_policy()).await);
+        assert_eq!(publisher.attempts(), 2);
+        assert!(start.elapsed() >= RetryPolicy::default().attempt_timeout);
+        assert!(start.elapsed() < PUBLISH_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_attempts_hanging_still_finish_within_the_overall_budget() {
+        let publisher = Scripted::new(&[Step::Hang, Step::Hang, Step::Hang]);
+        let port: Arc<dyn SecurityEventPublisher> = publisher.clone();
+        let start = tokio::time::Instant::now();
+        deliver(
+            &port,
+            SecurityEvent::scan_started("a").unwrap(),
+            max_jitter_policy(),
+        )
+        .await;
+        assert_eq!(publisher.attempts(), 3);
+        assert!(start.elapsed() <= PUBLISH_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emit_retries_in_the_background_after_a_transient_failure() {
+        let publisher = Scripted::new(&[Step::Fail, Step::Ok]);
+        let port: Arc<dyn SecurityEventPublisher> = publisher.clone();
+        emit(&port, SecurityEvent::scan_started("a"));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(publisher.attempts(), 2);
+        assert_eq!(publisher.published().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_event_is_not_retried_nor_published() {
+        let publisher = Scripted::new(&[Step::Ok]);
+        let port: Arc<dyn SecurityEventPublisher> = publisher.clone();
+        emit(&port, SecurityEvent::scan_started(""));
+        tokio::time::advance(Duration::from_secs(6)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(publisher.attempts(), 0);
+    }
+
+    #[test]
+    fn full_jitter_stays_within_zero_and_cap() {
+        let cap = Duration::from_millis(200);
+        let samples: Vec<_> = (0..200).map(|_| full_jitter(cap)).collect();
+        assert!(samples.iter().all(|d| *d <= cap));
+        assert!(
+            samples.iter().any(|d| *d < cap / 4),
+            "debe cubrir el tramo bajo"
+        );
+        assert!(
+            samples.iter().any(|d| *d > cap * 3 / 4),
+            "debe cubrir el tramo alto"
+        );
+    }
+
+    /// Publicador que falla siempre para eventos con cierta clave de partición.
+    struct FailsForKey {
+        bad: &'static str,
+        published: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SecurityEventPublisher for FailsForKey {
+        async fn publish(&self, event: &SecurityEvent) -> Result<(), SecurityEventError> {
+            if event.partition_key() == self.bad {
+                return Err(SecurityEventError::PublishFailed("boom".into()));
+            }
+            self.published
+                .lock()
+                .unwrap()
+                .push(event.partition_key().to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emit_all_with_one_failing_event_still_publishes_the_others_in_order() {
+        let publisher = Arc::new(FailsForKey {
+            bad: "b",
+            published: Mutex::new(Vec::new()),
+        });
+        let port: Arc<dyn SecurityEventPublisher> = publisher.clone();
+        emit_all(
+            &port,
+            vec![
+                SecurityEvent::scan_started("a"),
+                SecurityEvent::scan_started("b"),
+                SecurityEvent::scan_started("c"),
+            ],
+        );
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*publisher.published.lock().unwrap(), ["a", "c"]);
     }
 
     #[derive(Default)]
