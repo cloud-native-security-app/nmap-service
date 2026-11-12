@@ -2,6 +2,18 @@
 //! `consumer -> ssh -> scanner -> parser -> repository -> publisher`
 //! (ver `docs/architecture.md`, §"Flujo de datos").
 //!
+//! # Modos de escaneo
+//!
+//! El [`ScanRequest`] elige el ejecutor (ver [`crate::domain::ScanMode`]):
+//!
+//! - `ssh`: sesión SSH en el objetivo, `nmap` remoto, enriquecimiento y
+//!   verificación de parches sobre esa sesión.
+//! - `network`: `nmap` local ([`crate::local_scanner`]) contra la IP, sin SSH.
+//!   Se reutilizan el parser y el enriquecimiento (NVD/Exploit-DB), pero **no
+//!   hay verificación de parches** (no hay sesión): los hallazgos conservan
+//!   `confidence=version_match` y ningún `patch_state`, que por contrato
+//!   significa «no verificado».
+//!
 //! [`ScanPipeline::process_one`] ejecuta **una** solicitud por todas las etapas.
 //! Antes de la primera (`ssh::connect`) publica un [`ScanOutcome::Started`]
 //! best-effort, para que el Gateway sepa que la solicitud pasó a EN_PROGRESO
@@ -42,8 +54,11 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::domain::{CorrelationId, ScanCancellation, ScanRequest, ScanResult, VulnFinding};
+use crate::domain::{
+    CorrelationId, ScanAccess, ScanCancellation, ScanRequest, ScanResult, VulnFinding,
+};
 use crate::enrichment::VulnEnricher;
+use crate::local_scanner::{LocalScanError, LocalScanner};
 use crate::messaging::consumer::{
     ConsumeError, IncomingScanRequest, ScanCancellationSource, ScanRequestSource,
     REJECTED_REQUEST_REASON,
@@ -78,7 +93,9 @@ const REJECTED_REQUEST_REASON_CODE: &str = "rejected_request";
 /// `ssh_unreachable`, `ssh_host_key_mismatch`, `ssh_host_key_store`,
 /// `ssh_protocol_error`, `ssh_io_error`; `nmap` -> `nmap_not_available`,
 /// `nmap_insufficient_privileges`, `nmap_failed` (un fallo SSH al lanzarlo
-/// conserva su slug `ssh_*`); parseo -> `parse_failed`; persistencia ->
+/// conserva su slug `ssh_*`); `nmap` local (modo `network`) ->
+/// `nmap_not_available`, `nmap_timeout`, `nmap_failed`, `nmap_io_error`, y
+/// `target_unreachable` si no respondió ningún host; parseo -> `parse_failed`; persistencia ->
 /// `persistence_failed`; cancelación -> `scan_cancelled`; solicitud inválida
 /// -> `rejected_request`.
 #[derive(Debug)]
@@ -107,6 +124,31 @@ impl StageFailure {
         Self {
             reason: err.to_string(),
             code,
+        }
+    }
+
+    fn from_local(err: &LocalScanError) -> Self {
+        let code = match err {
+            LocalScanError::ToolNotAvailable => "nmap_not_available",
+            LocalScanError::Timeout(_) => "nmap_timeout",
+            LocalScanError::NmapFailed { .. } => "nmap_failed",
+            LocalScanError::Io(_) => "nmap_io_error",
+        };
+        Self {
+            reason: err.to_string(),
+            code,
+        }
+    }
+
+    /// Fallo de parseo en modo `network`: un `<nmaprun>` sin `<host>` significa
+    /// que el objetivo no respondió desde este contenedor.
+    fn from_network_parse(err: &parser::ParseError) -> Self {
+        match err {
+            parser::ParseError::NoHost => Self {
+                reason: "el objetivo no respondió al escaneo de red".to_owned(),
+                code: "target_unreachable",
+            },
+            other => Self::from_parse(other),
         }
     }
 
@@ -226,6 +268,9 @@ pub struct ServicePorts {
     /// Puerto de escaneo: ejecuta `nmap` sobre la sesión (adaptador real
     /// [`crate::scanner::NmapCliScanner`]).
     pub scanner: Arc<dyn NmapScanner>,
+    /// Puerto del escaneo local del modo `network`: ejecuta `nmap` en este
+    /// contenedor (adaptador real [`crate::local_scanner::LocalNmapScanner`]).
+    pub local_scanner: Arc<dyn LocalScanner>,
     /// Puerto de persistencia del [`ScanResult`] (adaptador real
     /// [`crate::repository::MongoRepository`]).
     pub repository: Arc<dyn ScanResultRepository>,
@@ -276,6 +321,7 @@ pub struct PipelineConfig {
 pub struct ScanPipeline {
     executor: Arc<dyn RemoteExecutor>,
     scanner: Arc<dyn NmapScanner>,
+    local_scanner: Arc<dyn LocalScanner>,
     repository: Arc<dyn ScanResultRepository>,
     enricher: Arc<dyn VulnEnricher>,
     patch_verifier: Arc<dyn PatchVerifier>,
@@ -298,6 +344,7 @@ impl ScanPipeline {
         Self {
             executor: ports.executor,
             scanner: ports.scanner,
+            local_scanner: ports.local_scanner,
             repository: ports.repository,
             enricher: ports.enricher,
             patch_verifier: ports.patch_verifier,
@@ -521,40 +568,62 @@ impl ScanPipeline {
         }
     }
 
-    /// Ejecuta las etapas SSH -> `nmap` -> parseo -> persistencia. Devuelve el
-    /// [`ScanResult`] o, ante el primer `Err`, un [`StageFailure`] con el
-    /// `reason` legible (`err.to_string()` de la etapa, sin credenciales) y el
-    /// slug de `scan.failed`.
+    /// Ejecuta las etapas (SSH ->) `nmap` -> parseo -> enriquecimiento (->
+    /// verificación de parches) -> persistencia. Devuelve el [`ScanResult`] o,
+    /// ante el primer `Err`, un [`StageFailure`] con el `reason` legible
+    /// (`err.to_string()` de la etapa, sin credenciales) y el slug de
+    /// `scan.failed`.
+    ///
+    /// El modo de la solicitud elige el ejecutor: `ssh` abre sesión y verifica
+    /// parches sobre ella; `network` ejecuta `nmap` localmente y se salta la
+    /// verificación de parches (no hay sesión).
     async fn run_stages(&self, request: &ScanRequest) -> Result<ScanResult, StageFailure> {
-        let session = self
-            .executor
-            .connect(
-                &request.ip.to_string(),
-                self.config.ssh_port,
-                &request.network_user,
-                &request.ssh_credentials_ref,
-                &self.host_key_store,
-                self.config.ssh_timeouts,
-            )
-            .await
-            .map_err(|err| StageFailure::from_ssh(&err))?;
+        let (mut result, session) = match &request.access {
+            ScanAccess::Ssh(ssh) => {
+                let session = self
+                    .executor
+                    .connect(
+                        &request.ip.to_string(),
+                        self.config.ssh_port,
+                        &ssh.network_user,
+                        &ssh.ssh_credentials_ref,
+                        &self.host_key_store,
+                        self.config.ssh_timeouts,
+                    )
+                    .await
+                    .map_err(|err| StageFailure::from_ssh(&err))?;
 
-        let xml = self
-            .scanner
-            .run_scan(
-                session.as_ref(),
-                request.ip,
-                request.has_sudo,
-                &self.config.scan_options,
-            )
-            .await
-            .map_err(|err| StageFailure::from_scan(&err))?;
+                let xml = self
+                    .scanner
+                    .run_scan(
+                        session.as_ref(),
+                        request.ip,
+                        ssh.has_sudo,
+                        &self.config.scan_options,
+                    )
+                    .await
+                    .map_err(|err| StageFailure::from_scan(&err))?;
 
-        let mut result = parser::parse(&xml).map_err(|err| StageFailure::from_parse(&err))?;
+                let result = parser::parse(&xml).map_err(|err| StageFailure::from_parse(&err))?;
+                (result, Some(session))
+            }
+            ScanAccess::Network => {
+                let xml = self
+                    .local_scanner
+                    .run_scan(request.ip, &self.config.scan_options)
+                    .await
+                    .map_err(|err| StageFailure::from_local(&err))?;
 
-        // Enriquecimiento best-effort: un fallo aquí NUNCA convierte el escaneo
-        // en `ScanOutcome::Failed`; se registra y se continúa con los hallazgos
-        // de `nmap` (ver `docs/architecture.md`, capa `enrichment`).
+                let result =
+                    parser::parse(&xml).map_err(|err| StageFailure::from_network_parse(&err))?;
+                (result, None)
+            }
+        };
+
+        // Enriquecimiento best-effort (ambos modos): un fallo aquí NUNCA
+        // convierte el escaneo en `ScanOutcome::Failed`; se registra y se
+        // continúa con los hallazgos de `nmap` (ver `docs/architecture.md`,
+        // capa `enrichment`).
         let extra = self
             .enricher
             .enrich(&result.ports)
@@ -569,27 +638,35 @@ impl ScanPipeline {
             });
         merge_enrichment_findings(&mut result.vulnerabilities, extra);
 
-        // Verificación de parches best-effort sobre la sesión ya abierta: un
-        // fallo (error SSH, timeout) NUNCA convierte el escaneo en `Failed`; se
-        // registra sin credenciales ni salida de comandos y los hallazgos
-        // quedan intactos (sin verificar).
-        match self
-            .patch_verifier
-            .verify(session.as_ref(), &mut result.vulnerabilities)
-            .await
-        {
-            Ok(summary) => tracing::info!(
+        match session {
+            // Verificación de parches best-effort sobre la sesión ya abierta: un
+            // fallo (error SSH, timeout) NUNCA convierte el escaneo en `Failed`;
+            // se registra sin credenciales ni salida de comandos y los hallazgos
+            // quedan intactos (sin verificar).
+            Some(session) => match self
+                .patch_verifier
+                .verify(session.as_ref(), &mut result.vulnerabilities)
+                .await
+            {
+                Ok(summary) => tracing::info!(
+                    correlation_id = %request.correlation_id,
+                    unpatched = summary.unpatched,
+                    fixed = summary.fixed,
+                    unverified = summary.unverified,
+                    skipped = ?summary.skipped,
+                    "verificación de parches completada"
+                ),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    correlation_id = %request.correlation_id,
+                    "verificación de parches falló; los hallazgos quedan sin verificar"
+                ),
+            },
+            // Modo network: sin sesión no hay verificación. Los hallazgos
+            // quedan `version_match` y sin `patch_state` (= no verificado).
+            None => tracing::info!(
                 correlation_id = %request.correlation_id,
-                unpatched = summary.unpatched,
-                fixed = summary.fixed,
-                unverified = summary.unverified,
-                skipped = ?summary.skipped,
-                "verificación de parches completada"
-            ),
-            Err(err) => tracing::warn!(
-                error = %err,
-                correlation_id = %request.correlation_id,
-                "verificación de parches falló; los hallazgos quedan sin verificar"
+                "modo network: se omite la verificación de parches; el estado de parche no se verificó"
             ),
         }
 
@@ -875,9 +952,11 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        CorrelationId, PatchState, PortFinding, Severity, SshCredentialsRef, VulnSource,
+        CorrelationId, PatchState, PortFinding, ScanAccess, Severity, SshAccess, SshCredentialsRef,
+        VulnSource,
     };
     use crate::enrichment::EnrichError;
+    use crate::local_scanner::{LocalScanError, LocalScanner};
     use crate::messaging::consumer::{
         AckError, Acknowledger, InMemoryScanCancellationSource, InMemoryScanRequestSource,
         IncomingScanRequest, ScanCancellationSource,
@@ -1417,6 +1496,7 @@ mod tests {
             ServicePorts {
                 executor: Arc::new(OkExecutor),
                 scanner: Arc::new(XmlScanner),
+                local_scanner: Arc::new(UnusedLocalScanner),
                 repository,
                 enricher: Arc::new(StubEnricher(vec![version_match_finding()])),
                 patch_verifier: Arc::new(verifier),
@@ -1479,10 +1559,12 @@ mod tests {
         ScanRequest {
             correlation_id: CorrelationId::from(correlation_id),
             ip: "198.51.100.7".parse().expect("IP de prueba válida"),
-            network_user: "netops".to_owned(),
-            ssh_credentials_ref: SshCredentialsRef::new(SecretString::from(SECRET.to_owned())),
-            has_sudo: false,
             requested_by: "analyst@example.test".to_owned(),
+            access: ScanAccess::Ssh(SshAccess {
+                network_user: "netops".to_owned(),
+                ssh_credentials_ref: SshCredentialsRef::new(SecretString::from(SECRET.to_owned())),
+                has_sudo: false,
+            }),
         }
     }
 
@@ -1503,6 +1585,7 @@ mod tests {
         let ports = ServicePorts {
             executor: Arc::new(FailingExecutor),
             scanner: Arc::new(UnusedScanner),
+            local_scanner: Arc::new(UnusedLocalScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -1593,6 +1676,7 @@ mod tests {
         let ports = ServicePorts {
             executor: Arc::new(FailingExecutor),
             scanner: Arc::new(UnusedScanner),
+            local_scanner: Arc::new(UnusedLocalScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -1693,6 +1777,7 @@ mod tests {
                 started: started.clone(),
             }),
             scanner: Arc::new(UnusedScanner),
+            local_scanner: Arc::new(UnusedLocalScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -1783,6 +1868,7 @@ mod tests {
                 started: Arc::new(Notify::new()),
             }),
             scanner: Arc::new(UnusedScanner),
+            local_scanner: Arc::new(UnusedLocalScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -1839,6 +1925,7 @@ mod tests {
         let ports = ServicePorts {
             executor: Arc::new(FailingExecutor),
             scanner: Arc::new(UnusedScanner),
+            local_scanner: Arc::new(UnusedLocalScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -1875,6 +1962,7 @@ mod tests {
         let ports = ServicePorts {
             executor: Arc::new(FailingExecutor),
             scanner: Arc::new(UnusedScanner),
+            local_scanner: Arc::new(UnusedLocalScanner),
             repository: Arc::new(UnusedRepository),
             enricher: Arc::new(StubEnricher(Vec::new())),
             patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -2011,6 +2099,7 @@ mod tests {
             ServicePorts {
                 executor,
                 scanner: Arc::new(UnusedScanner),
+                local_scanner: Arc::new(UnusedLocalScanner),
                 repository,
                 enricher: Arc::new(StubEnricher(Vec::new())),
                 patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -2412,6 +2501,7 @@ mod tests {
             ServicePorts {
                 executor: Arc::new(OkExecutor),
                 scanner: Arc::new(XmlScanner),
+                local_scanner: Arc::new(UnusedLocalScanner),
                 repository: Arc::new(CapturingRepository::default()),
                 enricher: Arc::new(StubEnricher(vec![version_match_finding()])),
                 // Falla a propósito: el hallazgo queda sin `patch_state`.
@@ -2432,6 +2522,7 @@ mod tests {
             ServicePorts {
                 executor: Arc::new(FailingExecutor),
                 scanner: Arc::new(UnusedScanner),
+                local_scanner: Arc::new(UnusedLocalScanner),
                 repository: Arc::new(UnusedRepository),
                 enricher: Arc::new(StubEnricher(Vec::new())),
                 patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -2463,6 +2554,221 @@ mod tests {
         assert_eq!(events[2].payload()["confidence"], "version_match");
     }
 
+    // ---- Modo `network` (NS-02) -------------------------------------------
+
+    /// Escáner local que no debe invocarse (solicitudes en modo `ssh`).
+    struct UnusedLocalScanner;
+
+    #[async_trait::async_trait]
+    impl LocalScanner for UnusedLocalScanner {
+        async fn run_scan(
+            &self,
+            _target_ip: IpAddr,
+            _options: &ScanOptions,
+        ) -> Result<String, LocalScanError> {
+            unreachable!("el escáner local sólo se usa en modo network")
+        }
+    }
+
+    /// Qué devuelve el escáner local falso.
+    enum LocalBehavior {
+        Xml(&'static str),
+        Timeout,
+        ToolMissing,
+    }
+
+    struct FakeLocalScanner(LocalBehavior);
+
+    #[async_trait::async_trait]
+    impl LocalScanner for FakeLocalScanner {
+        async fn run_scan(
+            &self,
+            _target_ip: IpAddr,
+            _options: &ScanOptions,
+        ) -> Result<String, LocalScanError> {
+            match &self.0 {
+                LocalBehavior::Xml(xml) => Ok((*xml).to_owned()),
+                LocalBehavior::Timeout => Err(LocalScanError::Timeout(Duration::from_secs(1))),
+                LocalBehavior::ToolMissing => Err(LocalScanError::ToolNotAvailable),
+            }
+        }
+    }
+
+    /// Verificador de parches que falla el test si se invoca.
+    struct ForbiddenPatchVerifier;
+
+    #[async_trait::async_trait]
+    impl PatchVerifier for ForbiddenPatchVerifier {
+        async fn verify(
+            &self,
+            _session: &dyn RemoteSession,
+            _findings: &mut [VulnFinding],
+        ) -> Result<PatchVerifySummary, PatchVerifyError> {
+            unreachable!("el modo network no tiene sesión SSH: no hay verificación de parches")
+        }
+    }
+
+    /// Ejecutor SSH que falla el test si se invoca.
+    struct ForbiddenSshExecutor;
+
+    #[async_trait::async_trait]
+    impl RemoteExecutor for ForbiddenSshExecutor {
+        async fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            _user: &str,
+            _credentials: &SshCredentialsRef,
+            _store: &Arc<dyn HostKeyStore>,
+            _timeouts: SshTimeouts,
+        ) -> Result<Box<dyn RemoteSession>, SshError> {
+            unreachable!("el modo network no abre sesiones SSH")
+        }
+    }
+
+    const OPEN_PORTS_XML: &str = include_str!("../tests/fixtures/open_ports_service_version.xml");
+    const NO_HOST_XML: &str = include_str!("../tests/fixtures/no_host_element.xml");
+
+    fn network_request(correlation_id: &str) -> ScanRequest {
+        ScanRequest {
+            correlation_id: CorrelationId::from(correlation_id),
+            ip: "198.51.100.7".parse().expect("IP de prueba válida"),
+            requested_by: "analyst@example.test".to_owned(),
+            access: ScanAccess::Network,
+        }
+    }
+
+    fn network_pipeline(
+        local: LocalBehavior,
+        repository: Arc<CapturingRepository>,
+        sink: Arc<InMemoryScanResultSink>,
+        events: Arc<dyn SecurityEventPublisher>,
+    ) -> ScanPipeline {
+        ScanPipeline::new(
+            ServicePorts {
+                executor: Arc::new(ForbiddenSshExecutor),
+                scanner: Arc::new(UnusedScanner),
+                local_scanner: Arc::new(FakeLocalScanner(local)),
+                repository,
+                enricher: Arc::new(StubEnricher(vec![version_match_finding()])),
+                patch_verifier: Arc::new(ForbiddenPatchVerifier),
+                host_key_store: Arc::new(InMemoryHostKeyStore::new()),
+                sink,
+                security_events: events,
+            },
+            test_config(),
+        )
+    }
+
+    #[tokio::test]
+    async fn network_scan_runs_locally_enriches_and_skips_the_patch_check() {
+        let repository = Arc::new(CapturingRepository::default());
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = network_pipeline(
+            LocalBehavior::Xml(OPEN_PORTS_XML),
+            repository.clone(),
+            sink.clone(),
+            noop_events(),
+        );
+
+        assert!(pipeline.process_one(network_request("corr-net-ok")).await);
+
+        let saved = repository.0.lock().expect("lock");
+        assert_eq!(saved.len(), 1, "el resultado se persiste");
+        // El enriquecimiento (NVD/ExploitDB) corre también en modo network.
+        let finding = saved[0]
+            .vulnerabilities
+            .iter()
+            .find(|f| f.id.as_deref() == Some("CVE-2024-6387"))
+            .expect("el hallazgo del enriquecedor está presente");
+        // Sin verificación de parches: el hallazgo queda `version_match` y sin
+        // `patch_state` (no verificado).
+        assert_eq!(
+            finding.confidence,
+            Some(crate::domain::Confidence::VersionMatch)
+        );
+        assert_eq!(finding.patch_state, None);
+
+        let published = sink.published();
+        assert!(matches!(published[0], ScanOutcome::Started { .. }));
+        assert!(matches!(published[1], ScanOutcome::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn network_scan_of_a_host_that_does_not_answer_fails_as_target_unreachable() {
+        let recorder = Arc::new(RecordingSecurityEventPublisher::new());
+        let sink = Arc::new(InMemoryScanResultSink::new());
+        let pipeline = network_pipeline(
+            LocalBehavior::Xml(NO_HOST_XML),
+            Arc::new(CapturingRepository::default()),
+            sink.clone(),
+            recorder.clone(),
+        );
+
+        pipeline.process_one(network_request("corr-net-down")).await;
+
+        let events = recorder.wait_for(2).await;
+        assert_eq!(event_types(&events), ["scan.started", "scan.failed"]);
+        assert_eq!(events[1].payload()["reason_code"], "target_unreachable");
+        assert!(matches!(
+            sink.published().last(),
+            Some(ScanOutcome::Failed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn network_scan_timeout_fails_with_the_nmap_timeout_code() {
+        let recorder = Arc::new(RecordingSecurityEventPublisher::new());
+        let pipeline = network_pipeline(
+            LocalBehavior::Timeout,
+            Arc::new(CapturingRepository::default()),
+            Arc::new(InMemoryScanResultSink::new()),
+            recorder.clone(),
+        );
+
+        pipeline
+            .process_one(network_request("corr-net-timeout"))
+            .await;
+
+        let events = recorder.wait_for(2).await;
+        assert_eq!(events[1].payload()["reason_code"], "nmap_timeout");
+    }
+
+    #[tokio::test]
+    async fn network_scan_without_the_nmap_binary_fails_as_nmap_not_available() {
+        let recorder = Arc::new(RecordingSecurityEventPublisher::new());
+        let pipeline = network_pipeline(
+            LocalBehavior::ToolMissing,
+            Arc::new(CapturingRepository::default()),
+            Arc::new(InMemoryScanResultSink::new()),
+            recorder.clone(),
+        );
+
+        pipeline.process_one(network_request("corr-net-tool")).await;
+
+        let events = recorder.wait_for(2).await;
+        assert_eq!(events[1].payload()["reason_code"], "nmap_not_available");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_host_in_ssh_mode_keeps_the_parse_failed_code() {
+        // `NoHost` sólo significa «objetivo inalcanzable» en modo network: en
+        // modo ssh el escaneo corre en el objetivo, así que sigue siendo un
+        // fallo de parseo.
+        assert_eq!(
+            StageFailure::from_parse(&ParseError::NoHost).code,
+            "parse_failed"
+        );
+        assert_eq!(
+            StageFailure::from_network_parse(&ParseError::NoHost).code,
+            "target_unreachable"
+        );
+        assert_eq!(
+            StageFailure::from_network_parse(&ParseError::MultipleHosts).code,
+            "parse_failed"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_stage_emits_started_and_failed_with_a_slug_never_the_error_text() {
         let recorder = Arc::new(RecordingSecurityEventPublisher::new());
@@ -2488,6 +2794,7 @@ mod tests {
                     started: started.clone(),
                 }),
                 scanner: Arc::new(UnusedScanner),
+                local_scanner: Arc::new(UnusedLocalScanner),
                 repository: Arc::new(UnusedRepository),
                 enricher: Arc::new(StubEnricher(Vec::new())),
                 patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -2545,6 +2852,7 @@ mod tests {
             ServicePorts {
                 executor: Arc::new(FailingExecutor),
                 scanner: Arc::new(UnusedScanner),
+                local_scanner: Arc::new(UnusedLocalScanner),
                 repository: Arc::new(LookupRepository(Ok(Some(stored_result())))),
                 enricher: Arc::new(StubEnricher(Vec::new())),
                 patch_verifier: Arc::new(StubPatchVerifier::noop()),
@@ -2618,6 +2926,24 @@ mod tests {
         for (error, code) in scan {
             assert_eq!(StageFailure::from_scan(&error).code, code);
         }
+        let local = [
+            (LocalScanError::ToolNotAvailable, "nmap_not_available"),
+            (
+                LocalScanError::Timeout(Duration::from_secs(1)),
+                "nmap_timeout",
+            ),
+            (
+                LocalScanError::NmapFailed {
+                    exit_code: 1,
+                    stderr: "x".into(),
+                },
+                "nmap_failed",
+            ),
+            (LocalScanError::Io("i".into()), "nmap_io_error"),
+        ];
+        for (error, code) in local {
+            assert_eq!(StageFailure::from_local(&error).code, code);
+        }
         assert_eq!(
             StageFailure::from_parse(&ParseError::MultipleHosts).code,
             "parse_failed"
@@ -2637,6 +2963,9 @@ mod tests {
             "nmap_not_available",
             "nmap_insufficient_privileges",
             "nmap_failed",
+            "nmap_timeout",
+            "nmap_io_error",
+            "target_unreachable",
             "parse_failed",
             "persistence_failed",
             CANCELLED_REASON_CODE,

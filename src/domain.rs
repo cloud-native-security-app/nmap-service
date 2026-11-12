@@ -127,17 +127,24 @@ impl<'de> Deserialize<'de> for SshCredentialsRef {
     }
 }
 
-/// Solicitud de escaneo recibida desde el Broker.
-///
-/// Es el único disparador válido de un escaneo: `ms-nmap` nunca escanea un
-/// objetivo que no llegue en un `ScanRequest` (ver `docs/security-scope.md`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScanRequest {
-    /// Identificador de correlación del flujo completo (solicitud -> resultado).
-    pub correlation_id: CorrelationId,
-    /// IP del host a escanear. Es el único objetivo autorizado de esta
-    /// solicitud.
-    pub ip: IpAddr,
+/// Cómo se escanea el objetivo (campo `scan_mode` del contrato
+/// `scan-request.schema.json`). Se serializa en minúsculas (`ssh`, `network`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanMode {
+    /// `ms-nmap` abre una sesión SSH en el objetivo y ejecuta allí `nmap`.
+    /// Es el modo por defecto cuando el mensaje no trae `scan_mode`, para que
+    /// los productores anteriores al campo sigan siendo válidos.
+    #[default]
+    Ssh,
+    /// `ms-nmap` ejecuta `nmap` desde su propio contenedor contra la IP del
+    /// objetivo, sin credenciales (`-sT`, sin `-O`, sin `sudo`).
+    Network,
+}
+
+/// Datos de acceso SSH al objetivo. Sólo existen en modo [`ScanMode::Ssh`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshAccess {
     /// Usuario de red con el que `ms-nmap` se autentica por SSH en el objetivo.
     pub network_user: String,
     /// Credenciales SSH para `network_user`. Su contenido va siempre redactado
@@ -150,10 +157,144 @@ pub struct ScanRequest {
     /// de SO, requiere root remoto) mediante `sudo -n`. Ver
     /// `docs/security-scope.md`.
     pub has_sudo: bool,
+}
+
+/// Acceso al objetivo según el modo de escaneo: hace irrepresentables las
+/// combinaciones que el contrato prohíbe (modo `ssh` sin credenciales, o modo
+/// `network` con ellas).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanAccess {
+    /// Modo `ssh`: el escaneo se ejecuta en el objetivo con estas credenciales.
+    Ssh(SshAccess),
+    /// Modo `network`: el escaneo se ejecuta desde este contenedor; no hay
+    /// credenciales.
+    Network,
+}
+
+/// Solicitud de escaneo recibida desde el Broker.
+///
+/// Es el único disparador válido de un escaneo: `ms-nmap` nunca escanea un
+/// objetivo que no llegue en un `ScanRequest` (ver `docs/security-scope.md`).
+///
+/// Su forma en el cable es la del contrato `scan-request.schema.json`:
+/// `scan_mode` (`ssh` por defecto) más, sólo en modo `ssh`, `network_user`,
+/// `ssh_credentials_ref` y `has_sudo`. La deserialización valida esa regla
+/// (falta un campo SSH en modo `ssh`, o sobra uno en modo `network`, es un
+/// error), de modo que un `ScanRequest` en memoria siempre es coherente.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ScanRequestWire", into = "ScanRequestWire")]
+pub struct ScanRequest {
+    /// Identificador de correlación del flujo completo (solicitud -> resultado).
+    pub correlation_id: CorrelationId,
+    /// IP del host a escanear. Es el único objetivo autorizado de esta
+    /// solicitud.
+    pub ip: IpAddr,
     /// Identidad del principal (usuario final) que originó la solicitud aguas
     /// arriba. Solo para trazabilidad/auditoría; la autorización sobre el
     /// objetivo se asume ya verificada por el Gateway/`ms-usuarios`.
     pub requested_by: String,
+    /// Modo de escaneo y, en modo `ssh`, las credenciales de acceso.
+    pub access: ScanAccess,
+}
+
+impl ScanRequest {
+    /// Modo de escaneo de la solicitud.
+    pub fn mode(&self) -> ScanMode {
+        match self.access {
+            ScanAccess::Ssh(_) => ScanMode::Ssh,
+            ScanAccess::Network => ScanMode::Network,
+        }
+    }
+
+    /// Acceso SSH, o `None` en modo `network`.
+    pub fn ssh(&self) -> Option<&SshAccess> {
+        match &self.access {
+            ScanAccess::Ssh(ssh) => Some(ssh),
+            ScanAccess::Network => None,
+        }
+    }
+}
+
+/// Forma plana de [`ScanRequest`] en el cable. Los campos SSH son opcionales
+/// aquí y su coherencia con `scan_mode` se comprueba en `TryFrom`.
+#[derive(Serialize, Deserialize)]
+struct ScanRequestWire {
+    correlation_id: CorrelationId,
+    /// Se omite al serializar en modo `ssh` (forma histórica byte a byte).
+    #[serde(default, skip_serializing_if = "is_default_mode")]
+    scan_mode: ScanMode,
+    ip: IpAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_credentials_ref: Option<SshCredentialsRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    has_sudo: Option<bool>,
+    requested_by: String,
+}
+
+fn is_default_mode(mode: &ScanMode) -> bool {
+    *mode == ScanMode::Ssh
+}
+
+impl TryFrom<ScanRequestWire> for ScanRequest {
+    type Error = String;
+
+    fn try_from(wire: ScanRequestWire) -> Result<Self, Self::Error> {
+        let access = match wire.scan_mode {
+            ScanMode::Ssh => ScanAccess::Ssh(SshAccess {
+                network_user: wire
+                    .network_user
+                    .ok_or("missing field `network_user` (required in ssh mode)")?,
+                ssh_credentials_ref: wire
+                    .ssh_credentials_ref
+                    .ok_or("missing field `ssh_credentials_ref` (required in ssh mode)")?,
+                has_sudo: wire
+                    .has_sudo
+                    .ok_or("missing field `has_sudo` (required in ssh mode)")?,
+            }),
+            ScanMode::Network => {
+                let forbidden = [
+                    ("network_user", wire.network_user.is_some()),
+                    ("ssh_credentials_ref", wire.ssh_credentials_ref.is_some()),
+                    ("has_sudo", wire.has_sudo.is_some()),
+                ];
+                if let Some((field, _)) = forbidden.iter().find(|(_, present)| *present) {
+                    return Err(format!("field `{field}` is not allowed in network mode"));
+                }
+                ScanAccess::Network
+            }
+        };
+        Ok(Self {
+            correlation_id: wire.correlation_id,
+            ip: wire.ip,
+            requested_by: wire.requested_by,
+            access,
+        })
+    }
+}
+
+impl From<ScanRequest> for ScanRequestWire {
+    fn from(request: ScanRequest) -> Self {
+        let (scan_mode, network_user, ssh_credentials_ref, has_sudo) = match request.access {
+            ScanAccess::Ssh(ssh) => (
+                ScanMode::Ssh,
+                Some(ssh.network_user),
+                Some(ssh.ssh_credentials_ref),
+                Some(ssh.has_sudo),
+            ),
+            ScanAccess::Network => (ScanMode::Network, None, None, None),
+        };
+        Self {
+            correlation_id: request.correlation_id,
+            scan_mode,
+            ip: request.ip,
+            network_user,
+            ssh_credentials_ref,
+            has_sudo,
+            requested_by: request.requested_by,
+        }
+    }
 }
 
 /// Solicitud de cancelación de un escaneo en curso, recibida desde el Broker
@@ -430,10 +571,12 @@ mod tests {
         ScanRequest {
             correlation_id: CorrelationId::from("corr-42"),
             ip: "192.0.2.10".parse().expect("IP de prueba válida"),
-            network_user: "scanner".to_owned(),
-            ssh_credentials_ref: SshCredentialsRef::new(SecretString::from(secret.to_owned())),
-            has_sudo: true,
             requested_by: "analyst@example.test".to_owned(),
+            access: ScanAccess::Ssh(SshAccess {
+                network_user: "scanner".to_owned(),
+                ssh_credentials_ref: SshCredentialsRef::new(SecretString::from(secret.to_owned())),
+                has_sudo: true,
+            }),
         }
     }
 
@@ -508,10 +651,109 @@ mod tests {
 
         let request: ScanRequest = serde_json::from_str(json).expect("deserializa la solicitud");
 
-        assert_eq!(request.ssh_credentials_ref.expose(), "real-broker-secret");
-        assert!(!request.has_sudo);
+        let ssh = request.ssh().expect("modo ssh por defecto");
+        assert_eq!(ssh.ssh_credentials_ref.expose(), "real-broker-secret");
+        assert!(!ssh.has_sudo);
+        assert_eq!(request.mode(), ScanMode::Ssh);
         assert_eq!(request.correlation_id.as_str(), "corr-7");
         assert_eq!(request.ip, "198.51.100.4".parse::<IpAddr>().unwrap());
+    }
+
+    const SSH_JSON: &str = r#"{
+        "correlation_id": "corr-7",
+        "ip": "198.51.100.4",
+        "network_user": "scanner",
+        "ssh_credentials_ref": "real-broker-secret",
+        "has_sudo": false,
+        "requested_by": "analyst@example.test"
+    }"#;
+
+    #[test]
+    fn ssh_request_without_scan_mode_defaults_to_ssh_and_keeps_its_wire_shape() {
+        let request: ScanRequest = serde_json::from_str(SSH_JSON).expect("deserializa");
+        assert_eq!(request.mode(), ScanMode::Ssh);
+
+        // Compatibilidad byte a byte: sin `scan_mode` y con los campos SSH en el
+        // mismo orden que antes (la credencial va redactada al serializar).
+        let json = serde_json::to_string(&request).expect("serializa");
+        assert_eq!(
+            json,
+            r#"{"correlation_id":"corr-7","ip":"198.51.100.4","network_user":"scanner","ssh_credentials_ref":"[REDACTED]","has_sudo":false,"requested_by":"analyst@example.test"}"#
+        );
+    }
+
+    #[test]
+    fn explicit_ssh_mode_is_accepted() {
+        let json = SSH_JSON.replacen('{', r#"{"scan_mode": "ssh","#, 1);
+        let request: ScanRequest = serde_json::from_str(&json).expect("deserializa");
+        assert_eq!(request.mode(), ScanMode::Ssh);
+    }
+
+    #[test]
+    fn network_request_has_no_ssh_access_and_serializes_without_ssh_fields() {
+        let json = r#"{
+            "correlation_id": "corr-8",
+            "scan_mode": "network",
+            "ip": "198.51.100.4",
+            "requested_by": "analyst@example.test"
+        }"#;
+        let request: ScanRequest = serde_json::from_str(json).expect("deserializa");
+
+        assert_eq!(request.mode(), ScanMode::Network);
+        assert!(request.ssh().is_none());
+        assert_eq!(
+            serde_json::to_value(&request).expect("serializa"),
+            serde_json::json!({
+                "correlation_id": "corr-8",
+                "scan_mode": "network",
+                "ip": "198.51.100.4",
+                "requested_by": "analyst@example.test"
+            })
+        );
+    }
+
+    #[test]
+    fn network_request_carrying_any_ssh_field_is_rejected_without_echoing_values() {
+        for extra in [
+            r#""network_user": "scanner""#,
+            r#""ssh_credentials_ref": "leaky-secret-value""#,
+            r#""has_sudo": false"#,
+        ] {
+            let json = format!(
+                r#"{{"correlation_id":"c","scan_mode":"network","ip":"198.51.100.4","requested_by":"a",{extra}}}"#
+            );
+            let err = serde_json::from_str::<ScanRequest>(&json)
+                .expect_err("network no admite campos SSH")
+                .to_string();
+            assert!(!err.contains("leaky-secret-value"), "{err}");
+        }
+    }
+
+    #[test]
+    fn ssh_request_missing_any_ssh_field_is_rejected() {
+        for field in ["network_user", "ssh_credentials_ref", "has_sudo"] {
+            let mut value: serde_json::Value = serde_json::from_str(SSH_JSON).expect("JSON");
+            value.as_object_mut().expect("objeto").remove(field);
+            let err = serde_json::from_value::<ScanRequest>(value)
+                .expect_err("ssh exige los tres campos")
+                .to_string();
+            assert!(err.contains(field), "el error debe nombrar {field}: {err}");
+        }
+    }
+
+    #[test]
+    fn unknown_scan_mode_is_rejected() {
+        let json = SSH_JSON.replacen('{', r#"{"scan_mode": "agent","#, 1);
+        assert!(serde_json::from_str::<ScanRequest>(&json).is_err());
+    }
+
+    #[test]
+    fn scan_mode_uses_a_stable_string_encoding() {
+        assert_eq!(serde_json::to_string(&ScanMode::Ssh).unwrap(), "\"ssh\"");
+        assert_eq!(
+            serde_json::to_string(&ScanMode::Network).unwrap(),
+            "\"network\""
+        );
     }
 
     #[test]

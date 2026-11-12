@@ -157,17 +157,26 @@ fn redact_credential(message: String, payload: &serde_json::Value) -> String {
 ///
 /// # Seguridad
 ///
-/// Sólo emite campos no sensibles (`correlation_id`, `network_user`, IP objetivo
-/// y `has_sudo`). Nunca registra `ssh_credentials_ref` ni el cuerpo crudo del
+/// Sólo emite campos no sensibles (`correlation_id`, `scan_mode`, `network_user`,
+/// IP objetivo y `has_sudo`). Nunca registra `ssh_credentials_ref` ni el cuerpo crudo del
 /// mensaje (ver `docs/security-scope.md`).
 pub fn log_request_received(request: &ScanRequest) {
-    tracing::info!(
-        correlation_id = %request.correlation_id,
-        network_user = %request.network_user,
-        target_ip = %request.ip,
-        has_sudo = request.has_sudo,
-        "solicitud de escaneo recibida del Broker"
-    );
+    match request.ssh() {
+        Some(ssh) => tracing::info!(
+            correlation_id = %request.correlation_id,
+            scan_mode = ?request.mode(),
+            network_user = %ssh.network_user,
+            target_ip = %request.ip,
+            has_sudo = ssh.has_sudo,
+            "solicitud de escaneo recibida del Broker"
+        ),
+        None => tracing::info!(
+            correlation_id = %request.correlation_id,
+            scan_mode = ?request.mode(),
+            target_ip = %request.ip,
+            "solicitud de escaneo recibida del Broker"
+        ),
+    }
 }
 
 /// Deserializa el cuerpo crudo de un mensaje del Broker a una
@@ -511,10 +520,11 @@ mod tests {
 
         assert_eq!(request.correlation_id.as_str(), "corr-42");
         assert_eq!(request.ip, "203.0.113.7".parse::<IpAddr>().unwrap());
-        assert!(request.has_sudo);
-        assert_eq!(request.network_user, "netops");
+        let ssh = request.ssh().expect("modo ssh");
+        assert!(ssh.has_sudo);
+        assert_eq!(ssh.network_user, "netops");
         assert_eq!(request.requested_by, "analyst@example.test");
-        assert_eq!(request.ssh_credentials_ref.expose(), SECRET);
+        assert_eq!(ssh.ssh_credentials_ref.expose(), SECRET);
     }
 
     #[test]

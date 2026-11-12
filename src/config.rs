@@ -34,6 +34,18 @@ pub const SSH_CONNECT_TIMEOUT_VAR: &str = "MS_NMAP_SSH_CONNECT_TIMEOUT_SECS";
 /// remoto sobre la sesión SSH, expresado en segundos enteros.
 pub const SSH_COMMAND_TIMEOUT_VAR: &str = "MS_NMAP_SSH_COMMAND_TIMEOUT_SECS";
 
+/// Nombre de la variable de entorno con el tiempo máximo, en segundos enteros,
+/// de un escaneo en modo `network` (`nmap` local, ver
+/// [`crate::local_scanner`]). Es **opcional**: sin ella se usa
+/// [`DEFAULT_LOCAL_SCAN_TIMEOUT`], para que un despliegue anterior al modo
+/// `network` siga arrancando sin cambios.
+pub const LOCAL_SCAN_TIMEOUT_VAR: &str = "MS_NMAP_LOCAL_SCAN_TIMEOUT_SECS";
+
+/// Tiempo máximo por defecto de un escaneo `network`: 15 minutos. NS-00 midió
+/// 1 min 18 s con `-T4` contra un único servicio; `-sV --script vuln` con el
+/// `-T2` por defecto de [`SCAN_TIMING_VAR`] y varios puertos tarda bastante más.
+pub const DEFAULT_LOCAL_SCAN_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// Nombre de la variable de entorno con la ruta al CSV de Exploit-DB
 /// (`files_exploits.csv`) que usa [`crate::enrichment::ExploitDbEnricher`].
 ///
@@ -179,6 +191,8 @@ pub struct Config {
     pub ssh_connect_timeout: Duration,
     /// Timeout para la ejecución de un comando remoto sobre la sesión SSH.
     pub ssh_command_timeout: Duration,
+    /// Tiempo máximo de un escaneo en modo `network` (`nmap` local).
+    pub local_scan_timeout: Duration,
     /// Ruta al CSV de Exploit-DB (`files_exploits.csv`) para el enriquecimiento
     /// offline de vulnerabilidades.
     pub exploitdb_csv: String,
@@ -260,6 +274,12 @@ impl Config {
             parse_timeout(SSH_CONNECT_TIMEOUT_VAR, lookup(SSH_CONNECT_TIMEOUT_VAR))?;
         let ssh_command_timeout =
             parse_timeout(SSH_COMMAND_TIMEOUT_VAR, lookup(SSH_COMMAND_TIMEOUT_VAR))?;
+        let local_scan_timeout = match lookup(LOCAL_SCAN_TIMEOUT_VAR) {
+            Some(raw) if !raw.trim().is_empty() => {
+                parse_timeout(LOCAL_SCAN_TIMEOUT_VAR, Some(raw))?
+            }
+            _ => DEFAULT_LOCAL_SCAN_TIMEOUT,
+        };
         let exploitdb_csv = required(EXPLOITDB_CSV_VAR, lookup(EXPLOITDB_CSV_VAR))?;
 
         let nvd_enrichment_enabled = parse_strict_bool(
@@ -304,6 +324,7 @@ impl Config {
             ssh_port,
             ssh_connect_timeout,
             ssh_command_timeout,
+            local_scan_timeout,
             exploitdb_csv,
             nvd_enrichment_enabled,
             nvd_api_key,
@@ -542,6 +563,32 @@ mod tests {
         assert!(config.nvd_api_key.is_none());
         assert!(config.nvd_cache_ttl.is_none());
         assert_eq!(config.scan_timing, Timing::Polite);
+    }
+
+    #[test]
+    fn local_scan_timeout_defaults_when_unset_so_existing_deployments_still_boot() {
+        let config = config_from(&valid_vars()).expect("carga");
+        assert_eq!(config.local_scan_timeout, DEFAULT_LOCAL_SCAN_TIMEOUT);
+    }
+
+    #[test]
+    fn local_scan_timeout_var_overrides_the_default() {
+        let mut vars = valid_vars();
+        vars.insert(LOCAL_SCAN_TIMEOUT_VAR, "45");
+        let config = config_from(&vars).expect("carga");
+        assert_eq!(config.local_scan_timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn invalid_local_scan_timeout_is_a_typed_error() {
+        for bad in ["0", "diez"] {
+            let mut vars = valid_vars();
+            vars.insert(LOCAL_SCAN_TIMEOUT_VAR, bad);
+            match config_from(&vars).expect_err("valor inválido") {
+                ConfigError::InvalidValue { var, .. } => assert_eq!(var, LOCAL_SCAN_TIMEOUT_VAR),
+                other => panic!("se esperaba InvalidValue, se obtuvo {other:?}"),
+            }
+        }
     }
 
     #[test]

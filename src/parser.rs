@@ -48,7 +48,7 @@
 //! - **host caído** (`<host><status state="down">`): se devuelve un
 //!   [`ScanResult`] con `ports` y `vulnerabilities` vacíos.
 //! - **sin ningún `<host>`** en el `<nmaprun>` (objetivo caído sin `-v`, o
-//!   escaneo sin resultados): [`ParseError::UnexpectedStructure`] — sin
+//!   escaneo sin resultados): [`ParseError::NoHost`] — sin
 //!   `<host>` no hay dirección con la que construir el [`ScanResult`], y un
 //!   objetivo inalcanzable es un fallo que el pipeline debe poder distinguir.
 //! - **varios `<host>`**: [`ParseError::MultipleHosts`]. El pipeline escanea
@@ -97,6 +97,14 @@ pub enum ParseError {
     /// única IP, así que esto indica una entrada inesperada.
     #[error("el XML contiene múltiples <host>; se esperaba exactamente uno")]
     MultipleHosts,
+    /// El `<nmaprun>` no contiene ningún `<host>`: `nmap` no obtuvo respuesta
+    /// del objetivo (caído, filtrado o inalcanzable) o el escaneo no produjo
+    /// resultados. El modo `network` del pipeline lo publica como
+    /// `target_unreachable`.
+    #[error(
+        "el <nmaprun> no contiene ningún <host> (objetivo inalcanzable o escaneo sin resultados)"
+    )]
+    NoHost,
 }
 
 /// Parsea el XML de un escaneo de `nmap` (`-oX`) y lo convierte en un
@@ -139,13 +147,7 @@ pub fn parse(xml: &str) -> Result<ScanResult, ParseError> {
         .collect();
 
     let host_node = match hosts.as_slice() {
-        [] => {
-            return Err(ParseError::UnexpectedStructure {
-                detail: "el <nmaprun> no contiene ningún <host> (objetivo inalcanzable \
-                         o escaneo sin resultados)"
-                    .to_owned(),
-            });
-        }
+        [] => return Err(ParseError::NoHost),
         [only] => *only,
         _ => return Err(ParseError::MultipleHosts),
     };
@@ -1238,10 +1240,8 @@ mod tests {
     #[test]
     fn parse_returns_error_when_nmaprun_has_no_host() {
         match parse(NO_HOST_ELEMENT_XML) {
-            Err(ParseError::UnexpectedStructure { detail }) => {
-                assert!(detail.contains("host"), "detalle: {detail}");
-            }
-            other => panic!("se esperaba UnexpectedStructure, se obtuvo {other:?}"),
+            Err(ParseError::NoHost) => {}
+            other => panic!("se esperaba NoHost, se obtuvo {other:?}"),
         }
     }
 

@@ -57,8 +57,9 @@ async fn request_source_delivers_and_parses_a_scan_request() {
         .expect("hay una solicitud");
 
     assert_eq!(incoming.request.correlation_id.as_str(), "corr-sqs-1");
-    assert_eq!(incoming.request.network_user, "netuser-lab");
-    assert!(incoming.request.has_sudo);
+    let ssh = incoming.request.ssh().expect("modo ssh");
+    assert_eq!(ssh.network_user, "netuser-lab");
+    assert!(ssh.has_sudo);
 }
 
 #[tokio::test]
