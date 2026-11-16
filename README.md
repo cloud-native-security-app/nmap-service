@@ -2,8 +2,8 @@
 
 `ms-nmap`: microservicio de escaneo dentro de una plataforma de
 ciberseguridad blue/red team. Recibe una solicitud de escaneo (IP, usuario de
-red y permisos) a través de una cola SQS, se conecta por SSH al objetivo, ejecuta
-`nmap` para detectar puertos abiertos, servicios, versiones y
+red y permisos) a través de una cola SQS, ejecuta `nmap` (en el objetivo por SSH,
+o desde su propio contenedor si la solicitud es `scan_mode: network`) para detectar puertos abiertos, servicios, versiones y
 vulnerabilidades, persiste el resultado en MongoDB (`db-nmap`) y lo publica
 de vuelta en un topic SNS para que otro servicio (`ms-analisis`) genere el
 informe final con IA.
@@ -119,14 +119,15 @@ El `Dockerfile` de la raíz produce una imagen multi-stage:
 - **builder**: `rust:1.98-bookworm`, compila el binario `ms-nmap` en release.
 - **exploitdb**: descarga `files_exploits.csv` de Exploit-DB, pineado a un
   commit concreto.
-- **runtime**: `gcr.io/distroless/cc-debian12:nonroot`, contiene el binario
-  `ms-nmap`, el CSV `files_exploits.csv` (dato de sólo lectura) y los
-  certificados CA del sistema, y corre como usuario no-root (`nonroot`, uid
-  65532).
+- **runtime**: `debian:bookworm-slim` con el paquete `nmap` y los certificados
+  CA, contiene el binario `ms-nmap` y el CSV `files_exploits.csv` (dato de sólo
+  lectura), y corre como usuario no-root (`nonroot`, uid 65532).
 
-La imagen final **no incluye**: la toolchain de Rust, el código fuente, shell
-ni coreutils, el CLI `searchsploit`, ni el binario `nmap`. `nmap` se ejecuta en
-la máquina objetivo vía SSH, no en este contenedor (ver `docs/architecture.md`).
+La imagen final **no incluye**: la toolchain de Rust, el código fuente ni el CLI
+`searchsploit`. **Incluye `nmap`** porque el modo `network` escanea desde este
+contenedor (`-sT`, sin `-O`, sin `sudo`, sin capacidades extra); el modo `ssh`
+sigue ejecutando `nmap` en la máquina objetivo (ver `docs/architecture.md`,
+§"Modos de escaneo").
 El servicio es un worker asíncrono puro: **no expone ningún servidor ni puerto
 HTTP**.
 
@@ -141,7 +142,7 @@ docker build -t ms-nmap .
 `ms-nmap` lee **toda** su configuración de variables de entorno. La mayoría son
 obligatorias (si falta alguna, registra el error y termina sin arrancar); las
 excepciones son `AWS_ENDPOINT_URL`, `SECURITY_EVENTS_STREAM_NAME` y
-`MS_NMAP_NVD_API_KEY` (genuinamente opcionales) y `MS_NMAP_NVD_CACHE_TTL_SECS` (obligatoria sólo si el
+`MS_NMAP_NVD_API_KEY` y `MS_NMAP_LOCAL_SCAN_TIMEOUT_SECS` (genuinamente opcionales) y `MS_NMAP_NVD_CACHE_TTL_SECS` (obligatoria sólo si el
 enriquecimiento NVD está habilitado):
 
 | Variable | Descripción |
@@ -159,6 +160,7 @@ enriquecimiento NVD está habilitado):
 | `SECURITY_EVENTS_STREAM_NAME` | Nombre del Kinesis Data Stream de eventos de seguridad (`security-events`; `[a-zA-Z0-9_.-]`, hasta 128 caracteres). Opcional: ausente o en blanco, `ms-nmap` no publica eventos (adaptador no-op, un log informativo al arrancar); un nombre inválido impide arrancar |
 | `MS_NMAP_SSH_CONNECT_TIMEOUT_SECS` | Timeout en segundos para establecer la conexión SSH con el objetivo |
 | `MS_NMAP_SSH_COMMAND_TIMEOUT_SECS` | Timeout en segundos para la ejecución del comando `nmap` remoto |
+| `MS_NMAP_LOCAL_SCAN_TIMEOUT_SECS` | Opcional (default `900`): tiempo máximo en segundos de un escaneo en modo `network` (`nmap` local). Al vencer se mata el proceso y el escaneo falla con `reason_code` `nmap_timeout` |
 | `MS_NMAP_EXPLOITDB_CSV` | Ruta al CSV `files_exploits.csv` de Exploit-DB para el enriquecimiento offline de vulnerabilidades. En la imagen Docker ya viene fijada por `ENV` a `/opt/exploitdb/files_exploits.csv` (el CSV se bundlea en la build); sólo hay que definirla al ejecutar fuera del contenedor |
 | `MS_NMAP_NVD_ENRICHMENT_ENABLED` | `true`/`false` (obligatoria, sin default): habilita el enriquecimiento online contra la API NVD 2.0. En `false`, `ms-nmap` no hace ninguna llamada de red hacia NVD |
 | `MS_NMAP_NVD_API_KEY` | API key de NVD (opcional; sube el límite de tasa permitido). Vacía o ausente = modo sin autenticar |

@@ -20,9 +20,11 @@ use testcontainers::{
 };
 
 use nmap_service::domain::{
-    CorrelationId, PortState, ScanCancellation, ScanRequest, SshCredentialsRef, VulnSource,
+    CorrelationId, PortState, ScanAccess, ScanCancellation, ScanRequest, SshAccess,
+    SshCredentialsRef, VulnSource,
 };
 use nmap_service::enrichment::{CompositeVulnEnricher, ExploitDbEnricher, VulnEnricher};
+use nmap_service::local_scanner::{LocalNmapScanner, LocalScanner};
 use nmap_service::messaging::consumer::{
     ConsumeError, InMemoryScanCancellationSource, InMemoryScanRequestSource, ScanCancellationSource,
 };
@@ -108,10 +110,12 @@ fn scan_request(ip: IpAddr, correlation_id: &str) -> ScanRequest {
     ScanRequest {
         correlation_id: CorrelationId::from(correlation_id),
         ip,
-        network_user: USER.to_owned(),
-        ssh_credentials_ref: creds(),
-        has_sudo: false,
         requested_by: "analyst@example.test".to_owned(),
+        access: ScanAccess::Ssh(SshAccess {
+            network_user: USER.to_owned(),
+            ssh_credentials_ref: creds(),
+            has_sudo: false,
+        }),
     }
 }
 
@@ -214,6 +218,8 @@ fn build_pipeline(
     let ports = ServicePorts {
         executor: Arc::new(RusshExecutor) as Arc<dyn RemoteExecutor>,
         scanner: Arc::new(NmapCliScanner) as Arc<dyn NmapScanner>,
+        local_scanner: Arc::new(LocalNmapScanner::new(Duration::from_secs(60)))
+            as Arc<dyn LocalScanner>,
         repository: Arc::new(repo.clone()) as Arc<dyn ScanResultRepository>,
         enricher,
         patch_verifier: Arc::new(nmap_service::patch_verify::RpmPatchVerifier),

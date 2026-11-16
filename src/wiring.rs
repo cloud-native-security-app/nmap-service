@@ -7,6 +7,8 @@
 //!
 //! - [`RemoteExecutor`] -> [`RusshExecutor`] (cliente `russh`).
 //! - [`NmapScanner`] -> [`NmapCliScanner`] (invoca el binario `nmap` remoto).
+//! - [`LocalScanner`] -> [`LocalNmapScanner`] (invoca el binario `nmap` de esta
+//!   imagen, modo `network`, con `config.local_scan_timeout`).
 //! - [`ScanResultRepository`] -> [`MongoRepository`].
 //! - [`HostKeyStore`] -> el respaldado por Mongo
 //!   ([`crate::repository::MongoHostKeyStore`]), para que la verificación TOFU
@@ -36,6 +38,7 @@ use crate::config::Config;
 use crate::enrichment::{
     CompositeVulnEnricher, EnrichError, ExploitDbEnricher, NvdApiEnricher, NvdCache, VulnEnricher,
 };
+use crate::local_scanner::{LocalNmapScanner, LocalScanner};
 use crate::messaging::consumer::{ScanCancellationSource, ScanRequestSource};
 use crate::messaging::kinesis::KinesisSecurityEventPublisher;
 use crate::messaging::publisher::ScanResultSink;
@@ -119,6 +122,8 @@ pub async fn service_ports_from_config(
     let host_key_store: Arc<dyn HostKeyStore> = Arc::new(repo.host_key_store());
     let executor: Arc<dyn RemoteExecutor> = Arc::new(RusshExecutor);
     let scanner: Arc<dyn NmapScanner> = Arc::new(NmapCliScanner);
+    let local_scanner: Arc<dyn LocalScanner> =
+        Arc::new(LocalNmapScanner::new(config.local_scan_timeout));
 
     // Enriquecimiento: el adaptador offline de Exploit-DB siempre se añade (el
     // CSV se carga aquí; si no está disponible, el servicio no arranca, la
@@ -209,6 +214,7 @@ pub async fn service_ports_from_config(
         ServicePorts {
             executor,
             scanner,
+            local_scanner,
             repository,
             enricher,
             patch_verifier,

@@ -6,16 +6,38 @@
 ## Alcance de este repo
 
 Este repo implementa **únicamente `ms-nmap`**: recibe una solicitud de escaneo
-(IP, usuario de red, credenciales/permisos), se conecta por SSH al objetivo,
-ejecuta `nmap` ahí, interpreta el resultado y lo publica de vuelta hacia el
-Broker. `ms-usuarios`, `ms-analisis` (el agente IA que redacta el informe), el
+(IP y, en modo `ssh`, usuario de red y credenciales/permisos), ejecuta `nmap`
+(en el objetivo por SSH, o desde su propio contenedor en modo `network`),
+interpreta el resultado y lo publica de vuelta hacia el Broker. `ms-usuarios`, `ms-analisis` (el agente IA que redacta el informe), el
 Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí.
 
 ## Decisiones de diseño ya tomadas
 
-- **SSH al objetivo, no escaneo local.** `ms-nmap` se conecta por SSH a la IP
-  objetivo con el usuario de red dado y ejecuta `nmap` en esa máquina remota
-  (no escanea la red desde su propio host).
+- **Modos de escaneo (`scan_mode`).** Una solicitud elige uno de dos modos
+  (contrato `broker/contracts/scan-request.schema.json`; sin `scan_mode` es
+  `ssh`, para que los productores anteriores sigan siendo válidos):
+  - **`ssh`** (decisión original, "SSH al objetivo, no escaneo local").
+    `ms-nmap` se conecta por SSH a la IP objetivo con el usuario de red dado y
+    ejecuta `nmap` en esa máquina remota. Exige `network_user`,
+    `ssh_credentials_ref` y `has_sudo`; permite `-O` con `sudo -n` y la
+    verificación autenticada de parches (`patch_verify`).
+  - **`network`** (decisión 2026-11-12, plan `network-scan-email-siem`).
+    `ms-nmap` ejecuta `nmap` **desde su propio contenedor** contra la IP
+    (`nmap -sT -sV --script vuln -T<n> -oX - <ip>`, módulo `local_scanner`). No
+    hay credenciales (el contrato las prohíbe: una credencial nunca viaja con un
+    escaneo de red), ni `sudo`, ni `-O`, ni raw sockets: `-sT` es un escaneo de
+    conexión TCP y corre como usuario no-root sin capacidades extra. Como no hay
+    sesión, **se omite la verificación de parches**: los hallazgos conservan
+    `confidence=version_match` y ningún `patch_state` (por contrato, «no
+    verificado»); el enriquecimiento NVD/Exploit-DB sí corre. Un objetivo que no
+    responde (`<nmaprun>` sin `<host>`) falla con `reason_code`
+    `target_unreachable`.
+
+  Esto revierte la restricción de que la imagen no llevara `nmap` (ver
+  `docs/decisions.md`, ADR-19). En el dominio, `ScanRequest.access` es
+  `ScanAccess::Ssh(SshAccess) | ScanAccess::Network`: la combinación «modo ssh
+  sin credenciales» o «modo network con credenciales» es irrepresentable y se
+  rechaza al deserializar.
 - **Se usa el binario `nmap` real**, no una reimplementación en Rust. La
   detección de vulnerabilidades se apoya en scripts NSE (`--script vuln`), no
   en una base de CVEs propia.
@@ -70,6 +92,7 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
   | `ssh::RemoteExecutor` (`connect`)  | `ssh`         | `ssh::RusshExecutor`             |
   | `ssh::RemoteSession` (`run_command`) | `ssh`       | `ssh::SshSession`               |
   | `scanner::NmapScanner`             | `scanner`     | `scanner::NmapCliScanner`        |
+  | `local_scanner::LocalScanner`      | `local_scanner` | `local_scanner::LocalNmapScanner` (modo `network`) |
   | `enrichment::VulnEnricher`         | `enrichment`  | `enrichment::CompositeVulnEnricher` (con `enrichment::ExploitDbEnricher` siempre, y `enrichment::NvdApiEnricher` si el egress a NVD está habilitado) |
   | `enrichment::NvdCache`             | `enrichment`  | `repository::MongoNvdCache` (colección `nvd_cache`, TTL) |
   | `repository::ScanResultRepository` | `repository`  | `repository::MongoRepository`   |
@@ -239,7 +262,9 @@ puertos abiertos no tienen severidad y no se cuentan.
 | `SshError::Protocol` / `Io` | `ssh_protocol_error` / `ssh_io_error` |
 | `ScanError::ToolNotAvailable` / `InsufficientPrivileges` / `NmapFailed` | `nmap_not_available` / `nmap_insufficient_privileges` / `nmap_failed` |
 | `ScanError::Ssh(e)` | el slug `ssh_*` de `e` |
-| `ParseError` | `parse_failed` |
+| `LocalScanError::ToolNotAvailable` / `Timeout` / `NmapFailed` / `Io` (modo `network`) | `nmap_not_available` / `nmap_timeout` / `nmap_failed` / `nmap_io_error` |
+| `ParseError::NoHost` en modo `network` (el objetivo no respondió) | `target_unreachable` |
+| `ParseError` (resto, y `NoHost` en modo `ssh`) | `parse_failed` |
 | `RepoError` al guardar | `persistence_failed` |
 | cancelación explícita | `scan_cancelled` |
 | solicitud inválida | `rejected_request` |
@@ -285,10 +310,14 @@ documentada en `docs/decisions.md`.
 Broker  ──(ScanRequest)──▶  messaging::consumer
                                    │
                                    ▼
-                        ssh::connect(ip, user, creds)
-                                   │
-                                   ▼
-                    scanner::run_scan(session, ip)  →  XML crudo
+              scan_mode = ssh                     scan_mode = network
+        ssh::connect(ip, user, creds)         (sin SSH ni credenciales)
+                    │                                     │
+                    ▼                                     ▼
+   scanner::run_scan(session, ip)       local_scanner::run_scan(ip)
+        (nmap en el objetivo)         (nmap local: -sT, sin -O ni sudo)
+                    └──────────────┬──────────────────────┘
+                                   ▼  XML crudo
                                    │
                                    ▼
                         parser::parse(xml)  →  ScanResult
@@ -297,6 +326,9 @@ Broker  ──(ScanRequest)──▶  messaging::consumer
            enrichment::VulnEnricher::enrich(&ports)  (best-effort)
                     →  + VulnFinding{source: exploit_db | nvd}, dedup por CVE
                        (nvd sólo si egress habilitado, ver security-scope.md)
+                                   │
+                  patch_verify (sólo modo ssh; en network se omite y
+                  los hallazgos quedan version_match sin patch_state)
                                    │
                         ┌──────────┴──────────┐
                         ▼                     ▼
@@ -325,16 +357,21 @@ Broker  ──(ScanRequest)──▶  messaging::consumer
     un commit concreto del repo `gitlab.com/exploit-database/exploitdb` (no
     `latest`/`main`). Sólo el CSV, no el CLI `searchsploit` (feature
     `vuln_enrichment`).
-  - **Stage runtime** (`gcr.io/distroless/cc-debian12:nonroot`): contiene el
-    binario `ms-nmap`, los certificados CA del sistema (TLS a MongoDB, a los endpoints
+  - **Stage runtime** (`debian:bookworm-slim`, pineada por digest): contiene el
+    binario `ms-nmap`, el paquete `nmap` (apt, sin recomendados, listas
+    borradas), los certificados CA del sistema (TLS a MongoDB, a los endpoints
     públicos de AWS SQS/SNS y, si está habilitado, a la API NVD) y
     `files_exploits.csv` en `/opt/exploitdb/` (dato de sólo lectura para
     `enrichment`; la ruta se fija con `ENV MS_NMAP_EXPLOITDB_CSV`). Corre como
-    usuario no-root (`nonroot`, uid 65532).
-- La imagen final **no incluye**: la toolchain de Rust, el código fuente, shell
-  ni coreutils, el CLI `searchsploit`, ni el binario `nmap`. `nmap` se ejecuta en
-  la máquina objetivo vía SSH (ver "SSH al objetivo, no escaneo local"), no en el
-  contenedor de `ms-nmap`. Tampoco lleva `openssh-client`: `russh` es Rust puro.
+    usuario no-root (`nonroot`, uid 65532, el mismo que tenía la base
+    distroless).
+- La imagen final **no incluye**: la toolchain de Rust, el código fuente ni el
+  CLI `searchsploit`. **Sí incluye `nmap`**, que usa el modo `network` (ver
+  "Modos de escaneo"); el modo `ssh` sigue ejecutando `nmap` en la máquina
+  objetivo. A diferencia de la base distroless anterior, la base Debian trae
+  shell y coreutils; `ms-nmap` no los usa: `nmap` se lanza con `argv` separado,
+  nunca a través de un shell. Tampoco lleva `openssh-client`: `russh` es Rust
+  puro.
   El enriquecimiento de vulnerabilidades de Exploit-DB es un lookup en memoria
   sobre el CSV bundleado: **sin egress de red**. El enriquecimiento de NVD
   (`enrichment::nvd::NvdApiEnricher`) sí es egress de red, pero **opt-in**: sólo

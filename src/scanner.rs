@@ -46,7 +46,7 @@ pub enum Timing {
 
 impl Timing {
     /// Flag `-T<n>` correspondiente para la línea de comandos de `nmap`.
-    fn flag(self) -> &'static str {
+    pub(crate) fn flag(self) -> &'static str {
         match self {
             Timing::Paranoid => "-T0",
             Timing::Sneaky => "-T1",

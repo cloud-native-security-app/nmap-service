@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 pub mod config;
 pub mod domain;
 pub mod enrichment;
+pub mod local_scanner;
 pub mod messaging;
 pub mod parser;
 pub mod patch_verify;
