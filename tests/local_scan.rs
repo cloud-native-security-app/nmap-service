@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use nmap_service::domain::PortState;
-use nmap_service::local_scanner::{LocalNmapScanner, LocalScanner};
+use nmap_service::local_scanner::{LocalNmapScanner, LocalScanTarget, LocalScanner};
 use nmap_service::parser;
 use nmap_service::scanner::{ScanOptions, Timing};
 use testcontainers::{
@@ -44,7 +44,7 @@ async fn local_scanner_finds_the_open_http_port_of_a_real_container() {
         ..ScanOptions::default()
     };
     let xml = LocalNmapScanner::new(Duration::from_secs(600))
-        .run_scan(target, &options)
+        .run_scan(&LocalScanTarget::from_ip(target), &options)
         .await
         .expect("el escaneo local termina bien");
 

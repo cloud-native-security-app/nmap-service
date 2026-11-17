@@ -195,6 +195,13 @@ pub struct ScanRequest {
     pub requested_by: String,
     /// Modo de escaneo y, en modo `ssh`, las credenciales de acceso.
     pub access: ScanAccess,
+    /// Sólo modo `network`: nombre de host tal como lo escribió el usuario
+    /// (RFC 1123). Sirve de host virtual HTTP (`http.host`) y para mostrar;
+    /// `nmap` nunca lo resuelve: el objetivo escaneado es siempre [`Self::ip`].
+    pub target_host: Option<String>,
+    /// Sólo modo `network`: puerto de la URL que se escanea además de los
+    /// puertos por defecto de `nmap` (1..=65535).
+    pub extra_port: Option<u16>,
 }
 
 impl ScanRequest {
@@ -231,6 +238,34 @@ struct ScanRequestWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     has_sudo: Option<bool>,
     requested_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_port: Option<u16>,
+}
+
+/// Longitud máxima de un nombre de host completo (RFC 1035/1123).
+const HOSTNAME_MAX_LEN: usize = 253;
+/// Longitud máxima de una etiqueta de un nombre de host.
+const HOSTNAME_LABEL_MAX_LEN: usize = 63;
+
+/// `true` si `host` es un nombre de host RFC 1123: etiquetas de 1..=63
+/// caracteres `[A-Za-z0-9-]` separadas por `.`, sin guion al principio ni al
+/// final de cada etiqueta, sin punto final y de como mucho 253 caracteres en
+/// total. Replica el `pattern` del contrato y mantiene un `-` inicial fuera de
+/// `argv` de `nmap`.
+fn is_valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= HOSTNAME_MAX_LEN
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= HOSTNAME_LABEL_MAX_LEN
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 fn is_default_mode(mode: &ScanMode) -> bool {
@@ -262,14 +297,36 @@ impl TryFrom<ScanRequestWire> for ScanRequest {
                 if let Some((field, _)) = forbidden.iter().find(|(_, present)| *present) {
                     return Err(format!("field `{field}` is not allowed in network mode"));
                 }
+                // Nunca se repite el valor recibido en el error.
+                if wire
+                    .target_host
+                    .as_deref()
+                    .is_some_and(|h| !is_valid_hostname(h))
+                {
+                    return Err("field `target_host` is not a valid RFC 1123 hostname".to_owned());
+                }
+                if wire.extra_port == Some(0) {
+                    return Err("field `extra_port` must be in 1..=65535".to_owned());
+                }
                 ScanAccess::Network
             }
         };
+        if matches!(access, ScanAccess::Ssh(_)) {
+            let forbidden = [
+                ("target_host", wire.target_host.is_some()),
+                ("extra_port", wire.extra_port.is_some()),
+            ];
+            if let Some((field, _)) = forbidden.iter().find(|(_, present)| *present) {
+                return Err(format!("field `{field}` is only allowed in network mode"));
+            }
+        }
         Ok(Self {
             correlation_id: wire.correlation_id,
             ip: wire.ip,
             requested_by: wire.requested_by,
             access,
+            target_host: wire.target_host,
+            extra_port: wire.extra_port,
         })
     }
 }
@@ -293,6 +350,8 @@ impl From<ScanRequest> for ScanRequestWire {
             ssh_credentials_ref,
             has_sudo,
             requested_by: request.requested_by,
+            target_host: request.target_host,
+            extra_port: request.extra_port,
         }
     }
 }
@@ -577,6 +636,8 @@ mod tests {
                 ssh_credentials_ref: SshCredentialsRef::new(SecretString::from(secret.to_owned())),
                 has_sudo: true,
             }),
+            target_host: None,
+            extra_port: None,
         }
     }
 
@@ -738,6 +799,112 @@ mod tests {
                 .expect_err("ssh exige los tres campos")
                 .to_string();
             assert!(err.contains(field), "el error debe nombrar {field}: {err}");
+        }
+    }
+
+    fn network_json(extra: &str) -> String {
+        format!(
+            r#"{{"correlation_id":"c","scan_mode":"network","ip":"198.51.100.4","requested_by":"a"{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn network_request_accepts_target_host_and_extra_port_and_round_trips_them() {
+        let json = network_json(r#","target_host":"app.example.com","extra_port":8443"#);
+        let request: ScanRequest = serde_json::from_str(&json).expect("deserializa");
+
+        assert_eq!(request.target_host.as_deref(), Some("app.example.com"));
+        assert_eq!(request.extra_port, Some(8443));
+        assert_eq!(request.ip, "198.51.100.4".parse::<IpAddr>().unwrap());
+        let value = serde_json::to_value(&request).expect("serializa");
+        assert_eq!(value["target_host"], "app.example.com");
+        assert_eq!(value["extra_port"], 8443);
+    }
+
+    #[test]
+    fn network_request_without_the_optional_fields_keeps_its_wire_shape() {
+        let request: ScanRequest = serde_json::from_str(&network_json("")).expect("deserializa");
+        assert_eq!(request.target_host, None);
+        assert_eq!(request.extra_port, None);
+        let value = serde_json::to_value(&request).expect("serializa");
+        assert!(value.get("target_host").is_none() && value.get("extra_port").is_none());
+    }
+
+    #[test]
+    fn network_request_accepts_each_optional_field_on_its_own() {
+        assert!(serde_json::from_str::<ScanRequest>(&network_json(r#","extra_port":1"#)).is_ok());
+        assert!(
+            serde_json::from_str::<ScanRequest>(&network_json(r#","target_host":"a""#)).is_ok()
+        );
+    }
+
+    #[test]
+    fn invalid_hostnames_are_rejected_without_echoing_the_value() {
+        let long_label = "a".repeat(64);
+        let too_long = format!("{}.com", ["a".repeat(63).as_str(); 4].join("."));
+        for host in [
+            "",
+            "-leading.example.com",
+            "trailing-.example.com",
+            "app.-bad.com",
+            "app.example.com.",
+            "under_score.com",
+            "spa ce.com",
+            "a..b",
+            "--script=evil",
+            "ünï.com",
+            long_label.as_str(),
+            too_long.as_str(),
+        ] {
+            let json = network_json(&format!(r#","target_host":"{host}""#));
+            let err = serde_json::from_str::<ScanRequest>(&json)
+                .expect_err(&format!("debe rechazar {host:?}"))
+                .to_string();
+            assert!(host.is_empty() || !err.contains(host), "{err}");
+        }
+    }
+
+    #[test]
+    fn hostname_limits_are_inclusive() {
+        let label63 = "a".repeat(63);
+        let host253 = format!("{label63}.{label63}.{label63}.{}", "b".repeat(61));
+        assert_eq!(host253.len(), 253);
+        for host in [
+            label63.as_str(),
+            host253.as_str(),
+            "A-1.Example.COM",
+            "10.example",
+        ] {
+            let json = network_json(&format!(r#","target_host":"{host}""#));
+            assert!(serde_json::from_str::<ScanRequest>(&json).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn out_of_range_extra_ports_are_rejected() {
+        for port in ["0", "65536", "-1", "70000", "1.5", r#""80""#] {
+            let json = network_json(&format!(r#","extra_port":{port}"#));
+            assert!(
+                serde_json::from_str::<ScanRequest>(&json).is_err(),
+                "{port}"
+            );
+        }
+        let max = network_json(r#","extra_port":65535"#);
+        assert!(serde_json::from_str::<ScanRequest>(&max).is_ok());
+    }
+
+    #[test]
+    fn ssh_request_carrying_target_host_or_extra_port_is_rejected() {
+        for (field, value) in [
+            ("target_host", r#""app.example.com""#),
+            ("extra_port", "8443"),
+        ] {
+            let mut json: serde_json::Value = serde_json::from_str(SSH_JSON).expect("JSON");
+            json[field] = serde_json::from_str(value).expect("valor");
+            let err = serde_json::from_value::<ScanRequest>(json)
+                .expect_err("ssh no admite campos network")
+                .to_string();
+            assert!(err.contains(field), "{err}");
         }
     }
 

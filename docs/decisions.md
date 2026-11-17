@@ -231,3 +231,20 @@ broker_adapter y configurable_scan_timing.
   verificador» en el propio `ScanResult` (el contrato `scan-outcome` no tiene
   un campo de resultado para ello): quien necesite mostrarlo debe usar el
   `scan_mode` de la solicitud, que el Gateway ya conoce.
+
+## ADR-20 — Escaneo `network` por URL: `target_host` y `extra_port`
+
+- **Contexto:** el plan `network-scan-url-target` deja escanear un host por
+  nombre o URL. El Gateway resuelve el nombre y publica la IP fijada; una URL
+  suele traer un puerto fuera del conjunto por defecto de `nmap`.
+- **Decisión:** `ScanRequest` acepta `target_host` (RFC 1123, máx. 253) y
+  `extra_port` (1..65535), sólo en modo `network` (contrato `broker` D-17).
+  `ip` sigue siendo la única dirección escaneada. Con `target_host` se añade
+  `--script-args http.host=<host>`. Con `extra_port` el escaneo cubre los
+  puertos por defecto **más** ese puerto: en `nmap` (7.93 y 7.992) `-p` no se
+  une a `--top-ports`, lo sustituye, y la lista por defecto cambia entre
+  versiones, así que `local_scanner` se la pide al propio binario
+  (`nmap -sT --top-ports 1000 -oX - -iL /dev/null`, sin tocar la red) y pasa
+  `-p <lista>,<extra_port>`. Sin extras el `argv` es idéntico al histórico.
+- **Consecuencia:** un escaneo con `extra_port` lanza un `nmap` previo
+  (milisegundos). Despliegue: `nmap-service` antes que el Gateway.

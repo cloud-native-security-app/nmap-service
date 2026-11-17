@@ -58,7 +58,7 @@ use crate::domain::{
     CorrelationId, ScanAccess, ScanCancellation, ScanRequest, ScanResult, VulnFinding,
 };
 use crate::enrichment::VulnEnricher;
-use crate::local_scanner::{LocalScanError, LocalScanner};
+use crate::local_scanner::{LocalScanError, LocalScanTarget, LocalScanner};
 use crate::messaging::consumer::{
     ConsumeError, IncomingScanRequest, ScanCancellationSource, ScanRequestSource,
     REJECTED_REQUEST_REASON,
@@ -416,6 +416,8 @@ impl ScanPipeline {
         tracing::info!(
             correlation_id = %correlation_id,
             target_ip = %request.ip,
+            target_host = request.target_host.as_deref(),
+            extra_port = request.extra_port,
             "pipeline de escaneo iniciado"
         );
 
@@ -610,7 +612,7 @@ impl ScanPipeline {
             ScanAccess::Network => {
                 let xml = self
                     .local_scanner
-                    .run_scan(request.ip, &self.config.scan_options)
+                    .run_scan(&LocalScanTarget::from(request), &self.config.scan_options)
                     .await
                     .map_err(|err| StageFailure::from_local(&err))?;
 
@@ -1565,6 +1567,8 @@ mod tests {
                 ssh_credentials_ref: SshCredentialsRef::new(SecretString::from(SECRET.to_owned())),
                 has_sudo: false,
             }),
+            target_host: None,
+            extra_port: None,
         }
     }
 
@@ -2563,7 +2567,7 @@ mod tests {
     impl LocalScanner for UnusedLocalScanner {
         async fn run_scan(
             &self,
-            _target_ip: IpAddr,
+            _target: &LocalScanTarget,
             _options: &ScanOptions,
         ) -> Result<String, LocalScanError> {
             unreachable!("el escáner local sólo se usa en modo network")
@@ -2583,7 +2587,7 @@ mod tests {
     impl LocalScanner for FakeLocalScanner {
         async fn run_scan(
             &self,
-            _target_ip: IpAddr,
+            _target: &LocalScanTarget,
             _options: &ScanOptions,
         ) -> Result<String, LocalScanError> {
             match &self.0 {
@@ -2635,6 +2639,8 @@ mod tests {
             ip: "198.51.100.7".parse().expect("IP de prueba válida"),
             requested_by: "analyst@example.test".to_owned(),
             access: ScanAccess::Network,
+            target_host: None,
+            extra_port: None,
         }
     }
 

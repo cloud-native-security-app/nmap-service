@@ -33,6 +33,12 @@
   detección, scripts de categoría `vuln`), sin `-O`, sin `sudo` y sin raw
   sockets. El `ScanRequest` de este modo **no puede** llevar credenciales: la
   deserialización rechaza `network_user`, `ssh_credentials_ref` y `has_sudo`.
+- Campos opcionales `target_host` y `extra_port` (sólo modo `network`; el modo
+  `ssh` los rechaza). `target_host` se valida como nombre RFC 1123 (etiquetas
+  `[A-Za-z0-9-]`, sin guion inicial/final, 253 caracteres como máximo) antes de
+  llegar a `argv`, y sólo viaja como `--script-args http.host=<host>`: `nmap`
+  escanea siempre la IP del mensaje y nunca resuelve nombres (sin rebinding de
+  DNS). Un valor inválido rechaza el mensaje sin repetirlo en el error.
 
 ## Desarrollo y tests
 
