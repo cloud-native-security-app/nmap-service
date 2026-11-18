@@ -116,6 +116,8 @@ fn scan_request(ip: IpAddr, correlation_id: &str) -> ScanRequest {
             ssh_credentials_ref: creds(),
             has_sudo: false,
         }),
+        target_host: None,
+        extra_port: None,
     }
 }
 

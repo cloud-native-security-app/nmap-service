@@ -8,6 +8,12 @@ vulnerabilidades, persiste el resultado en MongoDB (`db-nmap`) y lo publica
 de vuelta en un topic SNS para que otro servicio (`ms-analisis`) genere el
 informe final con IA.
 
+En modo `network` la solicitud admite dos campos opcionales: `target_host`
+(nombre RFC 1123, se pasa a los scripts como `http.host`) y `extra_port`
+(1..65535, se escanea además de los puertos por defecto de `nmap`). `ip` sigue
+siendo lo único que se escanea; el contrato vive en
+`broker/contracts/scan-request.schema.json`.
+
 Este repo implementa **únicamente** `ms-nmap`. `ms-usuarios`, `ms-analisis`,
 el Gateway y el Broker viven en otros repos.
 

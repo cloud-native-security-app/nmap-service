@@ -174,6 +174,8 @@ pub fn log_request_received(request: &ScanRequest) {
             correlation_id = %request.correlation_id,
             scan_mode = ?request.mode(),
             target_ip = %request.ip,
+            target_host = request.target_host.as_deref(),
+            extra_port = request.extra_port,
             "solicitud de escaneo recibida del Broker"
         ),
     }

@@ -68,6 +68,24 @@ fn network_example_validates_and_deserializes_as_network_mode() {
 }
 
 #[test]
+fn network_hostname_example_validates_and_keeps_host_and_port() {
+    let (Some(validator), Some(text)) = (schema_validator(), example("network-hostname.json"))
+    else {
+        return;
+    };
+    let json: Value = serde_json::from_str(&text).expect("JSON");
+    assert!(
+        validator.is_valid(&json),
+        "network-hostname.json debe validar"
+    );
+
+    let request: ScanRequest = serde_json::from_str(&text).expect("deserializa");
+    assert_eq!(request.mode(), ScanMode::Network);
+    assert!(request.target_host.is_some(), "target_host presente");
+    assert!(request.extra_port.is_some(), "extra_port presente");
+}
+
+#[test]
 fn every_invalid_example_is_rejected_by_both_the_schema_and_the_domain() {
     let Some(validator) = schema_validator() else {
         return;
@@ -94,7 +112,7 @@ fn every_invalid_example_is_rejected_by_both_the_schema_and_the_domain() {
         );
         checked += 1;
     }
-    assert!(checked >= 3, "se esperaban al menos 3 ejemplos inválidos");
+    assert!(checked >= 6, "se esperaban al menos 6 ejemplos inválidos");
 }
 
 #[test]
@@ -102,7 +120,7 @@ fn serialized_requests_validate_against_the_schema() {
     let Some(validator) = schema_validator() else {
         return;
     };
-    for name in ["ssh.json", "network.json"] {
+    for name in ["ssh.json", "network.json", "network-hostname.json"] {
         let Some(text) = example(name) else { return };
         let request: ScanRequest = serde_json::from_str(&text).expect("deserializa");
         let json = serde_json::to_value(&request).expect("serializa");

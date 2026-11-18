@@ -31,7 +31,10 @@ Gateway y el Broker en sí mismo son otros servicios — no se implementan aquí
     `confidence=version_match` y ningún `patch_state` (por contrato, «no
     verificado»); el enriquecimiento NVD/Exploit-DB sí corre. Un objetivo que no
     responde (`<nmaprun>` sin `<host>`) falla con `reason_code`
-    `target_unreachable`.
+    `target_unreachable`. Opcionalmente la solicitud trae `target_host`
+    (nombre RFC 1123, se pasa como `--script-args http.host=<host>`; `nmap`
+    nunca lo resuelve) y `extra_port` (1..65535, se suma a los puertos por
+    defecto de `nmap`); ambos sólo existen en este modo (ver ADR-20).
 
   Esto revierte la restricción de que la imagen no llevara `nmap` (ver
   `docs/decisions.md`, ADR-19). En el dominio, `ScanRequest.access` es
