@@ -162,8 +162,8 @@ fn broker_examples_deserialize_into_security_event_and_round_trip() {
         checked += 1;
     }
     assert!(
-        checked >= 11,
-        "se esperaban al menos los 11 ejemplos del contrato"
+        checked >= 15,
+        "se esperaban al menos los 15 ejemplos del contrato"
     );
 }
 
