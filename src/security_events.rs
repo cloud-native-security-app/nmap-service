@@ -8,7 +8,7 @@
 //!
 //! ms-nmap produce cuatro tipos: `scan.started`, `scan.completed`,
 //! `scan.failed` y `finding.critical`. Los demás los producen el Gateway y
-//! `user-service`; [`EventType`] cubre los 11 valores del contrato para poder
+//! `user-service`; [`EventType`] cubre los 12 valores del contrato para poder
 //! deserializar los ejemplos.
 //!
 //! Los adaptadores viven en [`crate::messaging::kinesis`] (real) y en este
@@ -59,7 +59,7 @@ const MAX_REASON_CODE_CHARS: usize = 64;
 /// emiten evento propio; se emiten primero los críticos y luego los altos.
 pub const MAX_FINDING_CRITICAL_EVENTS: usize = 50;
 
-/// Tipo de un [`SecurityEvent`]; cubre los 11 valores del contrato aunque
+/// Tipo de un [`SecurityEvent`]; cubre los 12 valores del contrato aunque
 /// ms-nmap solo produce algunos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
@@ -96,6 +96,9 @@ pub enum EventType {
     /// `user-service` registró una acción de auditoría.
     #[serde(rename = "audit.recorded")]
     AuditRecorded,
+    /// El Gateway reenvió una alerta SIEM de Wazuh.
+    #[serde(rename = "siem.alert")]
+    SiemAlert,
 }
 
 impl EventType {
@@ -113,6 +116,7 @@ impl EventType {
             Self::RatelimitHit => "ratelimit.hit",
             Self::MessageDeadlettered => "message.deadlettered",
             Self::AuditRecorded => "audit.recorded",
+            Self::SiemAlert => "siem.alert",
         }
     }
 }
@@ -129,6 +133,9 @@ pub enum EventSource {
     /// `user-service`.
     #[serde(rename = "user-service")]
     UserService,
+    /// Un SIEM Wazuh (`siem.alert`, reenviado por el Gateway).
+    #[serde(rename = "wazuh")]
+    Wazuh,
 }
 
 /// Evento de seguridad inmutable: el sobre del contrato
