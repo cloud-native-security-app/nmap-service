@@ -91,7 +91,7 @@ Construye la imagen, la publica en ECR como `security-app/nmap-service:<sha>`
 (y `:latest`) y despliega en el servicio ECS `nmap-service` del cluster
 `security-app-cluster-v2`. Terraform (repo `infra`) es la única fuente de
 verdad de la task definition (variables de entorno, secretos de SSM, roles,
-logs): CI solo descarga la task definition vigente del servicio, cambia la
+logs): CI solo descarga la task definition más reciente de la familia del servicio (no la que está corriendo, así no se pierden los cambios que registró Terraform), cambia la
 imagen del contenedor `nmap-service` por `<sha>`, registra la nueva revisión y
 espera la estabilidad del servicio. Nada de esto se versiona en este repo.
 
